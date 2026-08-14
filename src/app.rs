@@ -10,6 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde_json::{json, Value};
 
 use crate::bus::{AppEvent, Cmd};
+use crate::clipboard;
 use crate::files::{fuzzy_filter, list_files};
 use crate::resume::{list_sessions, read_session_events, SessionSummary};
 use crate::theme::Theme;
@@ -81,6 +82,20 @@ pub struct ResumePicker {
 }
 
 #[derive(Debug, Clone)]
+pub struct PaletteRow {
+    pub label: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Palette {
+    pub rows: Vec<PaletteRow>,
+    pub filter: String,
+    pub selected: usize,
+    pub visible: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub provider: String,
     pub id: String,
@@ -139,6 +154,7 @@ pub enum Dialog {
     Model(ModelPicker),
     FilePicker(FilePicker),
     Rewind(RewindPicker),
+    Palette(Palette),
 }
 
 pub struct App {
@@ -242,6 +258,36 @@ impl App {
         });
     }
 
+    fn open_palette(&mut self) {
+        let rows = vec![
+            ("/resume", "恢复会话"),
+            ("/new", "新会话"),
+            ("/model", "切换模型"),
+            ("/compact", "压缩历史"),
+            ("/copy", "复制最近回复"),
+            ("/help", "帮助"),
+            ("/exit", "退出"),
+            ("rewind 2×Esc", "回滚到早前消息"),
+            ("theme Ctrl+T", "切换深浅主题"),
+            ("approve dialog F2 (demo)", "演示审批弹窗"),
+            ("ask dialog F3 (demo)", "演示问题卡"),
+        ];
+        let rows: Vec<PaletteRow> = rows
+            .into_iter()
+            .map(|(label, action)| PaletteRow {
+                label: label.to_string(),
+                action: action.to_string(),
+            })
+            .collect();
+        let visible = (0..rows.len()).collect();
+        self.dialog = Dialog::Palette(Palette {
+            rows,
+            filter: String::new(),
+            selected: 0,
+            visible,
+        });
+    }
+
     fn open_rewind(&mut self) {
         let entries: Vec<RewindEntry> = self
             .transcript
@@ -274,6 +320,19 @@ impl App {
         }
     }
 
+    fn copy_text(&mut self, text: String) {
+        if text.is_empty() {
+            self.notice = Some("nothing to copy".into());
+            return;
+        }
+        let out = clipboard::copy(&text);
+        if out.delivered {
+            self.notice = Some("copied".into());
+        } else {
+            self.notice = Some(format!("clipboard unreachable; saved to {}", out.backup.display()));
+        }
+    }
+
     fn run_command(&mut self, cmd: &str) {
         let name = cmd.split_whitespace().next().unwrap_or("");
         match name {
@@ -299,6 +358,17 @@ impl App {
                 self.status = "new session".into();
             }
             "/exit" | "/quit" => self.quit = true,
+            "/copy" => {
+                let text = self
+                    .transcript
+                    .cells
+                    .iter()
+                    .rev()
+                    .find(|c| c.kind == CellKind::Assistant)
+                    .map(|c| c.text.clone())
+                    .unwrap_or_default();
+                self.copy_text(text);
+            }
             "/help" => {
                 self.notice =
                     Some("/resume /new /exit /help ready · /model /compact TODO".into())
@@ -717,6 +787,14 @@ impl App {
             return;
         }
 
+        // ---- command palette (docs/01 section 2.6) ----
+        if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+            || key.code == KeyCode::Char('?')
+        {
+            self.open_palette();
+            return;
+        }
+
         // ---- model picker ----
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('m') {
             if self.has_dialog() {
@@ -816,6 +894,18 @@ impl App {
                 }
                 KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
                 KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
+                KeyCode::Char('y') => {
+                    if let Some(i) = self.transcript.selected {
+                        let text = self.transcript.cells[i].text.clone();
+                        self.copy_text(text);
+                    }
+                }
+                KeyCode::Char('Y') => {
+                    if let Some(i) = self.transcript.selected {
+                        let title = self.transcript.cells[i].title.clone();
+                        self.copy_text(title);
+                    }
+                }
                 KeyCode::Char(c) => {
                     self.focus = Focus::Prompt;
                     self.input.push(c);
@@ -891,8 +981,16 @@ impl App {
                 self.dialog = Dialog::None;
                 self.respond(request_id, json!({ "answers": [] }));
             }
-            KeyCode::Char('c') | KeyCode::Char('y') => {
-                self.notice = Some("comment/copy: TODO".into());
+            KeyCode::Char('y') => {
+                let detail = {
+                    let Dialog::Ask(d) = &self.dialog else { return };
+                    let cur = d.current.min(d.questions.len().saturating_sub(1));
+                    d.questions[cur].detail.clone()
+                };
+                self.copy_text(detail);
+            }
+            KeyCode::Char('c') => {
+                self.notice = Some("line comment: TODO".into());
             }
             KeyCode::Char('s') => {
                 if let Dialog::Ask(d) = &mut self.dialog {
@@ -1111,6 +1209,61 @@ impl App {
                     _ => {}
                 }
             }
+            Dialog::Palette(p) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        p.selected = p.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        p.selected = (p.selected + 1).min(p.visible.len().saturating_sub(1));
+                    }
+                    KeyCode::Char(c) => {
+                        p.filter.push(c);
+                        p.visible = palette_filter(&p.rows, &p.filter);
+                        p.selected = 0;
+                    }
+                    KeyCode::Backspace => {
+                        p.filter.pop();
+                        p.visible = palette_filter(&p.rows, &p.filter);
+                        p.selected = 0;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(idx) = p.visible.get(p.selected) {
+                            let label = p.rows[*idx].label.clone();
+                            self.dialog = Dialog::None;
+                            if label.starts_with('/') {
+                                self.run_command(&label);
+                            } else if label.starts_with("rewind") {
+                                self.open_rewind();
+                            } else if label.starts_with("theme") {
+                                self.theme = if self.theme.name == "dark" {
+                                    crate::theme::LIGHT
+                                } else {
+                                    crate::theme::DARK
+                                };
+                            } else if label.contains("F2") {
+                                self.open_dialog(
+                                    "demo-approve".into(),
+                                    "ui/approve",
+                                    &serde_json::json!({ "toolName": "bash", "reason": "shell command", "input": {"command": "cargo test"}, "options": ["allowed-once", "rejected"] }),
+                                );
+                            } else if label.contains("F3") {
+                                self.open_dialog(
+                                    "demo-ask".into(),
+                                    "ui/ask-user",
+                                    &serde_json::json!({ "questions": [
+                                        { "id": "q1", "question": "选一个颜色？", "header": "主题", "options": [{"label": "蓝色"}, {"label": "绿色"}] }
+                                    ] }),
+                                );
+                            }
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.dialog = Dialog::None;
+                    }
+                    _ => {}
+                }
+            }
             Dialog::Rewind(r) => {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -1207,4 +1360,11 @@ impl App {
             Dialog::None => {}
         }
     }
+}
+
+fn palette_filter(rows: &[PaletteRow], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    (0..rows.len())
+        .filter(|i| q.is_empty() || rows[*i].label.to_lowercase().contains(&q) || rows[*i].action.to_lowercase().contains(&q))
+        .collect()
 }

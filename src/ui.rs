@@ -104,6 +104,49 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Dialog::Palette(p) => {
+            let w = area.width.min(80).saturating_sub(4).max(40);
+            let h = (p.visible.len().min(12) as u16 + 3).max(5);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                format!(" 命令面板 — filter: {}", p.filter),
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (row_idx, item_idx) in p.visible.iter().take(12).enumerate() {
+                let row = &p.rows[*item_idx];
+                let selected = row_idx == p.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{}{} — {}", mark, row.label, row.action),
+                    style,
+                )));
+            }
+            if p.visible.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " (无匹配)",
+                    Style::default().fg(app.theme.gray_dim),
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" palette ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
         Dialog::Rewind(r) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
             let h = (r.items.len() as u16 + 3).min(area.height.saturating_sub(4)).max(6);
@@ -509,6 +552,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         Dialog::Model(_) => "type filter · ↑/↓ select · Enter switch · Esc close · Ctrl+Q quit",
         Dialog::FilePicker(_) => "type filter · ↑/↓ select · Tab/Enter insert · Esc close · Ctrl+Q quit",
         Dialog::Rewind(_) => "↑/↓ select · Enter rewind · Esc close · Ctrl+Q quit",
+        Dialog::Palette(_) => "type filter · ↑/↓ select · Enter run · Esc close · Ctrl+Q quit",
         Dialog::Ask(d) => {
             let cur = d.current.min(d.questions.len().saturating_sub(1));
             if d.questions[cur].plan_approve.is_some() {

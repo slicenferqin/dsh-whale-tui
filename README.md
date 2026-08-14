@@ -71,6 +71,8 @@ TUI 的默认 provider/model 从 ~/.dsh/settings.yaml 的 dsh-whale-tui: 块读�
 | Ctrl+E | 折叠/展开 thinking（占位） |
 | Ctrl+T | 切主题（dark/light） |
 | Ctrl+Q / Ctrl+D | 退出 |
+| Ctrl+P / ? | 命令面板（slash 命令+常用操作，可过滤） |
+| y / Y | 复制选中块内容 / 元数据（剪贴板三路由：native→tmux→OSC52，备份 ~/.dsh/last-copy.txt） |
 
 ## Slash 命令（已实现）
 
@@ -80,6 +82,7 @@ TUI 的默认 provider/model 从 ~/.dsh/settings.yaml 的 dsh-whale-tui: 块读�
 | /new (/clear) | 新会话 |
 | /exit (/quit) | 退出 |
 | /help | 命令列表 |
+| /copy | 复制最近回复 |
 | /model /compact | TODO（下一批） |
 
 ## 目录

@@ -7,6 +7,7 @@ mod app;
 mod bus;
 mod demo;
 mod proto;
+mod clipboard;
 mod files;
 mod resume;
 mod theme;
