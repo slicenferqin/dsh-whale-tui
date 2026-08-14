@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build and check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: rustup update stable
+      - run: rustup default stable
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - run: node --check npm/lib/index.js
+      - run: node --check npm/bin/dsh-whale-tui.js

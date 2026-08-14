@@ -1,0 +1,5 @@
+# dsh-whale-tui bundle patch: mount the native TUI runner over the profile's base
+# bundle under the stable plugin id tui-runner.
+- insert:
+    - id: tui-runner
+      name: 'dsh-whale-tui'
