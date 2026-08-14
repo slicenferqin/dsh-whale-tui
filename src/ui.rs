@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Dialog, Focus, RunState};
+use crate::resume::age_label;
 use crate::transcript::CellKind;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -96,6 +97,46 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.prompt_border_active))
                 .title(" permission ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
+        Dialog::Resume(p) => {
+            let w = area.width.min(80).saturating_sub(4).max(40);
+            let h = (p.items.len() as u16 + 2).min(area.height.saturating_sub(4)).max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                " /resume — Enter 恢复 · Esc 关闭",
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (i, item) in p.items.iter().enumerate() {
+                let selected = i == p.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                let mut label = item.preview.clone();
+                if label.is_empty() {
+                    label = item.id.clone();
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("{}{} · {} turns · {} · {}", mark, label, item.turns, age_label(item.modified), item.id),
+                    style,
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" resume ");
             f.render_widget(
                 Paragraph::new(lines)
                     .block(block)
@@ -313,6 +354,7 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
 fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.dialog {
         Dialog::Approval(_) => "↑/↓ select · 1-9 pick · Enter confirm · Esc cancel · Ctrl+Q quit",
+        Dialog::Resume(_) => "↑/↓ select · Enter resume · Esc close · Ctrl+Q quit",
         Dialog::Ask(_) => "↑/↓ select · ←/→ question · 1-9 pick · Space toggle · Enter next/submit · Esc skip · Ctrl+Q quit",
         Dialog::None => match app.focus {
             Focus::Prompt => "Enter send · Shift+Enter newline · Alt+Enter send-now · Esc cancel/2×clear · Ctrl+Q quit",

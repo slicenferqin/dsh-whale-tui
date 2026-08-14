@@ -9,6 +9,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde_json::{json, Value};
 
 use crate::bus::{AppEvent, Cmd};
+use crate::resume::{list_sessions, read_session_events, SessionSummary};
 use crate::theme::Theme;
 use crate::transcript::{CellKind, Transcript};
 
@@ -66,10 +67,17 @@ pub struct AskDialog {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResumePicker {
+    pub items: Vec<SessionSummary>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
 pub enum Dialog {
     None,
     Approval(ApprovalDialog),
     Ask(AskDialog),
+    Resume(ResumePicker),
 }
 
 pub struct App {
@@ -89,6 +97,8 @@ pub struct App {
     pub quit: bool,
     pub demo: bool,
     pub dialog: Dialog,
+    pub workspace: String,
+    pending_resume_file: Option<std::path::PathBuf>,
     queue: Vec<String>,
     cmd_tx: Sender<Cmd>,
 }
@@ -100,6 +110,7 @@ impl App {
         model: String,
         demo: bool,
         cmd_tx: Sender<Cmd>,
+        workspace: String,
     ) -> Self {
         Self {
             theme,
@@ -118,6 +129,8 @@ impl App {
             quit: false,
             demo,
             dialog: Dialog::None,
+            workspace,
+            pending_resume_file: None,
             queue: Vec::new(),
             cmd_tx,
         }
@@ -158,6 +171,39 @@ impl App {
         });
     }
 
+    fn run_command(&mut self, cmd: &str) {
+        let name = cmd.split_whitespace().next().unwrap_or("");
+        match name {
+            "/resume" => {
+                let items = list_sessions(&self.workspace, &self.session_id);
+                if items.is_empty() {
+                    self.notice = Some("no sessions found".into());
+                } else {
+                    self.dialog = Dialog::Resume(ResumePicker { items, selected: 0 });
+                }
+            }
+            "/new" | "/clear" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                self.session_id = format!("dsh-{now}");
+                self.transcript = Transcript::new();
+                self.queue.clear();
+                self.scroll = 0;
+                self.status = "new session".into();
+            }
+            "/exit" | "/quit" => self.quit = true,
+            "/help" => {
+                self.notice =
+                    Some("/resume /new /exit /help ready · /model /compact TODO".into())
+            }
+            "/model" => self.notice = Some("model picker: TODO".into()),
+            "/compact" => self.notice = Some("compact: TODO".into()),
+            other => self.notice = Some(format!("unknown command {other}")),
+        }
+    }
+
     fn cancel_now(&mut self) {
         self.esc = EscArm::None;
         if self.demo {
@@ -187,6 +233,22 @@ impl App {
                 "tui/ready" => {
                     self.status = "runtime ready".into();
                     self.state = RunState::Idle;
+                }
+                "tui/loaded" => {
+                    if let Some(sid) = params.get("sessionId").and_then(|v| v.as_str()) {
+                        self.session_id = sid.to_string();
+                    }
+                    self.status = "resumed".into();
+                    if let Some(file) = self.pending_resume_file.take() {
+                        if let Ok(events) = read_session_events(&file) {
+                            self.transcript = Transcript::new();
+                            for ev in &events {
+                                self.transcript.apply(ev);
+                            }
+                            self.scroll = 0;
+                            self.notice = Some(format!("replayed {} events", events.len()));
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -415,6 +477,16 @@ impl App {
             return;
         }
 
+        // ---- slash commands (dispatch without a model turn) ----
+        if key.code == KeyCode::Enter
+            && !self.input.is_empty()
+            && self.input.starts_with('/')
+        {
+            let cmd = std::mem::take(&mut self.input);
+            self.run_command(&cmd);
+            return;
+        }
+
         // ---- send / queue / send-now ----
         if key.code == KeyCode::Enter {
             let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -606,6 +678,30 @@ impl App {
                     _ => {}
                 }
                 let _ = has_ctrl;
+            }
+            Dialog::Resume(p) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        p.selected = p.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        p.selected = (p.selected + 1).min(p.items.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = p.items.get(p.selected).cloned() {
+                            let id = item.id.clone();
+                            self.dialog = Dialog::None;
+                            self.pending_resume_file = Some(item.file);
+                            self.session_id = id.clone();
+                            self.status = "resuming".into();
+                            let _ = self.cmd_tx.send(Cmd::Load { session_id: id });
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.dialog = Dialog::None;
+                    }
+                    _ => {}
+                }
             }
             Dialog::None => {}
         }

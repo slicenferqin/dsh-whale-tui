@@ -198,6 +198,26 @@ function apply(ctx) {
     return { messageId: message.id }
   }
 
+  // Resume a persisted session (protocol extension). The harness replays
+  // the durable log and hands back a live agent for follow-ups.
+  async function load(params) {
+    const sessionId = String(params.sessionId)
+    const existing = sessions.get(sessionId)
+    if (existing !== undefined) {
+      return { sessionId, alreadyLive: true }
+    }
+    const handle = await ctx.agents.resume({
+      resumeSessionId: SessionId(sessionId),
+      agentOptions: {
+        provider: defaults.provider,
+        model: defaults.model,
+        ...(defaults.maxTokens === undefined ? {} : { maxTokens: defaults.maxTokens }),
+      },
+    })
+    sessions.set(sessionId, handle)
+    return { sessionId }
+  }
+
   // Our protocol extension: hard-cancel the running turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
@@ -258,6 +278,8 @@ function apply(ctx) {
         return initialize(params)
       case 'session/prompt':
         return prompt(params)
+      case 'session/load':
+        return load(params)
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {

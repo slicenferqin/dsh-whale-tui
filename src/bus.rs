@@ -25,6 +25,8 @@ pub enum Cmd {
     Cancel { session_id: String },
     /// Graceful quit; the controller answers the shutdown RPC then acks.
     Shutdown { ack: std::sync::mpsc::Sender<()> },
+    /// Resume a persisted session through the bridge (agents.resume).
+    Load { session_id: String },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond { id: String, result: Value },
 }

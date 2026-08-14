@@ -183,7 +183,11 @@ impl Transcript {
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
-                let input = data.and_then(|d| d.get("input")).map(summarize).unwrap_or_default();
+                let input = data
+                    .and_then(|d| d.get("input"))
+                    .map(summarize)
+                    .or_else(|| data.and_then(|d| d.get("arguments")).map(summarize))
+                    .unwrap_or_default();
                 let i = self.push(CellKind::Tool, name, input);
                 self.cells[i].folded = true;
                 self.selected = Some(i);

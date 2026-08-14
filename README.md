@@ -47,6 +47,16 @@ TS 桥与协议已立起 session/cancel 扩展点，审批/ask_user 双向通道
 
 仓库带 [dsh-plugin](https://github.com/topics/dsh-plugin) topic；发布 npm 后可被 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 精选列表与 dsh-find-plugin 检索收录。
 
+## 模型默认路由
+
+TUI 的默认 provider/model 从 ~/.dsh/settings.yaml 的 dsh-whale-tui: 块读取（缺省回退到全局 agent-default-model:，再回退 stock）：
+
+    dsh-whale-tui:
+      provider: opencode-go
+      model: deepseek-v4-flash
+
+命令行 --provider / --model 优先级最高。
+
 ## 键位（骨架已实现的部分）
 
 | 键 | 行为 |
@@ -61,6 +71,16 @@ TS 桥与协议已立起 session/cancel 扩展点，审批/ask_user 双向通道
 | Ctrl+E | 折叠/展开 thinking（占位） |
 | Ctrl+T | 切主题（dark/light） |
 | Ctrl+Q / Ctrl+D | 退出 |
+
+## Slash 命令（已实现）
+
+| 命令 | 行为 |
+|---|---|
+| /resume | 会话选择器：直读 ~/.dsh/sessions 的 JSONL（zstd 多帧），Enter 恢复并回放完整历史，后续消息走 agents.resume 的活会话 |
+| /new (/clear) | 新会话 |
+| /exit (/quit) | 退出 |
+| /help | 命令列表 |
+| /model /compact | TODO（下一批） |
 
 ## 目录
 

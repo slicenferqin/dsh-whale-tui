@@ -7,6 +7,7 @@ mod app;
 mod bus;
 mod demo;
 mod proto;
+mod resume;
 mod theme;
 mod transcript;
 mod ui;
@@ -37,8 +38,8 @@ OPTIONS:
   --attach-fds         plugin mode: JSON-RPC over inherited fds 3/4 (unix)
   -w, --workspace <d>  agent workspace (default: cwd)
   --session-id <id>    session id (default: generated)
-  --provider <id>      provider route (default: dsh settings agent-default-model)
-  --model <id>         model id (default: dsh settings agent-default-model)
+  --provider <id>      provider route (default: dsh-whale-tui settings block)
+  --model <id>         model id (default: dsh-whale-tui settings block)
   --theme <d|l>        dark (default) | light
   -V, --version        print version
   -h, --help           this help
@@ -143,6 +144,20 @@ fn controller_loop(
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("cancel failed: {e}")));
                 }
             }
+            Cmd::Load { session_id } => {
+                let params = json!({ "sessionId": session_id });
+                match rt.request("session/load", Some(params), Duration::from_secs(30)) {
+                    Ok(_res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/loaded".to_string(),
+                            params: json!({ "sessionId": session_id }),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("load failed: {e}")));
+                    }
+                }
+            }
             Cmd::Respond { id, result } => {
                 if let Err(e) = rt.respond(&id, result) {
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("respond failed: {e}")));
@@ -159,6 +174,9 @@ fn controller_loop(
 
 /// Read provider/model defaults from the local dsh install's settings.yaml
 /// (agent-default-model block). Best effort; returns None when absent.
+/// Read provider/model defaults from the local dsh install's settings.yaml.
+/// Priority: the dsh-whale-tui block (this TUI's own default), then the
+/// shared agent-default-model block. Best effort; None when absent.
 fn local_defaults() -> (Option<String>, Option<String>) {
     let root = std::env::var("DSH_HOME").ok().or_else(|| {
         std::env::var("HOME").ok().map(|h| format!("{h}/.dsh"))
@@ -166,31 +184,36 @@ fn local_defaults() -> (Option<String>, Option<String>) {
     let Some(root) = root else { return (None, None) };
     let path = std::path::Path::new(&root).join("settings.yaml");
     let Ok(text) = std::fs::read_to_string(path) else { return (None, None) };
-    let mut in_block = false;
-    let mut provider = None;
-    let mut model = None;
+    let mut block: Option<&str> = None;
+    let mut whale = (None, None);
+    let mut agent = (None, None);
     for line in text.lines() {
         if !line.starts_with([' ', '\t']) {
-            in_block = line.trim_end() == "agent-default-model:";
+            let head = line.trim_end();
+            if head == "dsh-whale-tui:" {
+                block = Some("whale");
+            } else if head == "agent-default-model:" {
+                block = Some("agent");
+            } else {
+                block = None;
+            }
             continue;
         }
-        if !in_block {
-            continue;
-        }
+        let Some(b) = block else { continue };
         let Some((k, v)) = line.trim().split_once(':') else { continue };
         let v = v.trim().trim_matches(|c| c == '\'' || c == '"').trim();
         if v.is_empty() {
             continue;
         }
+        let slot = if b == "whale" { &mut whale } else { &mut agent };
         match k.trim() {
-            "provider" => provider = Some(v.to_string()),
-            "model" => model = Some(v.to_string()),
+            "provider" => slot.0 = Some(v.to_string()),
+            "model" => slot.1 = Some(v.to_string()),
             _ => {}
         }
     }
-    (provider, model)
+    if whale.0.is_some() || whale.1.is_some() { whale } else { agent }
 }
-
 fn main() -> Result<()> {
     #[cfg(unix)]
     unsafe {
@@ -241,7 +264,7 @@ fn main() -> Result<()> {
     {
         let tx = bus_tx.clone();
         let cfg = RuntimeCfg {
-            cwd,
+            cwd: cwd.clone(),
             provider: provider.clone(),
             model: model.clone(),
         };
@@ -281,7 +304,7 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let theme = theme::theme_for(&args.theme);
-    let mut app = App::new(theme, session_id, model, args.demo, cmd_tx.clone());
+    let mut app = App::new(theme, session_id, model, args.demo, cmd_tx.clone(), cwd);
     if args.demo {
         demo::seed(&mut app);
     }
