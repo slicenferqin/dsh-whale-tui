@@ -104,6 +104,49 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Dialog::FilePicker(fp) => {
+            let w = area.width.min(80).saturating_sub(4).max(40);
+            let h = (fp.visible.len().min(12) as u16 + 3).max(5);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                format!(" @{} — Tab/Enter 插入 · Esc 关闭", fp.query),
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (row_idx, item_idx) in fp.visible.iter().take(12).enumerate() {
+                let row = &fp.files[*item_idx];
+                let selected = row_idx == fp.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", mark, row),
+                    style,
+                )));
+            }
+            if fp.visible.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " (无匹配)",
+                    Style::default().fg(app.theme.gray_dim),
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" file ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
         Dialog::Model(m) => {
             let vis = m.visible();
             let w = area.width.min(84).saturating_sub(4).max(40);
@@ -428,6 +471,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         Dialog::Approval(_) => "↑/↓ select · 1-9 pick · Enter confirm · Esc cancel · Ctrl+Q quit",
         Dialog::Resume(_) => "↑/↓ select · Enter resume · Esc close · Ctrl+Q quit",
         Dialog::Model(_) => "type filter · ↑/↓ select · Enter switch · Esc close · Ctrl+Q quit",
+        Dialog::FilePicker(_) => "type filter · ↑/↓ select · Tab/Enter insert · Esc close · Ctrl+Q quit",
         Dialog::Ask(d) => {
             let cur = d.current.min(d.questions.len().saturating_sub(1));
             if d.questions[cur].plan_approve.is_some() {

@@ -7,6 +7,7 @@ mod app;
 mod bus;
 mod demo;
 mod proto;
+mod files;
 mod resume;
 mod theme;
 mod transcript;
@@ -196,6 +197,20 @@ fn controller_loop(
                     }
                     Err(e) => {
                         let _ = bus.send(AppEvent::RuntimeStderr(format!("permission failed: {e}")));
+                    }
+                }
+            }
+            Cmd::Compact { session_id } => {
+                let params = json!({ "sessionId": session_id });
+                match rt.request("tui/compact", Some(params), Duration::from_secs(310)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/compacted".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("compact failed: {e}")));
                     }
                 }
             }

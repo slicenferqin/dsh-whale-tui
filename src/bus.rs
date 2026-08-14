@@ -35,6 +35,8 @@ pub enum Cmd {
     ListLive,
     /// Switch the live session's permission preset.
     SetPermission { session_id: String, preset: String },
+    /// Manual compaction (the agent must be idle).
+    Compact { session_id: String },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond { id: String, result: Value },
 }

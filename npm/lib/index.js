@@ -313,6 +313,22 @@ function apply(ctx) {
     return { ok: true, applied: preset }
   }
 
+  // Manual compaction over the harness's compaction seam. The agent must be
+  // idle; busy / no-history outcomes surface as typed errors to the TUI.
+  async function tuiCompact(params) {
+    const compaction = ctx.get('compaction')
+    if (compaction === undefined) throw new Error('no compaction service in this profile')
+    const sessionId = String(params.sessionId)
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) {
+      // No session = no history yet; nothing to compact.
+      return { ok: true, result: null }
+    }
+    const signal = AbortSignal.timeout(300000)
+    const result = await compaction.compactNow(handle.agent, signal, 'dsh-whale-tui')
+    return { ok: true, result: result ?? null }
+  }
+
   // Our protocol extension: hard-cancel the running turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
@@ -383,6 +399,8 @@ function apply(ctx) {
         return tuiLiveSessions()
       case 'tui/permission':
         return tuiPermission(params)
+      case 'tui/compact':
+        return tuiCompact(params)
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {

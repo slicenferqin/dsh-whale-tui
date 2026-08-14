@@ -10,6 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde_json::{json, Value};
 
 use crate::bus::{AppEvent, Cmd};
+use crate::files::{fuzzy_filter, list_files};
 use crate::resume::{list_sessions, read_session_events, SessionSummary};
 use crate::theme::Theme;
 use crate::transcript::{CellKind, Transcript};
@@ -87,6 +88,14 @@ pub struct ModelEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct FilePicker {
+    pub files: Vec<String>,
+    pub query: String,
+    pub selected: usize,
+    pub visible: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelPicker {
     pub rows: Vec<ModelEntry>,
     pub filter: String,
@@ -115,6 +124,7 @@ pub enum Dialog {
     Ask(AskDialog),
     Resume(ResumePicker),
     Model(ModelPicker),
+    FilePicker(FilePicker),
 }
 
 pub struct App {
@@ -135,6 +145,7 @@ pub struct App {
     pub demo: bool,
     pub dialog: Dialog,
     pub workspace: String,
+    at_fragment_start: Option<usize>,
     permission_presets: Vec<String>,
     preset_index: usize,
     catalog_for_presets: bool,
@@ -171,6 +182,7 @@ impl App {
             demo,
             dialog: Dialog::None,
             workspace,
+            at_fragment_start: None,
             permission_presets: Vec::new(),
             preset_index: 0,
             catalog_for_presets: false,
@@ -250,7 +262,12 @@ impl App {
                 self.status = "loading models".into();
                 let _ = self.cmd_tx.send(Cmd::FetchCatalog);
             }
-            "/compact" => self.notice = Some("compact: TODO".into()),
+            "/compact" => {
+                self.status = "compacting".into();
+                let _ = self.cmd_tx.send(Cmd::Compact {
+                    session_id: self.session_id.clone(),
+                });
+            }
             other => self.notice = Some(format!("unknown command {other}")),
         }
     }
@@ -353,6 +370,10 @@ impl App {
                         self.model = model.to_string();
                         self.status = format!("model: {provider}/{model}");
                     }
+                }
+                "tui/compacted" => {
+                    self.status = "compacted".into();
+                    self.notice = Some("history compacted".into());
                 }
                 "tui/permission-set" => {
                     if let Some(p) = params.get("applied").and_then(|v| v.as_str()) {
@@ -730,6 +751,18 @@ impl App {
 
         // ---- prompt editing ----
         match key.code {
+            KeyCode::Char('@') => {
+                let files = list_files(&self.workspace);
+                let visible = fuzzy_filter(&files, "");
+                self.at_fragment_start = Some(self.input.len());
+                self.input.push('@');
+                self.dialog = Dialog::FilePicker(FilePicker {
+                    files,
+                    query: String::new(),
+                    selected: 0,
+                    visible,
+                });
+            }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => {
                 self.input.pop();
@@ -964,6 +997,43 @@ impl App {
                     _ => {}
                 }
                 let _ = has_ctrl;
+            }
+            Dialog::FilePicker(f) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        f.selected = f.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        f.selected = (f.selected + 1).min(f.visible.len().saturating_sub(1));
+                    }
+                    KeyCode::Char(c) => {
+                        f.query.push(c);
+                        f.visible = fuzzy_filter(&f.files, &f.query);
+                        f.selected = 0;
+                    }
+                    KeyCode::Backspace => {
+                        f.query.pop();
+                        f.visible = fuzzy_filter(&f.files, &f.query);
+                        f.selected = 0;
+                    }
+                    KeyCode::Enter | KeyCode::Tab => {
+                        if let Some(idx) = f.visible.get(f.selected) {
+                            let path = f.files[*idx].clone();
+                            if let Some(start) = self.at_fragment_start {
+                                self.input.truncate(start);
+                                self.input.push_str(&path);
+                                self.input.push(' ');
+                            }
+                            self.at_fragment_start = None;
+                            self.dialog = Dialog::None;
+                            self.focus = Focus::Prompt;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.dialog = Dialog::None;
+                    }
+                    _ => {}
+                }
             }
             Dialog::Model(m) => {
                 match key.code {
