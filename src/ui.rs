@@ -104,6 +104,42 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Dialog::Rewind(r) => {
+            let w = area.width.min(80).saturating_sub(4).max(40);
+            let h = (r.items.len() as u16 + 3).min(area.height.saturating_sub(4)).max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                " rewind — Enter 回滚到该消息之前 · Esc 关闭",
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (i, item) in r.items.iter().enumerate() {
+                let selected = i == r.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{}{} (#{})", mark, item.preview, item.seq),
+                    style,
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" rewind ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
         Dialog::FilePicker(fp) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
             let h = (fp.visible.len().min(12) as u16 + 3).max(5);
@@ -472,6 +508,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         Dialog::Resume(_) => "↑/↓ select · Enter resume · Esc close · Ctrl+Q quit",
         Dialog::Model(_) => "type filter · ↑/↓ select · Enter switch · Esc close · Ctrl+Q quit",
         Dialog::FilePicker(_) => "type filter · ↑/↓ select · Tab/Enter insert · Esc close · Ctrl+Q quit",
+        Dialog::Rewind(_) => "↑/↓ select · Enter rewind · Esc close · Ctrl+Q quit",
         Dialog::Ask(d) => {
             let cur = d.current.min(d.questions.len().saturating_sub(1));
             if d.questions[cur].plan_approve.is_some() {

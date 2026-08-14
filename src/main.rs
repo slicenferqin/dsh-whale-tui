@@ -214,6 +214,20 @@ fn controller_loop(
                     }
                 }
             }
+            Cmd::Rewind { session_id, boundary } => {
+                let params = json!({ "sessionId": session_id, "boundary": boundary });
+                match rt.request("tui/rewind", Some(params), Duration::from_secs(30)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/rewound".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("rewind failed: {e}")));
+                    }
+                }
+            }
             Cmd::ListLive => {
                 match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
                     Ok(res) => {

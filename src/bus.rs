@@ -37,6 +37,8 @@ pub enum Cmd {
     SetPermission { session_id: String, preset: String },
     /// Manual compaction (the agent must be idle).
     Compact { session_id: String },
+    /// Rewind: fork the session at a turn boundary.
+    Rewind { session_id: String, boundary: u64 },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond { id: String, result: Value },
 }

@@ -88,6 +88,19 @@ pub struct ModelEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct RewindEntry {
+    pub seq: u64,
+    pub cell: usize,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindPicker {
+    pub items: Vec<RewindEntry>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct FilePicker {
     pub files: Vec<String>,
     pub query: String,
@@ -125,6 +138,7 @@ pub enum Dialog {
     Resume(ResumePicker),
     Model(ModelPicker),
     FilePicker(FilePicker),
+    Rewind(RewindPicker),
 }
 
 pub struct App {
@@ -226,6 +240,38 @@ impl App {
             session_id: self.session_id.clone(),
             text,
         });
+    }
+
+    fn open_rewind(&mut self) {
+        let entries: Vec<RewindEntry> = self
+            .transcript
+            .turns
+            .iter()
+            .filter_map(|t| {
+                let preview = self
+                    .transcript
+                    .cells
+                    .get(t.cell)
+                    .map(|c| {
+                        let one: String = c.text.replace('\n', " ").chars().take(48).collect();
+                        one
+                    })
+                    .unwrap_or_default();
+                Some(RewindEntry {
+                    seq: t.seq,
+                    cell: t.cell,
+                    preview,
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            self.notice = Some("no turns to rewind".into());
+        } else {
+            self.dialog = Dialog::Rewind(RewindPicker {
+                items: entries,
+                selected: 0,
+            });
+        }
     }
 
     fn run_command(&mut self, cmd: &str) {
@@ -370,6 +416,23 @@ impl App {
                         self.model = model.to_string();
                         self.status = format!("model: {provider}/{model}");
                     }
+                }
+                "tui/rewound" => {
+                    if let Some(new_id) = params.get("newSessionId").and_then(|v| v.as_str()) {
+                        self.session_id = new_id.to_string();
+                    }
+                    if let Some(b) = params.get("boundary").and_then(|v| v.as_u64()) {
+                        if let Some(t) = self.transcript.turns.iter().find(|t| t.seq == b) {
+                            let cut = t.cell + 1;
+                            self.transcript.cells.truncate(cut);
+                            self.transcript.turns.retain(|m| m.seq <= b);
+                            self.transcript.selected = None;
+                        }
+                    }
+                    self.queue.clear();
+                    self.scroll = 0;
+                    self.status = "rewound".into();
+                    self.notice = Some("rewound (new session continues here)".into());
                 }
                 "tui/compacted" => {
                     self.status = "compacted".into();
@@ -588,30 +651,43 @@ impl App {
         }
 
         // ---- Esc semantics (docs/01 section 2.5) ----
+        // Rapid ESC ESC collapses to Alt+Esc on most terminals; treat it as
+        // the second press so double-Esc works whether spaced or instant.
         if key.code == KeyCode::Esc {
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
             if self.is_running() {
                 self.cancel_now();
                 return;
             }
             if !self.input.is_empty() {
-                let now = Instant::now();
-                match self.esc {
-                    EscArm::ClearArmed(t) if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS => {
-                        self.history.push(std::mem::take(&mut self.input));
-                        self.esc = EscArm::None;
+                if alt {
+                    self.history.push(std::mem::take(&mut self.input));
+                    self.esc = EscArm::None;
+                } else {
+                    let now = Instant::now();
+                    match self.esc {
+                        EscArm::ClearArmed(t) if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS => {
+                            self.history.push(std::mem::take(&mut self.input));
+                            self.esc = EscArm::None;
+                        }
+                        _ => self.esc = EscArm::ClearArmed(now),
                     }
-                    _ => self.esc = EscArm::ClearArmed(now),
                 }
                 return;
             }
             if !self.transcript.is_empty() {
-                let now = Instant::now();
-                match self.esc {
-                    EscArm::RewindArmed(t) if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS => {
-                        self.notice = Some("rewind: TODO (ctx.sessions.fork + replay)".into());
-                        self.esc = EscArm::None;
+                if alt {
+                    self.esc = EscArm::None;
+                    self.open_rewind();
+                } else {
+                    let now = Instant::now();
+                    match self.esc {
+                        EscArm::RewindArmed(t) if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS => {
+                            self.esc = EscArm::None;
+                            self.open_rewind();
+                        }
+                        _ => self.esc = EscArm::RewindArmed(now),
                     }
-                    _ => self.esc = EscArm::RewindArmed(now),
                 }
                 return;
             }
@@ -1027,6 +1103,31 @@ impl App {
                             self.at_fragment_start = None;
                             self.dialog = Dialog::None;
                             self.focus = Focus::Prompt;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.dialog = Dialog::None;
+                    }
+                    _ => {}
+                }
+            }
+            Dialog::Rewind(r) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        r.selected = r.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        r.selected = (r.selected + 1).min(r.items.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = r.items.get(r.selected) {
+                            let session_id = self.session_id.clone();
+                            let boundary = item.seq;
+                            self.dialog = Dialog::None;
+                            self.status = "rewinding".into();
+                            let _ = self
+                                .cmd_tx
+                                .send(Cmd::Rewind { session_id, boundary });
                         }
                     }
                     KeyCode::Esc => {

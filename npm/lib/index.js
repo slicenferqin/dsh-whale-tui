@@ -329,6 +329,36 @@ function apply(ctx) {
     return { ok: true, result: result ?? null }
   }
 
+  // Rewind: fork the session at a turn boundary. The child agent is
+  // created with the prefix events as its seed (the same mechanism the
+  // official fork subagent uses), so model context restarts exactly at
+  // the chosen user message.
+  async function tuiRewind(params) {
+    const sessionId = String(params.sessionId)
+    const boundary = Number(params.boundary)
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) throw new Error('unknown session: ' + sessionId)
+    const source = handle.agent.session
+    const seed = source.events.slice(0, boundary + 1)
+    const childId = SessionId(crypto.randomUUID())
+    const childHandle = await ctx.agents.create({
+      sessionId: childId,
+      meta: {
+        cwd: defaults.cwd,
+        parentSession: source.id,
+        seedLength: seed.length,
+      },
+      seed,
+      agentOptions: {
+        provider: defaults.provider,
+        model: defaults.model,
+        ...(defaults.maxTokens === undefined ? {} : { maxTokens: defaults.maxTokens }),
+      },
+    })
+    sessions.set(String(childId), childHandle)
+    return { ok: true, newSessionId: String(childId), boundary }
+  }
+
   // Our protocol extension: hard-cancel the running turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
@@ -401,6 +431,8 @@ function apply(ctx) {
         return tuiPermission(params)
       case 'tui/compact':
         return tuiCompact(params)
+      case 'tui/rewind':
+        return tuiRewind(params)
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {

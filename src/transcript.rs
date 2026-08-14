@@ -30,6 +30,14 @@ pub struct Cell {
     pub failed: bool,
 }
 
+/// One user turn for the rewind picker: its durable seq plus the render cell
+/// that starts it (truncation point for display-level rollback).
+#[derive(Debug, Clone, Copy)]
+pub struct TurnMarker {
+    pub seq: u64,
+    pub cell: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Usage {
     pub input: u64,
@@ -54,6 +62,7 @@ pub struct Transcript {
     pub cells: Vec<Cell>,
     pub selected: Option<usize>,
     pub usage: Usage,
+    pub turns: Vec<TurnMarker>,
     next_id: u64,
     blocks: HashMap<u64, BlockState>,
 }
@@ -99,6 +108,9 @@ impl Transcript {
                 let text = text_blocks(data);
                 if !text.is_empty() {
                     let i = self.push(CellKind::User, String::new(), text);
+                    if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+                        self.turns.push(TurnMarker { seq, cell: i });
+                    }
                     self.selected = Some(i);
                 }
             }
