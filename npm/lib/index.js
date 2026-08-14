@@ -359,6 +359,42 @@ function apply(ctx) {
     return { ok: true, newSessionId: String(childId), boundary }
   }
 
+  // Session facts for /session-info: model route, cwd, completed turns,
+  // and the latest usage chunk (scanned backwards from the durable log).
+  async function tuiSessionInfo(params) {
+    const sessionId = String(params.sessionId)
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) {
+      return {
+        sessionId,
+        provider: defaults.provider,
+        model: defaults.model,
+        cwd: defaults.cwd,
+        turns: 0,
+        usage: null,
+      }
+    }
+    const events = handle.agent.session.events
+    let turns = 0
+    let usage = null
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i]
+      if (e.type === 'turn/end') turns++
+      if (usage === null && e.type === 'assistant/chunk') {
+        const c = e.data && e.data.chunk
+        if (c && c.type === 'usage' && c.usage) usage = c.usage
+      }
+    }
+    return {
+      sessionId,
+      provider: defaults.provider,
+      model: defaults.model,
+      cwd: defaults.cwd,
+      turns,
+      usage,
+    }
+  }
+
   // Our protocol extension: hard-cancel the running turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
@@ -433,6 +469,8 @@ function apply(ctx) {
         return tuiCompact(params)
       case 'tui/rewind':
         return tuiRewind(params)
+      case 'tui/session-info':
+        return tuiSessionInfo(params)
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {

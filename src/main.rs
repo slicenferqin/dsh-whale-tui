@@ -236,6 +236,21 @@ fn controller_loop(
                     }
                 }
             }
+            Cmd::SessionInfo { session_id } => {
+                let params = json!({ "sessionId": session_id });
+                match rt.request("tui/session-info", Some(params), Duration::from_secs(15)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/session-info-result".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ =
+                            bus.send(AppEvent::RuntimeStderr(format!("session-info failed: {e}")));
+                    }
+                }
+            }
             Cmd::ListLive => match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
                 Ok(res) => {
                     let _ = bus.send(AppEvent::Rpc {

@@ -73,11 +73,24 @@ pub struct AskDialog {
     pub feedback: String,
     pub taking_feedback: bool,
     pub detail_scroll: usize,
+    pub custom_text: String,
+    pub taking_text: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResumePicker {
     pub items: Vec<SessionSummary>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct InfoDialog {
+    pub rows: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThemePicker {
+    pub original: crate::theme::Theme,
     pub selected: usize,
 }
 
@@ -154,6 +167,8 @@ pub enum Dialog {
     FilePicker(FilePicker),
     Rewind(RewindPicker),
     Palette(Palette),
+    Info(InfoDialog),
+    Theme(ThemePicker),
 }
 
 pub struct App {
@@ -375,6 +390,20 @@ impl App {
                     .unwrap_or_default();
                 self.copy_text(text);
             }
+            "/session-info" | "/context" | "/status" | "/info" => {
+                let _ = self.cmd_tx.send(Cmd::SessionInfo {
+                    session_id: self.session_id.clone(),
+                });
+            }
+            "/theme" => {
+                if self.has_dialog() {
+                    self.dialog = Dialog::None;
+                } else {
+                    let original = self.theme;
+                    let selected = if self.theme.name == "dark" { 0 } else { 1 };
+                    self.dialog = Dialog::Theme(ThemePicker { original, selected });
+                }
+            }
             "/help" => {
                 self.notice = Some("/resume /new /exit /help ready · /model /compact TODO".into())
             }
@@ -509,6 +538,41 @@ impl App {
                         self.model = model.to_string();
                         self.status = format!("model: {provider}/{model}");
                     }
+                }
+                "tui/session-info-result" => {
+                    let get = |k: &str| {
+                        params
+                            .get(k)
+                            .map(|v| match v {
+                                serde_json::Value::String(sv) => sv.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Null => "-".to_string(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_else(|| "-".to_string())
+                    };
+                    let mut rows = vec![
+                        ("session".to_string(), get("sessionId")),
+                        (
+                            "model".to_string(),
+                            format!("{}/{}", get("provider"), get("model")),
+                        ),
+                        ("cwd".to_string(), get("cwd")),
+                        ("turns".to_string(), get("turns")),
+                    ];
+                    if let Some(u) = params.get("usage") {
+                        let g = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                        rows.push((
+                            "usage".to_string(),
+                            format!(
+                                "in {} · out {} · cache {}",
+                                g("inputTokens"),
+                                g("outputTokens"),
+                                g("cacheReadTokens")
+                            ),
+                        ));
+                    }
+                    self.dialog = Dialog::Info(InfoDialog { rows });
                 }
                 "tui/rewound" => {
                     if let Some(new_id) = params.get("newSessionId").and_then(|v| v.as_str()) {
@@ -693,6 +757,8 @@ impl App {
                     feedback: String::new(),
                     taking_feedback: false,
                     detail_scroll: 0,
+                    custom_text: String::new(),
+                    taking_text: false,
                 });
             }
             _ => {
@@ -1182,8 +1248,31 @@ impl App {
                             d.answers[cur].push(idx);
                         }
                     }
+                    // Free-text answer (docs/01 section 2.4, z key): custom
+                    // overrides the selection for single-select questions.
+                    KeyCode::Char('z') => {
+                        d.taking_text = true;
+                    }
+                    KeyCode::Char(c) if d.taking_text => {
+                        d.custom_text.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        if d.taking_text {
+                            d.custom_text.pop();
+                        }
+                    }
                     KeyCode::Enter => {
-                        if cur + 1 < n {
+                        if d.taking_text {
+                            // submit with the typed answer
+                            let custom = std::mem::take(&mut d.custom_text);
+                            let qid = d.questions[cur].id.clone();
+                            let id = d.request_id.clone();
+                            self.dialog = Dialog::None;
+                            self.respond(
+                                id,
+                                json!({ "answers": [ { "id": qid, "selected": [], "custom": custom } ] }),
+                            );
+                        } else if cur + 1 < n {
                             d.current = cur + 1;
                         } else {
                             // Submit: build the canonical answer shape.
@@ -1205,10 +1294,15 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
-                        // Skip the whole batch (agent continues without answers).
-                        let id = d.request_id.clone();
-                        self.dialog = Dialog::None;
-                        self.respond(id, json!({ "answers": [] }));
+                        if d.taking_text {
+                            d.taking_text = false;
+                            d.custom_text.clear();
+                        } else {
+                            // Skip the whole batch (agent continues without answers).
+                            let id = d.request_id.clone();
+                            self.dialog = Dialog::None;
+                            self.respond(id, json!({ "answers": [] }));
+                        }
                     }
                     _ => {}
                 }
@@ -1245,6 +1339,29 @@ impl App {
                     }
                 }
                 KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
+            Dialog::Info(_) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                    self.dialog = Dialog::None;
+                }
+            }
+            Dialog::Theme(t) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                    t.selected = 1 - t.selected;
+                    self.theme = if t.selected == 0 {
+                        crate::theme::DARK
+                    } else {
+                        crate::theme::LIGHT
+                    };
+                }
+                KeyCode::Enter => {
+                    self.dialog = Dialog::None;
+                }
+                KeyCode::Esc => {
+                    self.theme = t.original;
                     self.dialog = Dialog::None;
                 }
                 _ => {}

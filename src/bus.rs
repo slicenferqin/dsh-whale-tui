@@ -63,6 +63,10 @@ pub enum Cmd {
         session_id: String,
         boundary: u64,
     },
+    /// /session-info: session facts for the info dialog.
+    SessionInfo {
+        session_id: String,
+    },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond {
         id: String,

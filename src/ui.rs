@@ -106,6 +106,72 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Dialog::Info(d) => {
+            let w = area.width.min(80).saturating_sub(4).max(40);
+            let h = (d.rows.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                " session info — q/Enter/Esc 关闭",
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (k, v) in &d.rows {
+                let one: String = v.chars().take(60).collect();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {}: ", k),
+                        Style::default().fg(app.theme.accent_plan),
+                    ),
+                    Span::styled(one, Style::default().fg(app.theme.text_primary)),
+                ]));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" info ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
+        Dialog::Theme(t) => {
+            let w = area.width.min(40).saturating_sub(4).max(20);
+            let h = 6u16;
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                " /theme — 实时预览 · Enter 保持 · Esc 还原",
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (i, name) in ["dark", "light"].iter().enumerate() {
+                let selected = i == t.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                lines.push(Line::from(Span::styled(format!("{}{}", mark, name), style)));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" theme ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
         Dialog::Palette(p) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
             let h = (p.visible.len().min(12) as u16 + 3).max(5);
@@ -369,6 +435,13 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 )));
                 lines.push(Line::from(""));
             }
+            if d.taking_text {
+                lines.push(Line::from(Span::styled(
+                    format!(" z: 文本: {}", d.custom_text),
+                    Style::default().fg(app.theme.accent_plan),
+                )));
+                lines.push(Line::from(""));
+            }
             for (i, opt) in q.options.iter().enumerate() {
                 let chosen = d.answers[cur].contains(&i);
                 let cursor = if chosen { "› " } else { "  " };
@@ -608,12 +681,14 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         Dialog::FilePicker(_) => "type filter · ↑/↓ select · Tab/Enter insert · Esc close · Ctrl+Q quit",
         Dialog::Rewind(_) => "↑/↓ select · Enter rewind · Esc close · Ctrl+Q quit",
         Dialog::Palette(_) => "type filter · ↑/↓ select · Enter run · Esc close · Ctrl+Q quit",
+        Dialog::Info(_) => "q/Enter/Esc close · Ctrl+Q quit",
+        Dialog::Theme(_) => "↑/↓ preview · Enter keep · Esc revert · Ctrl+Q quit",
         Dialog::Ask(d) => {
             let cur = d.current.min(d.questions.len().saturating_sub(1));
             if d.questions[cur].plan_approve.is_some() {
                 "a approve · s request changes · c comment · y copy · q quit · ↑/↓ scroll · Ctrl+Q quit"
             } else {
-                "↑/↓ select · ←/→ question · 1-9 pick · Space toggle · Enter next/submit · Esc skip · Ctrl+Q quit"
+                "↑/↓ select · ←/→ question · 1-9 pick · Space toggle · z text · Enter next/submit · Esc skip · Ctrl+Q quit"
             }
         }
         Dialog::None => match app.focus {
