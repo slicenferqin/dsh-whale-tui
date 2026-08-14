@@ -48,6 +48,9 @@ pub struct ApprovalDialog {
     pub input: String,
     pub options: Vec<String>,
     pub selected: usize,
+    /// docs/01 section 2.4: Esc parks the keyboard in the scrollback while
+    /// the card stays visible; Tab hands the keyboard back to the card.
+    pub parked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +694,7 @@ impl App {
                     input,
                     options,
                     selected: 0,
+                    parked: false,
                 });
             }
             "ui/ask-user" => {
@@ -783,7 +787,18 @@ impl App {
         }
 
         // ---- blocking dialogs take over the keyboard (docs/01 section 2.4) ----
-        if self.has_dialog() {
+        // A parked approval card keeps the dialog visible but hands the
+        // keyboard to the scrollback; Tab returns to the card.
+        let parked = matches!(&self.dialog, Dialog::Approval(d) if d.parked);
+        if parked {
+            if key.code == KeyCode::Tab {
+                if let Dialog::Approval(d) = &mut self.dialog {
+                    d.parked = false;
+                }
+                return;
+            }
+            // fall through to normal scrollback handling below
+        } else if self.has_dialog() {
             self.dialog_key(key);
             return;
         }
@@ -1090,7 +1105,17 @@ impl App {
                 self.copy_text(detail);
             }
             KeyCode::Char('c') => {
-                self.notice = Some("line comment: TODO".into());
+                // Line comment: enter feedback mode prefixed with the line
+                // under the detail cursor; comments ride the request-changes
+                // (s) answer's custom field.
+                let line_no = {
+                    let Dialog::Ask(d) = &self.dialog else { return };
+                    d.detail_scroll + 1
+                };
+                if let Dialog::Ask(d) = &mut self.dialog {
+                    d.feedback = format!("L{}: ", line_no);
+                    d.taking_feedback = true;
+                }
             }
             KeyCode::Char('s') => {
                 if let Dialog::Ask(d) = &mut self.dialog {
@@ -1173,8 +1198,13 @@ impl App {
                         self.dialog = Dialog::None;
                         self.respond(id, json!({ "outcome": outcome }));
                     }
-                    // Esc parks in grok; skeleton cancels the request instead.
+                    // docs/01 section 2.4: Esc parks focus in the scrollback
+                    // without answering; Tab returns to the card.
                     KeyCode::Esc => {
+                        d.parked = true;
+                        self.focus = Focus::Scrollback;
+                    }
+                    KeyCode::Char('c') if has_ctrl => {
                         let id = d.request_id.clone();
                         self.dialog = Dialog::None;
                         self.respond(id, json!({ "outcome": "cancelled" }));

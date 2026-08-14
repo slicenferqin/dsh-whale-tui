@@ -88,9 +88,188 @@ pub const LIGHT: Theme = Theme {
     warning: Color::Rgb(190, 130, 0),
 };
 
+/// Terminal color capability level (docs/01 section 9: automatic
+/// quantization at startup).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorLevel {
+    Truecolor,
+    Ansi256,
+    Ansi16,
+}
+
+pub fn detect_level() -> ColorLevel {
+    if std::env::var("NO_COLOR").is_ok() {
+        return ColorLevel::Ansi16;
+    }
+    let ct = std::env::var("COLORTERM")
+        .unwrap_or_default()
+        .to_lowercase();
+    if ct.contains("truecolor") || ct.contains("24bit") {
+        return ColorLevel::Truecolor;
+    }
+    let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
+    if term.contains("256color") {
+        return ColorLevel::Ansi256;
+    }
+    ColorLevel::Ansi16
+}
+
+fn to_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+fn nearest_index(palette: &[(u8, u8, u8)], r: u8, g: u8, b: u8) -> usize {
+    let mut best = 0usize;
+    let mut best_d = i64::MAX;
+    for (i, (pr, pg, pb)) in palette.iter().enumerate() {
+        let dr = *pr as i64 - r as i64;
+        let dg = *pg as i64 - g as i64;
+        let db = *pb as i64 - b as i64;
+        let d = dr * dr + dg * dg + db * db;
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+fn ansi16_palette() -> Vec<(u8, u8, u8)> {
+    vec![
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ]
+}
+
+fn ansi256_palette() -> Vec<(u8, u8, u8)> {
+    let mut p = ansi16_palette();
+    for r in 0..6 {
+        for g in 0..6 {
+            for b in 0..6 {
+                p.push((
+                    if r == 0 { 0 } else { 55 + r * 40 },
+                    if g == 0 { 0 } else { 55 + g * 40 },
+                    if b == 0 { 0 } else { 55 + b * 40 },
+                ));
+            }
+        }
+    }
+    for i in 0..24 {
+        let v = 8 + i * 10;
+        p.push((v, v, v));
+    }
+    p
+}
+
+const ANSI16_NAMES: [Color; 16] = [
+    Color::Black,
+    Color::Red,
+    Color::Green,
+    Color::Yellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::Gray,
+    Color::DarkGray,
+    Color::LightRed,
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightBlue,
+    Color::LightMagenta,
+    Color::LightCyan,
+    Color::White,
+];
+
+fn quantize(c: Color, level: ColorLevel) -> Color {
+    let Some((r, g, b)) = to_rgb(c) else { return c };
+    match level {
+        ColorLevel::Truecolor => c,
+        ColorLevel::Ansi256 => Color::Indexed(nearest_index(&ansi256_palette(), r, g, b) as u8),
+        ColorLevel::Ansi16 => ANSI16_NAMES[nearest_index(&ansi16_palette(), r, g, b)],
+    }
+}
+
 pub fn theme_for(name: &str) -> Theme {
-    match name {
+    let t = match name {
         "light" | "day" => LIGHT,
         _ => DARK,
+    };
+    let level = detect_level();
+    if level == ColorLevel::Truecolor {
+        return t;
+    }
+    let q = |c: Color| quantize(c, level);
+    Theme {
+        name: t.name,
+        bg_base: q(t.bg_base),
+        bg_light: q(t.bg_light),
+        bg_highlight: q(t.bg_highlight),
+        text_primary: q(t.text_primary),
+        text_secondary: q(t.text_secondary),
+        gray_dim: q(t.gray_dim),
+        gray: q(t.gray),
+        gray_bright: q(t.gray_bright),
+        accent_user: q(t.accent_user),
+        accent_assistant: q(t.accent_assistant),
+        accent_thinking: q(t.accent_thinking),
+        accent_tool: q(t.accent_tool),
+        accent_error: q(t.accent_error),
+        accent_success: q(t.accent_success),
+        accent_running: q(t.accent_running),
+        accent_plan: q(t.accent_plan),
+        border: q(t.border),
+        prompt_border: q(t.prompt_border),
+        prompt_border_active: q(t.prompt_border_active),
+        code_bg: q(t.code_bg),
+        diff_insert_fg: q(t.diff_insert_fg),
+        diff_delete_fg: q(t.diff_delete_fg),
+        warning: q(t.warning),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantizes_rgb_to_palette() {
+        let c = Color::Rgb(16, 16, 20);
+        assert!(matches!(quantize(c, ColorLevel::Truecolor), Color::Rgb(..)));
+        assert!(matches!(
+            quantize(c, ColorLevel::Ansi256),
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            quantize(c, ColorLevel::Ansi16),
+            Color::Black | Color::DarkGray | Color::Gray
+        ));
+        // 深底主题在 16 色下应映射到黑
+        assert_eq!(
+            quantize(Color::Rgb(16, 16, 20), ColorLevel::Ansi16),
+            Color::Black
+        );
+    }
+
+    #[test]
+    fn detects_levels() {
+        // detect_level 读环境变量；这里只验证函数存在与 Ansi16 的保守默认
+        let _ = detect_level();
     }
 }

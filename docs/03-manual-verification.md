@@ -68,11 +68,11 @@ Web 与 TUI 是不同进程，互不可见。
 | /compact | 长会话后执行 → 上下文 token 明显下降、历史要点保留、模型仍能接上下文 |
 | Esc rewind（2×Esc） | [x] 已验证 2026-08-14：选择器出现（turn+seq 列表）→ Enter → 新会话从边界继续；追问后模型只记得 alpha 不记得 beta（上下文语义级截断）。注意：快速连发 ESC 会被终端折叠成 Alt+Esc（已处理），间隔按两下最稳；fork 语义=旧会话保留（与 grok 的丢弃不同） |
 | @file 补全 | 输入 @ + 部分文件名 → 候选列表、.gitignore 尊重、回车插入路径并附内容 |
-| c（plan 行评论）/ y（复制） | plan 审批里按 c 选行评论回模型；y 复制全文到剪贴板 |
+| c（plan 行评论）/ y（复制） | y [x] 已实现（2026-08-14，复制全文）；c 已实现为带行号前缀的反馈模式（L{行}: 意见，随 s 的 custom 回模型） |
 | /session-info、/context | 显示会话详情/上下文分类明细 |
 | 命令面板 Ctrl+P | 快捷键+slash+skills 可搜索 |
 | 剪贴板 | 在 tmux/SSH 下复制走三路由（native→tmux→OSC52）+ 备份文件 |
-| 主题 | /theme 实时预览、深浅切换、窄终端自适应 |
+| 主题 | [x] 部分验证（2026-08-14）：/theme 实时预览 + 深浅切换 + 16/256 色量化（16 色终端无 RGB 转义）；窄终端自适应待验 |
 | 图片粘贴 | macOS Cmd+V 截图 → chip；Windows Alt+V |
 | 多窗口 | 两个 TUI 窗口各自会话、互不干扰 |
 | Windows | standalone 模式（fd 3/4 仅 unix；plugin 模式 Windows 走 standalone 或需 named pipe） |
@@ -82,7 +82,7 @@ Web 与 TUI 是不同进程，互不可见。
 - [x] 状态栏裁半格 —— 已修（2026-08-14）：CJK 感知宽度截断，右侧按测量宽度排布
 - [x] dead-code/clippy 警告 —— 已清零（2026-08-14，含 --all-targets）；cargo fmt 统一；7 个单元测试（线形解析/zstd 多帧/slug/过滤器）
 - [x] Esc 取消后 1 秒宽限 —— 已实现（2026-08-14）
-- 权限弹窗 Esc 目前=取消请求，spec 是「停驻 scrollback 不回答」（后续对齐）
+- [x] 权限弹窗 Esc 停驻 —— 已实现（2026-08-14）：Esc 停驻 scrollback（卡片保留），Tab 回到卡片，Ctrl+C 取消请求
 - ask_user 的自由文本回答（z 键）未实现（Esc 跳过）
 
 ## 8. 性能/稳定性

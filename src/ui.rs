@@ -675,7 +675,13 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.dialog {
-        Dialog::Approval(_) => "↑/↓ select · 1-9 pick · Enter confirm · Esc cancel · Ctrl+Q quit",
+        Dialog::Approval(d) => {
+            if d.parked {
+                "↑/↓ select · h/l fold · Tab permission card · Ctrl+Q quit"
+            } else {
+                "↑/↓ select · 1-9 pick · Enter confirm · Esc park · Ctrl+C cancel · Ctrl+Q quit"
+            }
+        }
         Dialog::Resume(_) => "↑/↓ select · Enter resume · Esc close · Ctrl+Q quit",
         Dialog::Model(_) => "type filter · ↑/↓ select · Enter switch · Esc close · Ctrl+Q quit",
         Dialog::FilePicker(_) => "type filter · ↑/↓ select · Tab/Enter insert · Esc close · Ctrl+Q quit",
