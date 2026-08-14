@@ -104,6 +104,51 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Dialog::Model(m) => {
+            let vis = m.visible();
+            let w = area.width.min(84).saturating_sub(4).max(40);
+            let h = (vis.len() as u16 + 4).min(area.height.saturating_sub(4)).max(7);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                format!(" /model — filter: {}", m.filter),
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (row_idx, item_idx) in vis.iter().enumerate() {
+                let row = &m.rows[*item_idx];
+                let selected = *item_idx == m.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                let _ = row_idx;
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}/{} — {}", mark, row.provider, row.id, row.name),
+                    style,
+                )));
+            }
+            if vis.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " (无匹配)",
+                    Style::default().fg(app.theme.gray_dim),
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" model ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
         Dialog::Resume(p) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
             let h = (p.items.len() as u16 + 2).min(area.height.saturating_sub(4)).max(6);
@@ -163,6 +208,33 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(app.theme.text_primary),
             ))];
             lines.push(Line::from(""));
+            if q.plan_approve.is_some() && !q.detail.is_empty() {
+                let detail_lines: Vec<&str> = q.detail.split('\n').collect();
+                let win = 6usize;
+                let start = d.detail_scroll.min(detail_lines.len().saturating_sub(win));
+                let end = (start + win).min(detail_lines.len());
+                for raw in &detail_lines[start..end] {
+                    let one: String = raw.chars().take(68).collect();
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", one),
+                        Style::default().fg(app.theme.gray).bg(app.theme.bg_light),
+                    )));
+                }
+                if d.detail_scroll > 0 {
+                    lines.push(Line::from(Span::styled(
+                        "  ↑ more",
+                        Style::default().fg(app.theme.gray_dim),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+            if d.taking_feedback {
+                lines.push(Line::from(Span::styled(
+                    format!(" s: 意见: {}", d.feedback),
+                    Style::default().fg(app.theme.accent_plan),
+                )));
+                lines.push(Line::from(""));
+            }
             for (i, opt) in q.options.iter().enumerate() {
                 let chosen = d.answers[cur].contains(&i);
                 let cursor = if chosen { "› " } else { "  " };
@@ -355,7 +427,15 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.dialog {
         Dialog::Approval(_) => "↑/↓ select · 1-9 pick · Enter confirm · Esc cancel · Ctrl+Q quit",
         Dialog::Resume(_) => "↑/↓ select · Enter resume · Esc close · Ctrl+Q quit",
-        Dialog::Ask(_) => "↑/↓ select · ←/→ question · 1-9 pick · Space toggle · Enter next/submit · Esc skip · Ctrl+Q quit",
+        Dialog::Model(_) => "type filter · ↑/↓ select · Enter switch · Esc close · Ctrl+Q quit",
+        Dialog::Ask(d) => {
+            let cur = d.current.min(d.questions.len().saturating_sub(1));
+            if d.questions[cur].plan_approve.is_some() {
+                "a approve · s request changes · c comment · y copy · q quit · ↑/↓ scroll · Ctrl+Q quit"
+            } else {
+                "↑/↓ select · ←/→ question · 1-9 pick · Space toggle · Enter next/submit · Esc skip · Ctrl+Q quit"
+            }
+        }
         Dialog::None => match app.focus {
             Focus::Prompt => "Enter send · Shift+Enter newline · Alt+Enter send-now · Esc cancel/2×clear · Ctrl+Q quit",
             Focus::Scrollback => "↑/↓ select · h/l fold · Tab prompt · Ctrl+E thinking · Ctrl+T theme · Ctrl+Q quit",

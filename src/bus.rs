@@ -27,6 +27,14 @@ pub enum Cmd {
     Shutdown { ack: std::sync::mpsc::Sender<()> },
     /// Resume a persisted session through the bridge (agents.resume).
     Load { session_id: String },
+    /// Fetch the provider/model catalog for the picker.
+    FetchCatalog,
+    /// Switch the model route (applies to future sessions).
+    SelectModel { provider: String, model: String },
+    /// Ask the bridge which sessions are already live in this host.
+    ListLive,
+    /// Switch the live session's permission preset.
+    SetPermission { session_id: String, preset: String },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond { id: String, result: Value },
 }

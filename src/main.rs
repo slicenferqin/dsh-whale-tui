@@ -158,6 +158,58 @@ fn controller_loop(
                     }
                 }
             }
+            Cmd::FetchCatalog => {
+                match rt.request("tui/catalog", None, Duration::from_secs(30)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/catalog-result".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
+                    }
+                }
+            }
+            Cmd::SelectModel { provider, model } => {
+                let params = json!({ "provider": provider, "model": model });
+                match rt.request("tui/select-model", Some(params), Duration::from_secs(30)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/model-set".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("select-model failed: {e}")));
+                    }
+                }
+            }
+            Cmd::SetPermission { session_id, preset } => {
+                let params = json!({ "sessionId": session_id, "preset": preset });
+                match rt.request("tui/permission", Some(params), Duration::from_secs(15)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/permission-set".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("permission failed: {e}")));
+                    }
+                }
+            }
+            Cmd::ListLive => {
+                match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/live-list".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(_e) => {}
+                }
+            }
             Cmd::Respond { id, result } => {
                 if let Err(e) = rt.respond(&id, result) {
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("respond failed: {e}")));

@@ -2,6 +2,7 @@
 //! follow-up queue, selection/scroll, and the blocking dialogs (approval
 //! prompt + ask_user_question card, docs/01 section 2.4).
 
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
@@ -52,6 +53,8 @@ pub struct Question {
     pub id: String,
     pub question: String,
     pub header: String,
+    pub detail: String,
+    pub plan_approve: Option<String>,
     pub options: Vec<String>,
     pub multi_select: bool,
 }
@@ -64,6 +67,10 @@ pub struct AskDialog {
     pub current: usize,
     /// Chosen option indices per question (empty until answered).
     pub answers: Vec<Vec<usize>>,
+    /// plan-review: free-form feedback typed after pressing s.
+    pub feedback: String,
+    pub taking_feedback: bool,
+    pub detail_scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +80,41 @@ pub struct ResumePicker {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModelEntry {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelPicker {
+    pub rows: Vec<ModelEntry>,
+    pub filter: String,
+    pub selected: usize,
+}
+
+impl ModelPicker {
+    pub fn visible(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        (0..self.rows.len())
+            .filter(|i| {
+                let r = &self.rows[*i];
+                f.is_empty()
+                    || r.id.to_lowercase().contains(&f)
+                    || r.name.to_lowercase().contains(&f)
+                    || r.provider.to_lowercase().contains(&f)
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Dialog {
     None,
     Approval(ApprovalDialog),
     Ask(AskDialog),
     Resume(ResumePicker),
+    Model(ModelPicker),
 }
 
 pub struct App {
@@ -98,6 +135,10 @@ pub struct App {
     pub demo: bool,
     pub dialog: Dialog,
     pub workspace: String,
+    permission_presets: Vec<String>,
+    preset_index: usize,
+    catalog_for_presets: bool,
+    live_ids: HashSet<String>,
     pending_resume_file: Option<std::path::PathBuf>,
     queue: Vec<String>,
     cmd_tx: Sender<Cmd>,
@@ -130,6 +171,10 @@ impl App {
             demo,
             dialog: Dialog::None,
             workspace,
+            permission_presets: Vec::new(),
+            preset_index: 0,
+            catalog_for_presets: false,
+            live_ids: HashSet::new(),
             pending_resume_file: None,
             queue: Vec::new(),
             cmd_tx,
@@ -175,7 +220,9 @@ impl App {
         let name = cmd.split_whitespace().next().unwrap_or("");
         match name {
             "/resume" => {
-                let items = list_sessions(&self.workspace, &self.session_id);
+                let _ = self.cmd_tx.send(Cmd::ListLive);
+                let mut items = list_sessions(&self.workspace, &self.session_id);
+                items.retain(|it| !self.live_ids.contains(&it.id));
                 if items.is_empty() {
                     self.notice = Some("no sessions found".into());
                 } else {
@@ -198,7 +245,11 @@ impl App {
                 self.notice =
                     Some("/resume /new /exit /help ready · /model /compact TODO".into())
             }
-            "/model" => self.notice = Some("model picker: TODO".into()),
+            "/model" => {
+                self.catalog_for_presets = false;
+                self.status = "loading models".into();
+                let _ = self.cmd_tx.send(Cmd::FetchCatalog);
+            }
             "/compact" => self.notice = Some("compact: TODO".into()),
             other => self.notice = Some(format!("unknown command {other}")),
         }
@@ -233,6 +284,97 @@ impl App {
                 "tui/ready" => {
                     self.status = "runtime ready".into();
                     self.state = RunState::Idle;
+                }
+                "tui/catalog-result" => {
+                    if let Some(names) = params
+                        .get("permissionPresets")
+                        .and_then(|v| v.as_array())
+                    {
+                        self.permission_presets = names
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                    }
+                    let current_provider = params
+                        .get("current")
+                        .and_then(|v| v.get("provider"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let current_model = params
+                        .get("current")
+                        .and_then(|v| v.get("model"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut rows: Vec<ModelEntry> = params
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| {
+                                    Some(ModelEntry {
+                                        provider: m.get("provider")?.as_str()?.to_string(),
+                                        id: m.get("id")?.as_str()?.to_string(),
+                                        name: m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // Current provider's models first; preselect the current model.
+                    rows.sort_by_key(|r| {
+                        let cur = r.provider == current_provider;
+                        let exact = cur && r.id == current_model;
+                        (if cur { 0 } else { 1 }, if exact { 0 } else { 1 }, r.id.clone())
+                    });
+                    let selected = rows
+                        .iter()
+                        .position(|r| r.provider == current_provider && r.id == current_model)
+                        .unwrap_or(0);
+                    let for_presets = self.catalog_for_presets;
+                    self.catalog_for_presets = false;
+                    if for_presets {
+                        self.notice = Some(format!("{} presets loaded", self.permission_presets.len()));
+                    } else if rows.is_empty() {
+                        self.notice = Some("catalog empty".into());
+                    } else {
+                        self.dialog = Dialog::Model(ModelPicker {
+                            rows,
+                            filter: String::new(),
+                            selected,
+                        });
+                    }
+                }
+                "tui/model-set" => {
+                    if let Some(cur) = params.get("current") {
+                        let provider = cur.get("provider").and_then(|v| v.as_str()).unwrap_or("?");
+                        let model = cur.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                        self.model = model.to_string();
+                        self.status = format!("model: {provider}/{model}");
+                    }
+                }
+                "tui/permission-set" => {
+                    if let Some(p) = params.get("applied").and_then(|v| v.as_str()) {
+                        self.status = format!("preset: {p}");
+                        if let Some(i) = self.permission_presets.iter().position(|x| x == p) {
+                            self.preset_index = i;
+                        }
+                    }
+                }
+                "tui/live-list" => {
+                    if let Some(ids) = params.get("ids").and_then(|v| v.as_array()) {
+                        self.live_ids = ids
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                    }
+                    if let Dialog::Resume(p) = &mut self.dialog {
+                        p.items.retain(|it| !self.live_ids.contains(&it.id));
+                        if !p.items.is_empty() && p.selected >= p.items.len() {
+                            p.selected = p.items.len() - 1;
+                        }
+                    }
                 }
                 "tui/loaded" => {
                     if let Some(sid) = params.get("sessionId").and_then(|v| v.as_str()) {
@@ -329,6 +471,16 @@ impl App {
                                         .and_then(Value::as_str)
                                         .unwrap_or("")
                                         .to_string(),
+                                    detail: q
+                                        .get("detail")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    plan_approve: q
+                                        .get("intent")
+                                        .and_then(|i| i.get("approve"))
+                                        .and_then(Value::as_str)
+                                        .map(String::from),
                                     options: q
                                         .get("options")
                                         .and_then(Value::as_array)
@@ -359,6 +511,9 @@ impl App {
                     questions,
                     current: 0,
                     answers: vec![Vec::new(); n],
+                    feedback: String::new(),
+                    taking_feedback: false,
+                    detail_scroll: 0,
                 });
             }
             _ => {
@@ -465,9 +620,15 @@ impl App {
             return;
         }
 
-        // ---- model picker placeholder ----
+        // ---- model picker ----
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('m') {
-            self.notice = Some("model picker: TODO (tui/catalog)".into());
+            if self.has_dialog() {
+                self.dialog = Dialog::None;
+            } else {
+                self.catalog_for_presets = false;
+                self.status = "loading models".into();
+                let _ = self.cmd_tx.send(Cmd::FetchCatalog);
+            }
             return;
         }
 
@@ -511,6 +672,24 @@ impl App {
             }
             let text = std::mem::take(&mut self.input);
             self.send_input(text);
+            return;
+        }
+
+        // ---- permission preset cycle: Shift+Tab (docs/01 section 3.1) ----
+        if key.code == KeyCode::BackTab {
+            if self.permission_presets.is_empty() {
+                self.catalog_for_presets = true;
+                let _ = self.cmd_tx.send(Cmd::FetchCatalog);
+                self.notice = Some("loading presets".into());
+            } else {
+                self.preset_index = (self.preset_index + 1) % self.permission_presets.len();
+                let preset = self.permission_presets[self.preset_index].clone();
+                self.status = format!("preset: {preset} (switching)");
+                let _ = self.cmd_tx.send(Cmd::SetPermission {
+                    session_id: self.session_id.clone(),
+                    preset,
+                });
+            }
             return;
         }
 
@@ -568,6 +747,98 @@ impl App {
         }
     }
 
+    /// plan-review intent (docs/01 section 3.4): the plan markdown renders
+    /// in a scrolled window; a approves, s requests changes with typed
+    /// feedback, q abandons, c/y are TODO, arrows scroll the plan.
+    fn plan_review_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        let (request_id, qid, approve, other, taking, fb, scroll) = {
+            let Dialog::Ask(d) = &self.dialog else { return };
+            let cur = d.current.min(d.questions.len().saturating_sub(1));
+            let q = &d.questions[cur];
+            (
+                d.request_id.clone(),
+                q.id.clone(),
+                q.plan_approve.clone().unwrap_or_default(),
+                q.options
+                    .iter()
+                    .find(|o| Some(o.as_str()) != q.plan_approve.as_deref())
+                    .cloned()
+                    .unwrap_or_default(),
+                d.taking_feedback,
+                d.feedback.clone(),
+                d.detail_scroll,
+            )
+        };
+        match key.code {
+            KeyCode::Char('a') => {
+                self.dialog = Dialog::None;
+                self.respond(
+                    request_id,
+                    json!({ "answers": [ { "id": qid, "selected": [approve] } ] }),
+                );
+            }
+            KeyCode::Char('q') => {
+                self.dialog = Dialog::None;
+                self.respond(request_id, json!({ "answers": [] }));
+            }
+            KeyCode::Char('c') | KeyCode::Char('y') => {
+                self.notice = Some("comment/copy: TODO".into());
+            }
+            KeyCode::Char('s') => {
+                if let Dialog::Ask(d) = &mut self.dialog {
+                    d.taking_feedback = true;
+                }
+            }
+            KeyCode::Enter => {
+                if taking {
+                    self.dialog = Dialog::None;
+                    self.respond(
+                        request_id,
+                        json!({ "answers": [ { "id": qid, "selected": [other], "custom": fb } ] }),
+                    );
+                }
+            }
+            KeyCode::Esc => {
+                if taking {
+                    if let Dialog::Ask(d) = &mut self.dialog {
+                        d.taking_feedback = false;
+                    }
+                } else {
+                    self.dialog = Dialog::None;
+                    self.respond(request_id, json!({ "answers": [] }));
+                }
+            }
+            KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
+                if let Dialog::Ask(d) = &mut self.dialog {
+                    d.detail_scroll =
+                        scroll.saturating_add(if key.code == KeyCode::PageUp { 6 } else { 1 });
+                }
+            }
+            KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
+                if let Dialog::Ask(d) = &mut self.dialog {
+                    d.detail_scroll =
+                        scroll.saturating_sub(if key.code == KeyCode::PageDown { 6 } else { 1 });
+                }
+            }
+            KeyCode::Backspace => {
+                if let Dialog::Ask(d) = &mut self.dialog {
+                    if d.taking_feedback {
+                        d.feedback.pop();
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Dialog::Ask(d) = &mut self.dialog {
+                    if d.taking_feedback {
+                        d.feedback.push(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn dialog_key(&mut self, key: crossterm::event::KeyEvent) {
         let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match &mut self.dialog {
@@ -604,7 +875,22 @@ impl App {
                     _ => {}
                 }
             }
-            Dialog::Ask(d) => {
+            Dialog::Ask(_) => {
+                let is_plan = match &self.dialog {
+                    Dialog::Ask(d) => {
+                        let cur = d.current.min(d.questions.len().saturating_sub(1));
+                        d.questions[cur].plan_approve.is_some()
+                    }
+                    _ => false,
+                };
+                if is_plan {
+                    self.plan_review_key(key);
+                    return;
+                }
+                let d = match &mut self.dialog {
+                    Dialog::Ask(d) => d,
+                    _ => return,
+                };
                 let n = d.questions.len();
                 let cur = d.current.min(n.saturating_sub(1));
                 let opts = d.questions[cur].options.len();
@@ -678,6 +964,50 @@ impl App {
                     _ => {}
                 }
                 let _ = has_ctrl;
+            }
+            Dialog::Model(m) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        m.selected = m.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let vis = m.visible();
+                        if !vis.is_empty() {
+                            let pos = vis.iter().position(|i| *i == m.selected).unwrap_or(0);
+                            let next = (pos + 1).min(vis.len().saturating_sub(1));
+                            m.selected = vis[next];
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        m.filter.push(c);
+                        let vis = m.visible();
+                        if !vis.is_empty() {
+                            m.selected = vis[0];
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        m.filter.pop();
+                        let vis = m.visible();
+                        if !vis.is_empty() {
+                            m.selected = vis[0];
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(row) = m.rows.get(m.selected) {
+                            let provider = row.provider.clone();
+                            let model = row.id.clone();
+                            self.dialog = Dialog::None;
+                            self.status = "switching model".into();
+                            let _ = self
+                                .cmd_tx
+                                .send(Cmd::SelectModel { provider, model });
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.dialog = Dialog::None;
+                    }
+                    _ => {}
+                }
             }
             Dialog::Resume(p) => {
                 match key.code {

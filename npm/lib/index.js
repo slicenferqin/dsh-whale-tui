@@ -67,12 +67,15 @@ function apply(ctx) {
     cwd: process.cwd(),
     provider: 'deepseek-official',
     model: 'deepseek-v4-flash',
+    reasoningEffort: undefined,
     maxTokens: undefined,
   }
   /** sessionId -> handle, for sessions this server created. */
   const sessions = new Map()
   /** sessionId -> in-flight creation promise (dedupes concurrent prompts). */
   const sessionCreations = new Map()
+  /** sessionId -> permission preset staged before the session exists. */
+  const pendingPermissions = new Map()
   const disposers = []
   let shuttingDown = false
   let shutdownTask
@@ -130,6 +133,8 @@ function apply(ctx) {
             id: q.id,
             question: q.question,
             header: q.header ?? null,
+            detail: q.detail ?? null,
+            intent: q.intent ?? null,
             options: (q.options ?? []).map((o) => ({
               label: o.label,
               description: o.description ?? null,
@@ -154,6 +159,14 @@ function apply(ctx) {
       },
     })
     sessions.set(sessionId, handle)
+    const staged = pendingPermissions.get(sessionId)
+    if (staged !== undefined) {
+      pendingPermissions.delete(sessionId)
+      const svc = ctx.get('permissionPresets')
+      if (svc !== undefined) {
+        try { svc.set(handle.agent.session, staged) } catch {}
+      }
+    }
     return handle
   }
 
@@ -218,6 +231,88 @@ function apply(ctx) {
     return { sessionId }
   }
 
+  // -------------------------------------------------------- model routes --
+  // Model catalog for the picker (providers + models + current selection).
+  async function tuiCatalog() {
+    const llm = ctx.get('llm')
+    if (llm === undefined) throw new Error('no llm service is composed in this profile')
+    const providers = llm.listProviders()
+    const models = []
+    await Promise.all(providers.map(async (p) => {
+      try {
+        for (const m of await llm.listModels(p.id)) models.push(m)
+      } catch {} // tolerate one provider's listing failure
+    }))
+    let permissionPresets
+    const perm = ctx.get('permissionPresets')
+    if (perm !== undefined && Array.isArray(perm.names)) permissionPresets = perm.names
+    return {
+      permissionPresets: permissionPresets ?? null,
+      providers: providers.map((p) => ({ id: p.id, name: p.name ?? p.id })),
+      models: models.map((m) => ({
+        provider: m.provider,
+        id: m.id,
+        name: m.name ?? m.id,
+        vision: !!(m.inputModalities || []).includes('image'),
+      })),
+      current: { provider: defaults.provider, model: defaults.model },
+    }
+  }
+
+  // Per-session model switch. Future sessions inherit the new defaults;
+  // session-level hot switch (openma's installModelSelection) is a later step.
+  async function tuiSelectModel(params) {
+    const llm = ctx.get('llm')
+    if (llm === undefined) throw new Error('no llm service is composed in this profile')
+    const provider = params.provider === undefined ? defaults.provider : String(params.provider)
+    const model = params.model === undefined ? defaults.model : String(params.model)
+    const effort = params.reasoningEffort === undefined
+      ? defaults.reasoningEffort
+      : (params.reasoningEffort ?? undefined)
+    const next = {
+      provider,
+      model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    }
+    await llm.resolveCallConfig(next)
+    defaults.provider = provider
+    defaults.model = model
+    defaults.reasoningEffort = effort
+    return { ok: true, current: next }
+  }
+
+  // Live agents owned by THIS host (the TUI's own sessions). Used by the
+  // /resume picker to skip sessions already open here.
+  async function tuiLiveSessions() {
+    const ids = []
+    try {
+      for (const agent of ctx.agents.list()) {
+        if (agent.session !== undefined) ids.push(String(agent.session.id))
+      }
+    } catch {}
+    return { ids }
+  }
+
+  // Switch the live session's permission preset (Shift+Tab cycling). A
+  // preset chosen before the first prompt is staged and applied at creation.
+  async function tuiPermission(params) {
+    const svc = ctx.get('permissionPresets')
+    if (svc === undefined) throw new Error('no permission-presets service in this profile')
+    const sessionId = String(params.sessionId)
+    const preset = String(params.preset)
+    const names = Array.isArray(svc.names) ? svc.names : undefined
+    if (names !== undefined && !names.includes(preset)) {
+      throw new Error('unknown permission preset ' + preset + ' (known: ' + names.join(', ') + ')')
+    }
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) {
+      pendingPermissions.set(sessionId, preset)
+      return { ok: true, applied: preset, staged: true }
+    }
+    svc.set(handle.agent.session, preset)
+    return { ok: true, applied: preset }
+  }
+
   // Our protocol extension: hard-cancel the running turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
@@ -280,6 +375,14 @@ function apply(ctx) {
         return prompt(params)
       case 'session/load':
         return load(params)
+      case 'tui/catalog':
+        return tuiCatalog()
+      case 'tui/select-model':
+        return tuiSelectModel(params)
+      case 'tui/live-sessions':
+        return tuiLiveSessions()
+      case 'tui/permission':
+        return tuiPermission(params)
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {
