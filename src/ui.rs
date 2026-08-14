@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Dialog, Focus, RunState};
 use crate::resume::age_label;
-use crate::transcript::CellKind;
+use crate::transcript::{CellKind, Transcript};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -101,6 +101,34 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 .title(" permission ");
             f.render_widget(
                 Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
+        Dialog::Subagent(v) => {
+            let w = area.width.saturating_sub(6).max(40);
+            let h = area.height.saturating_sub(4).max(10);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let lines_all: Vec<Line> = app
+                .child_transcripts
+                .get(&v.child_id)
+                .map(|t| transcript_lines(app, t))
+                .unwrap_or_default();
+            let height = h.saturating_sub(2) as usize;
+            let start = lines_all
+                .len()
+                .saturating_sub(height)
+                .saturating_sub(v.scroll);
+            let end = lines_all.len().saturating_sub(v.scroll);
+            let view: Vec<Line> = lines_all[start..end.max(start)].to_vec();
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.accent_plan))
+                .title(format!(" subagent {} ", v.child_id));
+            f.render_widget(
+                Paragraph::new(view)
                     .block(block)
                     .style(Style::default().bg(app.theme.bg_base)),
                 rect,
@@ -591,8 +619,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
-    let t = &app.transcript;
+/// Cell -> display lines for any transcript (main scrollback or the framed
+/// subagent view).
+fn transcript_lines<'a>(app: &App, t: &Transcript) -> Vec<Line<'a>> {
     let sel = t.selected;
     let mut lines: Vec<Line> = Vec::new();
     for (i, cell) in t.cells.iter().enumerate() {
@@ -633,6 +662,11 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     }
+    lines
+}
+
+fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
+    let mut lines = transcript_lines(app, &app.transcript);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "welcome — 输入消息开始（demo 模式已预置一轮脚本化对话）",
@@ -688,6 +722,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         Dialog::Rewind(_) => "↑/↓ select · Enter rewind · Esc close · Ctrl+Q quit",
         Dialog::Palette(_) => "type filter · ↑/↓ select · Enter run · Esc close · Ctrl+Q quit",
         Dialog::Info(_) => "q/Enter/Esc close · Ctrl+Q quit",
+        Dialog::Subagent(_) => "↑/↓ scroll · q/Esc back · Ctrl+Q quit",
         Dialog::Theme(_) => "↑/↓ preview · Enter keep · Esc revert · Ctrl+Q quit",
         Dialog::Ask(d) => {
             let cur = d.current.min(d.questions.len().saturating_sub(1));

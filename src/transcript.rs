@@ -30,6 +30,8 @@ pub struct Cell {
     pub text: String,
     pub folded: bool,
     pub failed: bool,
+    /// Subagent cells carry the child session id (opens the framed view).
+    pub link: Option<String>,
 }
 
 /// One user turn for the rewind picker: its durable seq plus the render cell
@@ -93,6 +95,7 @@ impl Transcript {
             text: text.into(),
             folded: kind == CellKind::Thinking,
             failed: false,
+            link: None,
         });
         self.cells.len() - 1
     }

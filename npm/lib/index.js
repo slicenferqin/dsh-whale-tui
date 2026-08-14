@@ -61,6 +61,10 @@ function apply(ctx) {
   })
 
   // child fd 3 reads what we write; child fd 4 writes what we read.
+  // EPIPE after the TUI exits is expected teardown noise: without these
+  // handlers the write error event crashes the host (unhandled 'error').
+  child.stdio[3]?.on('error', () => {})
+  child.stdio[4]?.on('error', () => {})
   const transport = new JsonRpcLineTransport(child.stdio[4], child.stdio[3])
 
   const defaults = {
@@ -108,10 +112,21 @@ function apply(ctx) {
         toolName: req.toolName,
         reason: req.reason ?? null,
         input: req.input ?? null,
-        options: ['allowed-once', 'rejected'],
+        options: ['allowed-once', 'always-allow', 'rejected'],
       }, signal)
       const outcome = result && result.outcome
       if (outcome === 'allowed-once' || outcome === 'rejected' || outcome === 'cancelled') {
+        // "Always allow" row: the TUI answers allowed-once and asks the
+        // bridge to switch the session to the approval-free preset, so the
+        // remembered grant is just the preset switch (grok persists a
+        // per-command prefix; dsh has no such seam, preset is the closest).
+        if (result && result.remember === 'always') {
+          const svc = ctx.get('permissionPresets')
+          const session = req.agent && req.agent.session
+          if (svc !== undefined && session !== undefined) {
+            try { svc.set(session, 'danger-full-access') } catch {}
+          }
+        }
         return outcome
       }
       return next()
@@ -407,6 +422,10 @@ function apply(ctx) {
   // ------------------------------------------------------------ shutdown --
   async function performShutdown() {
     shuttingDown = true
+    // Cancel any running turns first so dispose never blocks on live work.
+    for (const rec of sessions.values()) {
+      try { rec.agent.cancel({ kind: 'shutdown' }) } catch {}
+    }
     await Promise.allSettled([...sessionCreations.values()])
     sessionCreations.clear()
     const records = [...sessions.values()]
@@ -474,9 +493,19 @@ function apply(ctx) {
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {
-        const result = await shutdown()
-        setImmediate(() => disposeAndExit(0))
-        return result
+        // Answer immediately so the TUI can quit; cleanup runs in the
+        // background and a hard timer guarantees the host exits even when a
+        // plugin disposer stalls.
+        setImmediate(() => {
+          const hard = setTimeout(() => process.exit(0), 8000)
+          void shutdown()
+            .catch(() => {})
+            .then(() => {
+              clearTimeout(hard)
+              disposeAndExit(0)
+            })
+        })
+        return { ok: true }
       }
       default:
         throw new Error('unknown method: ' + method)

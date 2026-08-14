@@ -1,6 +1,6 @@
 {
   "name": "dsh-whale-tui",
-  "version": "0.1.26",
+  "version": "0.1.35",
   "description": "grok-style terminal UI for DeepSeek Harness — whale edition",
   "license": "MIT",
   "main": "lib/index.js",

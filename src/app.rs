@@ -2,7 +2,7 @@
 //! follow-up queue, selection/scroll, and the blocking dialogs (approval
 //! prompt + ask_user_question card, docs/01 section 2.4).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
@@ -84,6 +84,12 @@ pub struct AskDialog {
 pub struct ResumePicker {
     pub items: Vec<SessionSummary>,
     pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentView {
+    pub child_id: String,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +178,7 @@ pub enum Dialog {
     Palette(Palette),
     Info(InfoDialog),
     Theme(ThemePicker),
+    Subagent(SubagentView),
 }
 
 pub struct App {
@@ -198,6 +205,7 @@ pub struct App {
     catalog_for_presets: bool,
     live_ids: HashSet<String>,
     cancel_grace: Option<Instant>,
+    pub child_transcripts: HashMap<String, Transcript>,
     pending_resume_file: Option<std::path::PathBuf>,
     queue: Vec<String>,
     cmd_tx: Sender<Cmd>,
@@ -236,6 +244,7 @@ impl App {
             catalog_for_presets: false,
             live_ids: HashSet::new(),
             cancel_grace: None,
+            child_transcripts: HashMap::new(),
             pending_resume_file: None,
             queue: Vec::new(),
             cmd_tx,
@@ -445,8 +454,60 @@ impl App {
         match ev {
             AppEvent::Rpc { method, params } => match method.as_str() {
                 "session.event" => {
+                    let sid = params
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if let Some(event) = params.get("event") {
-                        self.transcript.apply(event);
+                        if sid == self.session_id {
+                            self.transcript.apply(event);
+                        } else {
+                            let t = self.child_transcripts.entry(sid.to_string()).or_default();
+                            t.apply(event);
+                        }
+                    }
+                }
+                "subagent.started" => {
+                    let parent = params
+                        .get("parentSessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let child = params
+                        .get("childSessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if parent == self.session_id {
+                        let i = self.transcript.push(
+                            CellKind::Subagent,
+                            "subagent".to_string(),
+                            format!("started {child}"),
+                        );
+                        self.transcript.cells[i].link = Some(child.to_string());
+                        self.transcript.selected = Some(i);
+                        self.child_transcripts.entry(child.to_string()).or_default();
+                    }
+                }
+                "subagent.finished" => {
+                    let child = params
+                        .get("childSessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if let Some(i) = self
+                        .transcript
+                        .cells
+                        .iter()
+                        .position(|c| c.link.as_deref() == Some(child))
+                    {
+                        let status = params
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("done");
+                        let text = params
+                            .get("lastAssistantMessage")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        self.transcript.cells[i].text = format!("{status}: {text}");
+                        self.transcript.selected = Some(i);
                     }
                 }
                 "session.status" => {
@@ -906,8 +967,10 @@ impl App {
         }
 
         // ---- command palette (docs/01 section 2.6) ----
-        if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
-            || key.code == KeyCode::Char('?')
+        // '?' is the palette alt binding only outside the composer, so a
+        // question mark in a prompt keeps typing normally.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p')
+            || key.code == KeyCode::Char('?') && self.focus == Focus::Scrollback
         {
             self.open_palette();
             return;
@@ -1009,6 +1072,16 @@ impl App {
                 }
                 KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
                 KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
+                KeyCode::Enter => {
+                    if let Some(i) = self.transcript.selected {
+                        if let Some(link) = self.transcript.cells[i].link.clone() {
+                            self.dialog = Dialog::Subagent(SubagentView {
+                                child_id: link,
+                                scroll: 0,
+                            });
+                        }
+                    }
+                }
                 KeyCode::Char('y') => {
                     if let Some(i) = self.transcript.selected {
                         let text = self.transcript.cells[i].text.clone();
@@ -1189,14 +1262,27 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        let outcome = d
+                        let chosen = d
                             .options
                             .get(d.selected)
                             .cloned()
                             .unwrap_or_else(|| "cancelled".into());
                         let id = d.request_id.clone();
                         self.dialog = Dialog::None;
-                        self.respond(id, json!({ "outcome": outcome }));
+                        if chosen == "always-allow" {
+                            // 切到免审批 preset（本次仍按允许一次放行）
+                            let session_id = self.session_id.clone();
+                            let _ = self.cmd_tx.send(Cmd::SetPermission {
+                                session_id,
+                                preset: "danger-full-access".to_string(),
+                            });
+                            self.respond(
+                                id,
+                                json!({ "outcome": "allowed-once", "remember": "always" }),
+                            );
+                        } else {
+                            self.respond(id, json!({ "outcome": chosen }));
+                        }
                     }
                     // docs/01 section 2.4: Esc parks focus in the scrollback
                     // without answering; Tab returns to the card.
@@ -1369,6 +1455,18 @@ impl App {
                     }
                 }
                 KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
+            Dialog::Subagent(v) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp => {
+                    v.scroll = v.scroll.saturating_add(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown => {
+                    v.scroll = v.scroll.saturating_sub(1);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.dialog = Dialog::None;
                 }
                 _ => {}
