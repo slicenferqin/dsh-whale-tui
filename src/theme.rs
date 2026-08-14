@@ -3,7 +3,10 @@
 
 use ratatui::style::Color;
 
+/// grok-style color slots (docs/01 section 9); not every slot is consumed
+/// by the skeleton renderer yet — they are the theme contract.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct Theme {
     pub name: &'static str,
     pub bg_base: Color,

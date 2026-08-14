@@ -105,7 +105,6 @@ pub struct ModelEntry {
 #[derive(Debug, Clone)]
 pub struct RewindEntry {
     pub seq: u64,
-    pub cell: usize,
     pub preview: String,
 }
 
@@ -180,6 +179,7 @@ pub struct App {
     preset_index: usize,
     catalog_for_presets: bool,
     live_ids: HashSet<String>,
+    cancel_grace: Option<Instant>,
     pending_resume_file: Option<std::path::PathBuf>,
     queue: Vec<String>,
     cmd_tx: Sender<Cmd>,
@@ -217,6 +217,7 @@ impl App {
             preset_index: 0,
             catalog_for_presets: false,
             live_ids: HashSet::new(),
+            cancel_grace: None,
             pending_resume_file: None,
             queue: Vec::new(),
             cmd_tx,
@@ -247,8 +248,11 @@ impl App {
         self.input.clear();
         self.state = RunState::Starting;
         if self.demo {
-            self.transcript
-                .push(CellKind::Assistant, String::new(), "(demo) 收到，这里是本地回显。".to_string());
+            self.transcript.push(
+                CellKind::Assistant,
+                String::new(),
+                "(demo) 收到，这里是本地回显。".to_string(),
+            );
             self.state = RunState::Idle;
             return;
         }
@@ -293,7 +297,7 @@ impl App {
             .transcript
             .turns
             .iter()
-            .filter_map(|t| {
+            .map(|t| {
                 let preview = self
                     .transcript
                     .cells
@@ -303,11 +307,10 @@ impl App {
                         one
                     })
                     .unwrap_or_default();
-                Some(RewindEntry {
+                RewindEntry {
                     seq: t.seq,
-                    cell: t.cell,
                     preview,
-                })
+                }
             })
             .collect();
         if entries.is_empty() {
@@ -329,7 +332,10 @@ impl App {
         if out.delivered {
             self.notice = Some("copied".into());
         } else {
-            self.notice = Some(format!("clipboard unreachable; saved to {}", out.backup.display()));
+            self.notice = Some(format!(
+                "clipboard unreachable; saved to {}",
+                out.backup.display()
+            ));
         }
     }
 
@@ -370,8 +376,7 @@ impl App {
                 self.copy_text(text);
             }
             "/help" => {
-                self.notice =
-                    Some("/resume /new /exit /help ready · /model /compact TODO".into())
+                self.notice = Some("/resume /new /exit /help ready · /model /compact TODO".into())
             }
             "/model" => {
                 self.catalog_for_presets = false;
@@ -390,6 +395,9 @@ impl App {
 
     fn cancel_now(&mut self) {
         self.esc = EscArm::None;
+        // docs/01 section 2.5: for ~1s after an Esc-triggered cancel the idle
+        // rewind arm stays suppressed, so mashing Esc cannot open the picker.
+        self.cancel_grace = Some(Instant::now());
         if self.demo {
             self.state = RunState::Idle;
             self.status = "cancelled (demo)".into();
@@ -411,17 +419,23 @@ impl App {
                 }
                 "session.status" => {
                     let running = params.get("status").and_then(|s| s.as_str()) == Some("running");
-                    self.state = if running { RunState::Running } else { RunState::Idle };
-                    self.status = if running { "running".into() } else { "idle".into() };
+                    self.state = if running {
+                        RunState::Running
+                    } else {
+                        RunState::Idle
+                    };
+                    self.status = if running {
+                        "running".into()
+                    } else {
+                        "idle".into()
+                    };
                 }
                 "tui/ready" => {
                     self.status = "runtime ready".into();
                     self.state = RunState::Idle;
                 }
                 "tui/catalog-result" => {
-                    if let Some(names) = params
-                        .get("permissionPresets")
-                        .and_then(|v| v.as_array())
+                    if let Some(names) = params.get("permissionPresets").and_then(|v| v.as_array())
                     {
                         self.permission_presets = names
                             .iter()
@@ -449,7 +463,11 @@ impl App {
                                     Some(ModelEntry {
                                         provider: m.get("provider")?.as_str()?.to_string(),
                                         id: m.get("id")?.as_str()?.to_string(),
-                                        name: m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        name: m
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
                                     })
                                 })
                                 .collect()
@@ -459,7 +477,11 @@ impl App {
                     rows.sort_by_key(|r| {
                         let cur = r.provider == current_provider;
                         let exact = cur && r.id == current_model;
-                        (if cur { 0 } else { 1 }, if exact { 0 } else { 1 }, r.id.clone())
+                        (
+                            if cur { 0 } else { 1 },
+                            if exact { 0 } else { 1 },
+                            r.id.clone(),
+                        )
                     });
                     let selected = rows
                         .iter()
@@ -468,7 +490,8 @@ impl App {
                     let for_presets = self.catalog_for_presets;
                     self.catalog_for_presets = false;
                     if for_presets {
-                        self.notice = Some(format!("{} presets loaded", self.permission_presets.len()));
+                        self.notice =
+                            Some(format!("{} presets loaded", self.permission_presets.len()));
                     } else if rows.is_empty() {
                         self.notice = Some("catalog empty".into());
                     } else {
@@ -641,7 +664,9 @@ impl App {
                                         .map(|o| {
                                             o.iter()
                                                 .filter_map(|v| {
-                                                    v.get("label").and_then(Value::as_str).map(String::from)
+                                                    v.get("label")
+                                                        .and_then(Value::as_str)
+                                                        .map(String::from)
                                                 })
                                                 .collect()
                                         })
@@ -736,7 +761,9 @@ impl App {
                 } else {
                     let now = Instant::now();
                     match self.esc {
-                        EscArm::ClearArmed(t) if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS => {
+                        EscArm::ClearArmed(t)
+                            if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS =>
+                        {
                             self.history.push(std::mem::take(&mut self.input));
                             self.esc = EscArm::None;
                         }
@@ -746,13 +773,23 @@ impl App {
                 return;
             }
             if !self.transcript.is_empty() {
+                let in_grace = self
+                    .cancel_grace
+                    .map(|t| t.elapsed().as_millis() < 1000)
+                    .unwrap_or(false);
+                if in_grace {
+                    self.esc = EscArm::None;
+                    return;
+                }
                 if alt {
                     self.esc = EscArm::None;
                     self.open_rewind();
                 } else {
                     let now = Instant::now();
                     match self.esc {
-                        EscArm::RewindArmed(t) if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS => {
+                        EscArm::RewindArmed(t)
+                            if now.duration_since(t).as_millis() <= DOUBLE_ESC_MS =>
+                        {
                             self.esc = EscArm::None;
                             self.open_rewind();
                         }
@@ -814,10 +851,7 @@ impl App {
         }
 
         // ---- slash commands (dispatch without a model turn) ----
-        if key.code == KeyCode::Enter
-            && !self.input.is_empty()
-            && self.input.starts_with('/')
-        {
+        if key.code == KeyCode::Enter && !self.input.is_empty() && self.input.starts_with('/') {
             let cmd = std::mem::take(&mut self.input);
             self.run_command(&cmd);
             return;
@@ -1112,7 +1146,11 @@ impl App {
                     KeyCode::Up | KeyCode::Char('k') => {
                         if !d.answers[cur].is_empty() {
                             let v = d.answers[cur][0];
-                            d.answers[cur] = if multi { vec![v] } else { vec![v.saturating_sub(1)] };
+                            d.answers[cur] = if multi {
+                                vec![v]
+                            } else {
+                                vec![v.saturating_sub(1)]
+                            };
                         } else if opts > 0 {
                             d.answers[cur] = vec![0];
                         }
@@ -1120,7 +1158,11 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => {
                         if !d.answers[cur].is_empty() {
                             let v = d.answers[cur][0];
-                            let nv = if multi { v } else { (v + 1).min(opts.saturating_sub(1)) };
+                            let nv = if multi {
+                                v
+                            } else {
+                                (v + 1).min(opts.saturating_sub(1))
+                            };
                             d.answers[cur] = vec![nv];
                         } else if opts > 0 {
                             d.answers[cur] = vec![0];
@@ -1172,191 +1214,180 @@ impl App {
                 }
                 let _ = has_ctrl;
             }
-            Dialog::FilePicker(f) => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        f.selected = f.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        f.selected = (f.selected + 1).min(f.visible.len().saturating_sub(1));
-                    }
-                    KeyCode::Char(c) => {
-                        f.query.push(c);
-                        f.visible = fuzzy_filter(&f.files, &f.query);
-                        f.selected = 0;
-                    }
-                    KeyCode::Backspace => {
-                        f.query.pop();
-                        f.visible = fuzzy_filter(&f.files, &f.query);
-                        f.selected = 0;
-                    }
-                    KeyCode::Enter | KeyCode::Tab => {
-                        if let Some(idx) = f.visible.get(f.selected) {
-                            let path = f.files[*idx].clone();
-                            if let Some(start) = self.at_fragment_start {
-                                self.input.truncate(start);
-                                self.input.push_str(&path);
-                                self.input.push(' ');
-                            }
-                            self.at_fragment_start = None;
-                            self.dialog = Dialog::None;
-                            self.focus = Focus::Prompt;
-                        }
-                    }
-                    KeyCode::Esc => {
-                        self.dialog = Dialog::None;
-                    }
-                    _ => {}
+            Dialog::FilePicker(f) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    f.selected = f.selected.saturating_sub(1);
                 }
-            }
-            Dialog::Palette(p) => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        p.selected = p.selected.saturating_sub(1);
+                KeyCode::Down | KeyCode::Char('j') => {
+                    f.selected = (f.selected + 1).min(f.visible.len().saturating_sub(1));
+                }
+                KeyCode::Char(c) => {
+                    f.query.push(c);
+                    f.visible = fuzzy_filter(&f.files, &f.query);
+                    f.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    f.query.pop();
+                    f.visible = fuzzy_filter(&f.files, &f.query);
+                    f.selected = 0;
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    if let Some(idx) = f.visible.get(f.selected) {
+                        let path = f.files[*idx].clone();
+                        if let Some(start) = self.at_fragment_start {
+                            self.input.truncate(start);
+                            self.input.push_str(&path);
+                            self.input.push(' ');
+                        }
+                        self.at_fragment_start = None;
+                        self.dialog = Dialog::None;
+                        self.focus = Focus::Prompt;
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        p.selected = (p.selected + 1).min(p.visible.len().saturating_sub(1));
-                    }
-                    KeyCode::Char(c) => {
-                        p.filter.push(c);
-                        p.visible = palette_filter(&p.rows, &p.filter);
-                        p.selected = 0;
-                    }
-                    KeyCode::Backspace => {
-                        p.filter.pop();
-                        p.visible = palette_filter(&p.rows, &p.filter);
-                        p.selected = 0;
-                    }
-                    KeyCode::Enter => {
-                        if let Some(idx) = p.visible.get(p.selected) {
-                            let label = p.rows[*idx].label.clone();
-                            self.dialog = Dialog::None;
-                            if label.starts_with('/') {
-                                self.run_command(&label);
-                            } else if label.starts_with("rewind") {
-                                self.open_rewind();
-                            } else if label.starts_with("theme") {
-                                self.theme = if self.theme.name == "dark" {
-                                    crate::theme::LIGHT
-                                } else {
-                                    crate::theme::DARK
-                                };
-                            } else if label.contains("F2") {
-                                self.open_dialog(
+                }
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
+            Dialog::Palette(p) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    p.selected = (p.selected + 1).min(p.visible.len().saturating_sub(1));
+                }
+                KeyCode::Char(c) => {
+                    p.filter.push(c);
+                    p.visible = palette_filter(&p.rows, &p.filter);
+                    p.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    p.filter.pop();
+                    p.visible = palette_filter(&p.rows, &p.filter);
+                    p.selected = 0;
+                }
+                KeyCode::Enter => {
+                    if let Some(idx) = p.visible.get(p.selected) {
+                        let label = p.rows[*idx].label.clone();
+                        self.dialog = Dialog::None;
+                        if label.starts_with('/') {
+                            self.run_command(&label);
+                        } else if label.starts_with("rewind") {
+                            self.open_rewind();
+                        } else if label.starts_with("theme") {
+                            self.theme = if self.theme.name == "dark" {
+                                crate::theme::LIGHT
+                            } else {
+                                crate::theme::DARK
+                            };
+                        } else if label.contains("F2") {
+                            self.open_dialog(
                                     "demo-approve".into(),
                                     "ui/approve",
                                     &serde_json::json!({ "toolName": "bash", "reason": "shell command", "input": {"command": "cargo test"}, "options": ["allowed-once", "rejected"] }),
                                 );
-                            } else if label.contains("F3") {
-                                self.open_dialog(
+                        } else if label.contains("F3") {
+                            self.open_dialog(
                                     "demo-ask".into(),
                                     "ui/ask-user",
                                     &serde_json::json!({ "questions": [
                                         { "id": "q1", "question": "选一个颜色？", "header": "主题", "options": [{"label": "蓝色"}, {"label": "绿色"}] }
                                     ] }),
                                 );
-                            }
                         }
                     }
-                    KeyCode::Esc => {
-                        self.dialog = Dialog::None;
-                    }
-                    _ => {}
                 }
-            }
-            Dialog::Rewind(r) => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        r.selected = r.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        r.selected = (r.selected + 1).min(r.items.len().saturating_sub(1));
-                    }
-                    KeyCode::Enter => {
-                        if let Some(item) = r.items.get(r.selected) {
-                            let session_id = self.session_id.clone();
-                            let boundary = item.seq;
-                            self.dialog = Dialog::None;
-                            self.status = "rewinding".into();
-                            let _ = self
-                                .cmd_tx
-                                .send(Cmd::Rewind { session_id, boundary });
-                        }
-                    }
-                    KeyCode::Esc => {
-                        self.dialog = Dialog::None;
-                    }
-                    _ => {}
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
                 }
-            }
-            Dialog::Model(m) => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        m.selected = m.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let vis = m.visible();
-                        if !vis.is_empty() {
-                            let pos = vis.iter().position(|i| *i == m.selected).unwrap_or(0);
-                            let next = (pos + 1).min(vis.len().saturating_sub(1));
-                            m.selected = vis[next];
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        m.filter.push(c);
-                        let vis = m.visible();
-                        if !vis.is_empty() {
-                            m.selected = vis[0];
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        m.filter.pop();
-                        let vis = m.visible();
-                        if !vis.is_empty() {
-                            m.selected = vis[0];
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(row) = m.rows.get(m.selected) {
-                            let provider = row.provider.clone();
-                            let model = row.id.clone();
-                            self.dialog = Dialog::None;
-                            self.status = "switching model".into();
-                            let _ = self
-                                .cmd_tx
-                                .send(Cmd::SelectModel { provider, model });
-                        }
-                    }
-                    KeyCode::Esc => {
-                        self.dialog = Dialog::None;
-                    }
-                    _ => {}
+                _ => {}
+            },
+            Dialog::Rewind(r) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    r.selected = r.selected.saturating_sub(1);
                 }
-            }
-            Dialog::Resume(p) => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        p.selected = p.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        p.selected = (p.selected + 1).min(p.items.len().saturating_sub(1));
-                    }
-                    KeyCode::Enter => {
-                        if let Some(item) = p.items.get(p.selected).cloned() {
-                            let id = item.id.clone();
-                            self.dialog = Dialog::None;
-                            self.pending_resume_file = Some(item.file);
-                            self.session_id = id.clone();
-                            self.status = "resuming".into();
-                            let _ = self.cmd_tx.send(Cmd::Load { session_id: id });
-                        }
-                    }
-                    KeyCode::Esc => {
-                        self.dialog = Dialog::None;
-                    }
-                    _ => {}
+                KeyCode::Down | KeyCode::Char('j') => {
+                    r.selected = (r.selected + 1).min(r.items.len().saturating_sub(1));
                 }
-            }
+                KeyCode::Enter => {
+                    if let Some(item) = r.items.get(r.selected) {
+                        let session_id = self.session_id.clone();
+                        let boundary = item.seq;
+                        self.dialog = Dialog::None;
+                        self.status = "rewinding".into();
+                        let _ = self.cmd_tx.send(Cmd::Rewind {
+                            session_id,
+                            boundary,
+                        });
+                    }
+                }
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
+            Dialog::Model(m) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    m.selected = m.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let vis = m.visible();
+                    if !vis.is_empty() {
+                        let pos = vis.iter().position(|i| *i == m.selected).unwrap_or(0);
+                        let next = (pos + 1).min(vis.len().saturating_sub(1));
+                        m.selected = vis[next];
+                    }
+                }
+                KeyCode::Char(c) => {
+                    m.filter.push(c);
+                    let vis = m.visible();
+                    if !vis.is_empty() {
+                        m.selected = vis[0];
+                    }
+                }
+                KeyCode::Backspace => {
+                    m.filter.pop();
+                    let vis = m.visible();
+                    if !vis.is_empty() {
+                        m.selected = vis[0];
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(row) = m.rows.get(m.selected) {
+                        let provider = row.provider.clone();
+                        let model = row.id.clone();
+                        self.dialog = Dialog::None;
+                        self.status = "switching model".into();
+                        let _ = self.cmd_tx.send(Cmd::SelectModel { provider, model });
+                    }
+                }
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
+            Dialog::Resume(p) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    p.selected = (p.selected + 1).min(p.items.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = p.items.get(p.selected).cloned() {
+                        let id = item.id.clone();
+                        self.dialog = Dialog::None;
+                        self.pending_resume_file = Some(item.file);
+                        self.session_id = id.clone();
+                        self.status = "resuming".into();
+                        let _ = self.cmd_tx.send(Cmd::Load { session_id: id });
+                    }
+                }
+                KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
             Dialog::None => {}
         }
     }
@@ -1365,6 +1396,32 @@ impl App {
 fn palette_filter(rows: &[PaletteRow], query: &str) -> Vec<usize> {
     let q = query.to_lowercase();
     (0..rows.len())
-        .filter(|i| q.is_empty() || rows[*i].label.to_lowercase().contains(&q) || rows[*i].action.to_lowercase().contains(&q))
+        .filter(|i| {
+            q.is_empty()
+                || rows[*i].label.to_lowercase().contains(&q)
+                || rows[*i].action.to_lowercase().contains(&q)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_filters_labels_and_actions() {
+        let rows = vec![
+            PaletteRow {
+                label: "/resume".into(),
+                action: "恢复会话".into(),
+            },
+            PaletteRow {
+                label: "/model".into(),
+                action: "切换模型".into(),
+            },
+        ];
+        assert_eq!(palette_filter(&rows, "model"), vec![1]);
+        assert_eq!(palette_filter(&rows, "恢复"), vec![0]);
+        assert_eq!(palette_filter(&rows, "").len(), 2);
+    }
 }

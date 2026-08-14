@@ -65,8 +65,12 @@ pub fn list_sessions(workspace: &str, skip_id: &str) -> Vec<SessionSummary> {
             dirs.extend(entries.flatten().map(|e| e.path()));
         }
         for dir in dirs {
-            let Some(file) = session_file(&dir) else { continue };
-            let Some(summary) = summarize(&file) else { continue };
+            let Some(file) = session_file(&dir) else {
+                continue;
+            };
+            let Some(summary) = summarize(&file) else {
+                continue;
+            };
             if summary.id == skip_id || out.iter().any(|s| s.id == summary.id) {
                 continue;
             }
@@ -143,14 +147,18 @@ fn summarize(file: &Path) -> Option<SessionSummary> {
         .iter()
         .filter(|e| e.get("type").and_then(Value::as_str) == Some("turn/start"))
         .count();
-    let preview = events.iter().find_map(user_text).map(|t| {
-        let one_line = t.replace('\n', " ");
-        let mut p: String = one_line.chars().take(40).collect();
-        if one_line.chars().count() > 40 {
-            p.push('…');
-        }
-        p
-    }).unwrap_or_default();
+    let preview = events
+        .iter()
+        .find_map(user_text)
+        .map(|t| {
+            let one_line = t.replace('\n', " ");
+            let mut p: String = one_line.chars().take(40).collect();
+            if one_line.chars().count() > 40 {
+                p.push('…');
+            }
+            p
+        })
+        .unwrap_or_default();
     let modified = std::fs::metadata(file)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -173,5 +181,45 @@ pub fn age_label(modified: SystemTime) -> String {
         60..=3599 => format!("{}m", secs / 60),
         3600..=86399 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn slug_matches_host_layout() {
+        assert_eq!(
+            workspace_slug("/Users/sanjiu/proj"),
+            "--Users-sanjiu-proj--"
+        );
+    }
+
+    #[test]
+    fn reads_concatenated_zstd_frames() {
+        let tmp = std::env::temp_dir().join(format!("dsh-zstd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("session.jsonl.zstd");
+        let header = json!({"type":"session","id":"x"}).to_string()
+            + "
+";
+        let body = json!({"type":"turn/start"}).to_string()
+            + "
+";
+        let mut frames = Vec::new();
+        for chunk in [header.as_bytes(), body.as_bytes()] {
+            frames.extend(ruzstd::encoding::compress_to_vec(
+                chunk,
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ));
+        }
+        std::fs::write(&file, frames).unwrap();
+        let events = read_session_events(&file).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"].as_str(), Some("session"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

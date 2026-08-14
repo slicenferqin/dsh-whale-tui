@@ -79,9 +79,9 @@ Web 与 TUI 是不同进程，互不可见。
 
 ## 7. 已知瑕疵（小）
 
-- 状态栏文案在 70% 分界处偶尔裁半格（draw_status 的 split 无截断处理）
-- cargo 有 dead-code 警告若干
-- Esc 语义的「取消后 1 秒宽限」未实现（spec 2.5）
+- [x] 状态栏裁半格 —— 已修（2026-08-14）：CJK 感知宽度截断，右侧按测量宽度排布
+- [x] dead-code/clippy 警告 —— 已清零（2026-08-14，含 --all-targets）；cargo fmt 统一；7 个单元测试（线形解析/zstd 多帧/slug/过滤器）
+- [x] Esc 取消后 1 秒宽限 —— 已实现（2026-08-14）
 - 权限弹窗 Esc 目前=取消请求，spec 是「停驻 scrollback 不回答」（后续对齐）
 - ask_user 的自由文本回答（z 键）未实现（Esc 跳过）
 

@@ -16,7 +16,9 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 6 || out.len() >= 2000 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut items: Vec<_> = entries.flatten().collect();
     items.sort_by_key(|e| e.file_name());
     for entry in items {
@@ -54,4 +56,24 @@ pub fn fuzzy_filter(files: &[String], query: &str) -> Vec<usize> {
             q.is_empty() || f.to_lowercase().contains(&q)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_matches_substrings() {
+        let files = vec![
+            "src/main.rs".to_string(),
+            "src/app.rs".to_string(),
+            "README.md".to_string(),
+        ];
+        let hits = fuzzy_filter(&files, "main");
+        assert_eq!(hits, vec![0]);
+        let all = fuzzy_filter(&files, "");
+        assert_eq!(all.len(), 3);
+        let none = fuzzy_filter(&files, "zzz");
+        assert!(none.is_empty());
+    }
 }

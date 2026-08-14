@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Notice/Subagent are spec-planned render kinds
 pub enum CellKind {
     User,
     Assistant,
@@ -22,6 +23,7 @@ pub enum CellKind {
 
 #[derive(Debug, Clone)]
 pub struct Cell {
+    #[allow(dead_code)] // stable identity for event dedup (planned)
     pub id: u64,
     pub kind: CellKind,
     pub title: String,
@@ -76,7 +78,12 @@ impl Transcript {
         self.cells.is_empty()
     }
 
-    pub(crate) fn push(&mut self, kind: CellKind, title: impl Into<String>, text: impl Into<String>) -> usize {
+    pub(crate) fn push(
+        &mut self,
+        kind: CellKind,
+        title: impl Into<String>,
+        text: impl Into<String>,
+    ) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         self.cells.push(Cell {
@@ -91,7 +98,9 @@ impl Transcript {
     }
 
     pub fn apply(&mut self, event: &Value) {
-        let Some(ty) = event.get("type").and_then(Value::as_str) else { return };
+        let Some(ty) = event.get("type").and_then(Value::as_str) else {
+            return;
+        };
         let data = event.get("data");
         match ty {
             "user/message" => {
@@ -115,17 +124,20 @@ impl Transcript {
                 }
             }
             "assistant/chunk" => {
-                let Some(chunk) = data.and_then(|d| d.get("chunk")) else { return };
+                let Some(chunk) = data.and_then(|d| d.get("chunk")) else {
+                    return;
+                };
                 let ctype = chunk.get("type").and_then(Value::as_str);
                 let index = chunk.get("index").and_then(Value::as_u64);
                 match ctype {
                     Some("block-start") => {
                         let block_type = chunk.get("blockType").and_then(Value::as_str);
-                        let kind = if block_type == Some("reasoning") || block_type == Some("thinking") {
-                            BlockKind::Thinking
-                        } else {
-                            BlockKind::Text
-                        };
+                        let kind =
+                            if block_type == Some("reasoning") || block_type == Some("thinking") {
+                                BlockKind::Thinking
+                            } else {
+                                BlockKind::Text
+                            };
                         let (cell_kind, title) = match kind {
                             BlockKind::Thinking => (CellKind::Thinking, "Thinking".to_string()),
                             BlockKind::Text => (CellKind::Assistant, String::new()),
@@ -164,9 +176,18 @@ impl Transcript {
                     }
                     Some("usage") => {
                         if let Some(u) = chunk.get("usage") {
-                            self.usage.input = u.get("inputTokens").and_then(Value::as_u64).unwrap_or(self.usage.input);
-                            self.usage.output = u.get("outputTokens").and_then(Value::as_u64).unwrap_or(self.usage.output);
-                            self.usage.cache = u.get("cacheReadTokens").and_then(Value::as_u64).unwrap_or(self.usage.cache);
+                            self.usage.input = u
+                                .get("inputTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(self.usage.input);
+                            self.usage.output = u
+                                .get("outputTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(self.usage.output);
+                            self.usage.cache = u
+                                .get("cacheReadTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(self.usage.cache);
                         }
                     }
                     _ => {}
@@ -182,7 +203,11 @@ impl Transcript {
                     .and_then(Value::as_array)
                 {
                     if let Some(text) = content_text(content) {
-                        if !self.cells.iter().any(|c| c.kind == CellKind::Assistant && !c.text.is_empty()) {
+                        if !self
+                            .cells
+                            .iter()
+                            .any(|c| c.kind == CellKind::Assistant && !c.text.is_empty())
+                        {
                             let i = self.push(CellKind::Assistant, String::new(), text);
                             self.selected = Some(i);
                         }
@@ -205,11 +230,12 @@ impl Transcript {
                 self.selected = Some(i);
             }
             "tool/result" => {
-                let failed = data
-                    .and_then(|d| d.get("status"))
-                    .and_then(Value::as_str)
-                    == Some("failed");
-                let text = data.and_then(|d| d.get("result")).map(summarize).unwrap_or_default();
+                let failed =
+                    data.and_then(|d| d.get("status")).and_then(Value::as_str) == Some("failed");
+                let text = data
+                    .and_then(|d| d.get("result"))
+                    .map(summarize)
+                    .unwrap_or_default();
                 let i = self.push(CellKind::ToolResult, String::new(), text);
                 self.cells[i].failed = failed;
                 self.selected = Some(i);
@@ -237,7 +263,9 @@ impl Transcript {
 }
 
 fn text_blocks(data: Option<&Value>) -> String {
-    let Some(data) = data else { return String::new() };
+    let Some(data) = data else {
+        return String::new();
+    };
     let Some(content) = data.get("content").and_then(Value::as_array) else {
         return String::new();
     };
@@ -267,5 +295,57 @@ fn summarize(v: &Value) -> String {
         format!("{} …", head)
     } else {
         one_line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(ty: &str, data: Value) -> Value {
+        json!({"type":ty,"data":data})
+    }
+
+    #[test]
+    fn applies_real_wire_shapes() {
+        let mut t = Transcript::new();
+        t.apply(&json!({"type":"user/message","seq":7,"data":{"source":{"kind":"user"},"content":[{"type":"text","text":"hi"}]}}));
+        t.apply(&ev(
+            "assistant/chunk",
+            json!({"chunk":{"type":"block-start","index":0,"blockType":"reasoning"}}),
+        ));
+        t.apply(&ev(
+            "assistant/chunk",
+            json!({"chunk":{"type":"text-delta","index":0,"text":"thinking..."}}),
+        ));
+        t.apply(&ev(
+            "assistant/chunk",
+            json!({"chunk":{"type":"block-end","index":0}}),
+        ));
+        assert_eq!(t.cells.len(), 2);
+        assert_eq!(t.cells[0].kind, CellKind::User);
+        assert_eq!(t.cells[1].kind, CellKind::Thinking);
+        assert!(t.cells[1].folded);
+        assert_eq!(t.cells[1].text, "thinking...");
+        assert_eq!(t.turns.len(), 1);
+        assert_eq!(t.turns[0].seq, 7);
+    }
+
+    #[test]
+    fn filters_plugin_context_injections() {
+        let mut t = Transcript::new();
+        t.apply(&json!({"type":"user/message","seq":1,"data":{"source":{"kind":"plugin"},"content":[{"type":"text","text":"skills catalog"}]}}));
+        assert!(t.cells.is_empty(), "plugin injections never render");
+        assert!(t.turns.is_empty());
+    }
+
+    #[test]
+    fn parses_usage_chunk() {
+        let mut t = Transcript::new();
+        t.apply(&json!({"type":"assistant/chunk","data":{"chunk":{"type":"usage","usage":{"inputTokens":24,"outputTokens":1,"cacheReadTokens":11648}}}}));
+        assert_eq!(t.usage.input, 24);
+        assert_eq!(t.usage.output, 1);
+        assert_eq!(t.usage.cache, 11648);
     }
 }

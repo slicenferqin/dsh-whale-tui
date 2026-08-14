@@ -32,6 +32,7 @@ pub struct Runtime {
 
 impl Runtime {
     /// Spawn a standalone SDK runtime subprocess.
+    #[allow(dead_code)] // standalone mode (Windows / SDK runtime), planned
     pub fn spawn(
         bin: &str,
         envs: &[(String, String)],
@@ -116,6 +117,7 @@ impl Runtime {
             .expect("spawn frame reader");
     }
 
+    #[allow(dead_code)] // standalone-mode diagnostics pump
     fn start_stderr(&self, stderr: impl Read + Send + 'static, bus: mpsc::Sender<AppEvent>) {
         let tail = Arc::clone(&self.stderr_tail);
         std::thread::Builder::new()
@@ -172,12 +174,18 @@ impl Runtime {
                 if tail.is_empty() {
                     bail!("{method} timed out waiting for harness runtime")
                 }
-                bail!("{method} timed out: {}", tail.join("
-"))
+                bail!(
+                    "{method} timed out: {}",
+                    tail.join(
+                        "
+"
+                    )
+                )
             }
         }
     }
 
+    #[allow(dead_code)] // client->server notifications (planned: usage/telemetry)
     pub fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.write_line(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }

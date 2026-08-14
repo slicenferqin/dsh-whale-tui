@@ -2,8 +2,8 @@
 //! Every copy also lands in a backup file; the notice names it whenever
 //! delivery is unverified (SSH / tmux / headless).
 
-use std::io::Write;
 use base64::Engine;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 

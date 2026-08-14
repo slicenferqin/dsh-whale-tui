@@ -12,7 +12,11 @@ pub enum AppEvent {
     /// One line of runtime stderr (kept for diagnostics).
     RuntimeStderr(String),
     /// Server-initiated request from the bridge (approval / ask_user dialogs).
-    ServerRequest { id: String, method: String, params: Value },
+    ServerRequest {
+        id: String,
+        method: String,
+        params: Value,
+    },
     /// Runtime subprocess exited.
     RuntimeExited(Option<i32>),
 }
@@ -20,25 +24,48 @@ pub enum AppEvent {
 /// UI -> controller commands.
 #[derive(Debug, Clone)]
 pub enum Cmd {
-    Prompt { session_id: String, text: String },
+    Prompt {
+        session_id: String,
+        text: String,
+    },
     /// Our protocol extension: hard-cancel the running turn (agent.cancel).
-    Cancel { session_id: String },
+    Cancel {
+        session_id: String,
+    },
     /// Graceful quit; the controller answers the shutdown RPC then acks.
-    Shutdown { ack: std::sync::mpsc::Sender<()> },
+    Shutdown {
+        ack: std::sync::mpsc::Sender<()>,
+    },
     /// Resume a persisted session through the bridge (agents.resume).
-    Load { session_id: String },
+    Load {
+        session_id: String,
+    },
     /// Fetch the provider/model catalog for the picker.
     FetchCatalog,
     /// Switch the model route (applies to future sessions).
-    SelectModel { provider: String, model: String },
+    SelectModel {
+        provider: String,
+        model: String,
+    },
     /// Ask the bridge which sessions are already live in this host.
     ListLive,
     /// Switch the live session's permission preset.
-    SetPermission { session_id: String, preset: String },
+    SetPermission {
+        session_id: String,
+        preset: String,
+    },
     /// Manual compaction (the agent must be idle).
-    Compact { session_id: String },
+    Compact {
+        session_id: String,
+    },
     /// Rewind: fork the session at a turn boundary.
-    Rewind { session_id: String, boundary: u64 },
+    Rewind {
+        session_id: String,
+        boundary: u64,
+    },
     /// Answer a server-initiated request (approval / ask_user dialog).
-    Respond { id: String, result: Value },
+    Respond {
+        id: String,
+        result: Value,
+    },
 }

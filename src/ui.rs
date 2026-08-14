@@ -52,7 +52,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         Dialog::None => {}
         Dialog::Approval(d) => {
             let w = area.width.min(72).saturating_sub(4).max(30);
-            let h = (d.options.len() as u16 + 6).min(area.height.saturating_sub(4)).max(8);
+            let h = (d.options.len() as u16 + 6)
+                .min(area.height.saturating_sub(4))
+                .max(8);
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![
@@ -149,7 +151,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Rewind(r) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
-            let h = (r.items.len() as u16 + 3).min(area.height.saturating_sub(4)).max(6);
+            let h = (r.items.len() as u16 + 3)
+                .min(area.height.saturating_sub(4))
+                .max(6);
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
@@ -204,10 +208,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("{}{}", mark, row),
-                    style,
-                )));
+                lines.push(Line::from(Span::styled(format!("{}{}", mark, row), style)));
             }
             if fp.visible.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -229,7 +230,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         Dialog::Model(m) => {
             let vis = m.visible();
             let w = area.width.min(84).saturating_sub(4).max(40);
-            let h = (vis.len() as u16 + 4).min(area.height.saturating_sub(4)).max(7);
+            let h = (vis.len() as u16 + 4)
+                .min(area.height.saturating_sub(4))
+                .max(7);
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
@@ -273,7 +276,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Resume(p) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
-            let h = (p.items.len() as u16 + 2).min(area.height.saturating_sub(4)).max(6);
+            let h = (p.items.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(6);
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
@@ -296,7 +301,14 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                     label = item.id.clone();
                 }
                 lines.push(Line::from(Span::styled(
-                    format!("{}{} · {} turns · {} · {}", mark, label, item.turns, age_label(item.modified), item.id),
+                    format!(
+                        "{}{} · {} turns · {} · {}",
+                        mark,
+                        label,
+                        item.turns,
+                        age_label(item.modified),
+                        item.id
+                    ),
                     style,
                 )));
             }
@@ -361,7 +373,11 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 let chosen = d.answers[cur].contains(&i);
                 let cursor = if chosen { "› " } else { "  " };
                 let box_mark = if q.multi_select {
-                    if chosen { "[x]" } else { "[ ]" }
+                    if chosen {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    }
                 } else {
                     ""
                 };
@@ -397,10 +413,50 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Truncate spans to a display-width budget (CJK-aware) so the status line
+/// never clips mid-glyph at the split boundary.
+fn fit_spans<'a>(spans: &[Span<'a>], budget: u16) -> Vec<Span<'a>> {
+    let mut out: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    for sp in spans {
+        let w = unicode_width::UnicodeWidthStr::width(sp.content.as_ref());
+        if used + w > budget as usize {
+            let mut s = String::new();
+            for ch in sp.content.chars() {
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + cw > budget as usize {
+                    break;
+                }
+                s.push(ch);
+                used += cw;
+            }
+            if !s.is_empty() {
+                out.push(Span::styled(s, sp.style));
+            }
+            break;
+        }
+        out.push(sp.clone());
+        used += w;
+    }
+    out
+}
+
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    let ctx_text = {
+        let u = app.transcript.usage;
+        if u.input > 0 || u.output > 0 {
+            format!("in {} · out {} · cache {}", u.input, u.output, u.cache)
+        } else {
+            "ctx 0/1.0M".to_string()
+        }
+    };
+    let ctx_w = unicode_width::UnicodeWidthStr::width(ctx_text.as_str()) as u16;
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(ctx_w.saturating_add(2)),
+        ])
         .split(area);
     let mut spans = vec![
         Span::styled(
@@ -446,17 +502,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(app.theme.warning),
         ));
     }
+    let budget = split[0].width.saturating_sub(1);
+    let fitted = fit_spans(&spans, budget);
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(app.theme.bg_base)),
+        Paragraph::new(Line::from(fitted)).style(Style::default().bg(app.theme.bg_base)),
         split[0],
     );
     // Token usage from the last assistant/chunk usage event.
-    let u = app.transcript.usage;
-    let ctx_text = if u.input > 0 || u.output > 0 {
-        format!("in {} · out {} · cache {}", u.input, u.output, u.cache)
-    } else {
-        "ctx 0/1.0M".to_string()
-    };
     let ctx = Span::styled(ctx_text, Style::default().fg(app.theme.gray));
     f.render_widget(
         Paragraph::new(Line::from(vec![ctx]))
@@ -516,9 +568,12 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Tail window + manual scroll offset.
     let height = area.height.saturating_sub(1) as usize;
-    let start = lines.len().saturating_sub(height).saturating_sub(app.scroll);
+    let start = lines
+        .len()
+        .saturating_sub(height)
+        .saturating_sub(app.scroll);
     let end = lines.len().saturating_sub(app.scroll);
-    let view: Vec<Line> = lines[start.max(0)..end.max(start)].to_vec();
+    let view: Vec<Line> = lines[start..end.max(start)].to_vec();
     f.render_widget(Paragraph::new(view), area);
 }
 

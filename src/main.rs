@@ -5,10 +5,10 @@
 
 mod app;
 mod bus;
-mod demo;
-mod proto;
 mod clipboard;
+mod demo;
 mod files;
+mod proto;
 mod resume;
 mod theme;
 mod transcript;
@@ -23,7 +23,9 @@ use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use serde_json::json;
 
 use crate::app::App;
@@ -136,13 +138,15 @@ fn controller_loop(
                     "sessionId": session_id,
                     "contentBlocks": [ { "type": "text", "text": text } ]
                 });
-                if let Err(e) = rt.request("session/prompt", Some(params), Duration::from_secs(30)) {
+                if let Err(e) = rt.request("session/prompt", Some(params), Duration::from_secs(30))
+                {
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("prompt failed: {e}")));
                 }
             }
             Cmd::Cancel { session_id } => {
                 let params = json!({ "sessionId": session_id });
-                if let Err(e) = rt.request("session/cancel", Some(params), Duration::from_secs(10)) {
+                if let Err(e) = rt.request("session/cancel", Some(params), Duration::from_secs(10))
+                {
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("cancel failed: {e}")));
                 }
             }
@@ -160,19 +164,17 @@ fn controller_loop(
                     }
                 }
             }
-            Cmd::FetchCatalog => {
-                match rt.request("tui/catalog", None, Duration::from_secs(30)) {
-                    Ok(res) => {
-                        let _ = bus.send(AppEvent::Rpc {
-                            method: "tui/catalog-result".to_string(),
-                            params: res,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
-                    }
+            Cmd::FetchCatalog => match rt.request("tui/catalog", None, Duration::from_secs(30)) {
+                Ok(res) => {
+                    let _ = bus.send(AppEvent::Rpc {
+                        method: "tui/catalog-result".to_string(),
+                        params: res,
+                    });
                 }
-            }
+                Err(e) => {
+                    let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
+                }
+            },
             Cmd::SelectModel { provider, model } => {
                 let params = json!({ "provider": provider, "model": model });
                 match rt.request("tui/select-model", Some(params), Duration::from_secs(30)) {
@@ -183,7 +185,8 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("select-model failed: {e}")));
+                        let _ =
+                            bus.send(AppEvent::RuntimeStderr(format!("select-model failed: {e}")));
                     }
                 }
             }
@@ -197,7 +200,8 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("permission failed: {e}")));
+                        let _ =
+                            bus.send(AppEvent::RuntimeStderr(format!("permission failed: {e}")));
                     }
                 }
             }
@@ -215,7 +219,10 @@ fn controller_loop(
                     }
                 }
             }
-            Cmd::Rewind { session_id, boundary } => {
+            Cmd::Rewind {
+                session_id,
+                boundary,
+            } => {
                 let params = json!({ "sessionId": session_id, "boundary": boundary });
                 match rt.request("tui/rewind", Some(params), Duration::from_secs(30)) {
                     Ok(res) => {
@@ -229,17 +236,15 @@ fn controller_loop(
                     }
                 }
             }
-            Cmd::ListLive => {
-                match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
-                    Ok(res) => {
-                        let _ = bus.send(AppEvent::Rpc {
-                            method: "tui/live-list".to_string(),
-                            params: res,
-                        });
-                    }
-                    Err(_e) => {}
+            Cmd::ListLive => match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
+                Ok(res) => {
+                    let _ = bus.send(AppEvent::Rpc {
+                        method: "tui/live-list".to_string(),
+                        params: res,
+                    });
                 }
-            }
+                Err(_e) => {}
+            },
             Cmd::Respond { id, result } => {
                 if let Err(e) = rt.respond(&id, result) {
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("respond failed: {e}")));
@@ -260,12 +265,16 @@ fn controller_loop(
 /// Priority: the dsh-whale-tui block (this TUI's own default), then the
 /// shared agent-default-model block. Best effort; None when absent.
 fn local_defaults() -> (Option<String>, Option<String>) {
-    let root = std::env::var("DSH_HOME").ok().or_else(|| {
-        std::env::var("HOME").ok().map(|h| format!("{h}/.dsh"))
-    });
-    let Some(root) = root else { return (None, None) };
+    let root = std::env::var("DSH_HOME")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.dsh")));
+    let Some(root) = root else {
+        return (None, None);
+    };
     let path = std::path::Path::new(&root).join("settings.yaml");
-    let Ok(text) = std::fs::read_to_string(path) else { return (None, None) };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
     let mut block: Option<&str> = None;
     let mut whale = (None, None);
     let mut agent = (None, None);
@@ -282,7 +291,9 @@ fn local_defaults() -> (Option<String>, Option<String>) {
             continue;
         }
         let Some(b) = block else { continue };
-        let Some((k, v)) = line.trim().split_once(':') else { continue };
+        let Some((k, v)) = line.trim().split_once(':') else {
+            continue;
+        };
         let v = v.trim().trim_matches(|c| c == '\'' || c == '"').trim();
         if v.is_empty() {
             continue;
@@ -294,7 +305,11 @@ fn local_defaults() -> (Option<String>, Option<String>) {
             _ => {}
         }
     }
-    if whale.0.is_some() || whale.1.is_some() { whale } else { agent }
+    if whale.0.is_some() || whale.1.is_some() {
+        whale
+    } else {
+        agent
+    }
 }
 fn main() -> Result<()> {
     #[cfg(unix)]
@@ -310,10 +325,15 @@ fn main() -> Result<()> {
             .into_owned(),
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
     };
-    let session_id = args
-        .session_id
-        .clone()
-        .unwrap_or_else(|| format!("dsh-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()));
+    let session_id = args.session_id.clone().unwrap_or_else(|| {
+        format!(
+            "dsh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        )
+    });
 
     let (bus_tx, bus_rx) = mpsc::channel::<AppEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -339,8 +359,14 @@ fn main() -> Result<()> {
     let (provider, model) = {
         let local = local_defaults();
         (
-            args.provider.clone().or(local.0).unwrap_or_else(|| "deepseek-official".into()),
-            args.model.clone().or(local.1).unwrap_or_else(|| "deepseek-v4-flash".into()),
+            args.provider
+                .clone()
+                .or(local.0)
+                .unwrap_or_else(|| "deepseek-official".into()),
+            args.model
+                .clone()
+                .or(local.1)
+                .unwrap_or_else(|| "deepseek-v4-flash".into()),
         )
     };
     {
@@ -360,14 +386,11 @@ fn main() -> Result<()> {
         let tx = bus_tx.clone();
         std::thread::Builder::new()
             .name("input".into())
-            .spawn(move || loop {
-                match crossterm::event::read() {
-                    Ok(ev) => {
-                        if tx.send(AppEvent::Term(ev)).is_err() {
-                            break;
-                        }
+            .spawn(move || {
+                while let Ok(ev) = crossterm::event::read() {
+                    if tx.send(AppEvent::Term(ev)).is_err() {
+                        break;
                     }
-                    Err(_) => break,
                 }
             })
             .expect("spawn input thread");
@@ -375,7 +398,12 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
