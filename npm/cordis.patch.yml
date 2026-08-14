@@ -1,5 +1,9 @@
-# dsh-whale-tui bundle patch: mount the native TUI runner over the profile's base
-# bundle under the stable plugin id tui-runner.
+# dsh-whale-tui bundle patch: mount the native TUI runner over the profile's
+# base bundle, plus the interaction tool the TUI surface answers (the
+# ask_user_question tool needs a userQuestions provider, which this bundle
+# registers inside tui-runner).
 - insert:
     - id: tui-runner
       name: 'dsh-whale-tui'
+    - id: tool-ask-user
+      name: '@deepseek-ai/dsh-tool-ask-user'

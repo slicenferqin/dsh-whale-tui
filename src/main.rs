@@ -143,6 +143,11 @@ fn controller_loop(
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("cancel failed: {e}")));
                 }
             }
+            Cmd::Respond { id, result } => {
+                if let Err(e) = rt.respond(&id, result) {
+                    let _ = bus.send(AppEvent::RuntimeStderr(format!("respond failed: {e}")));
+                }
+            }
             Cmd::Shutdown { ack } => {
                 rt.shutdown();
                 let _ = ack.send(());

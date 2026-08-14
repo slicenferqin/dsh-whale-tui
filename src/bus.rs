@@ -11,6 +11,8 @@ pub enum AppEvent {
     Rpc { method: String, params: Value },
     /// One line of runtime stderr (kept for diagnostics).
     RuntimeStderr(String),
+    /// Server-initiated request from the bridge (approval / ask_user dialogs).
+    ServerRequest { id: String, method: String, params: Value },
     /// Runtime subprocess exited.
     RuntimeExited(Option<i32>),
 }
@@ -23,4 +25,6 @@ pub enum Cmd {
     Cancel { session_id: String },
     /// Graceful quit; the controller answers the shutdown RPC then acks.
     Shutdown { ack: std::sync::mpsc::Sender<()> },
+    /// Answer a server-initiated request (approval / ask_user dialog).
+    Respond { id: String, result: Value },
 }

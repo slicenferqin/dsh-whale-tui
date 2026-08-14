@@ -94,6 +94,54 @@ function apply(ctx) {
     })
   }))
 
+  // ------------------------------------------ interactive dialogs --------
+  // Approval: answer the approval/request waterfall from the TUI. On any
+  // transport failure we delegate (fail-closed via the default answerer).
+  disposers.push(ctx.on('approval/request', async (req, next) => {
+    try {
+      const signal = AbortSignal.timeout(120000)
+      const result = await transport.request('ui/approve', {
+        id: String(req.id),
+        toolName: req.toolName,
+        reason: req.reason ?? null,
+        input: req.input ?? null,
+        options: ['allowed-once', 'rejected'],
+      }, signal)
+      const outcome = result && result.outcome
+      if (outcome === 'allowed-once' || outcome === 'rejected' || outcome === 'cancelled') {
+        return outcome
+      }
+      return next()
+    } catch {
+      return next()
+    }
+  }))
+
+  // ask_user_question: register THE UI provider for this context (the tui
+  // profile composes no other provider). Returns the human answer to the
+  // agent loop.
+  const userQuestions = ctx.get('userQuestions')
+  if (userQuestions !== undefined) {
+    disposers.push(userQuestions.registerProvider({
+      ask: async (req) => {
+        const signal = AbortSignal.timeout(120000)
+        const result = await transport.request('ui/ask-user', {
+          questions: req.questions.map((q) => ({
+            id: q.id,
+            question: q.question,
+            header: q.header ?? null,
+            options: (q.options ?? []).map((o) => ({
+              label: o.label,
+              description: o.description ?? null,
+            })),
+            multiSelect: !!q.multiSelect,
+          })),
+        }, signal)
+        return { answers: result.answers }
+      },
+    }))
+  }
+
   // ---------------------------------------------------------- sessions --
   async function createSession(sessionId) {
     const handle = await ctx.agents.create({

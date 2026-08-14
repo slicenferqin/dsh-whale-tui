@@ -182,6 +182,11 @@ impl Runtime {
         self.write_line(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
+    /// Answer a server-initiated request from the bridge.
+    pub fn respond(&self, id: &str, result: Value) -> Result<()> {
+        self.write_line(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+
     pub fn stderr_snapshot(&self, n: usize) -> Vec<String> {
         let tail = self.stderr_tail.lock().unwrap();
         tail.iter().rev().take(n).rev().cloned().collect()
@@ -213,24 +218,34 @@ fn route(msg: &Value, pending: &Pending, stdin_slot: &SharedWriter, bus: &mpsc::
     let id = msg.get("id");
     let method = msg.get("method").and_then(Value::as_str);
     match (id, method) {
-        // Server-initiated request: the future approval / ask_user bridge
-        // answers here. For now, method-not-found keeps the runtime alive.
+        // Server-initiated request: the approval / ask_user bridge. Dispatch
+        // to the UI thread; if the UI is gone, fail the request so the peer
+        // never deadlocks waiting for an answer.
         (Some(id), Some(method)) => {
-            let reply = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("dsh-whale-tui: unhandled server request {method}") }
+            let rid = id
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| id.to_string());
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let sent = bus.send(AppEvent::ServerRequest {
+                id: rid.clone(),
+                method: method.to_string(),
+                params,
             });
-            if let Some(stdin) = stdin_slot.lock().unwrap().as_mut() {
-                if let Ok(mut payload) = serde_json::to_vec(&reply) {
-                    payload.push(b'\n');
-                    let _ = stdin.write_all(&payload);
-                    let _ = stdin.flush();
+            if sent.is_err() {
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": { "code": -32601, "message": "dsh-whale-tui: no UI to answer" }
+                });
+                if let Some(stdin) = stdin_slot.lock().unwrap().as_mut() {
+                    if let Ok(mut payload) = serde_json::to_vec(&reply) {
+                        payload.push(b'\n');
+                        let _ = stdin.write_all(&payload);
+                        let _ = stdin.flush();
+                    }
                 }
             }
-            let _ = bus.send(AppEvent::RuntimeStderr(format!(
-                "unhandled server request: {method}"
-            )));
         }
         // Response to one of our requests.
         (Some(id), None) => {
