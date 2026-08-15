@@ -106,6 +106,53 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Dialog::Tasks(t) => {
+            let w = area.width.min(90).saturating_sub(4).max(40);
+            let h = (t.rows.len() as u16 + 3)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                " tasks — r 刷新 · q/Esc 关闭",
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            if t.rows.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " (无后台任务)",
+                    Style::default().fg(app.theme.gray_dim),
+                )));
+            }
+            for (i, row) in t.rows.iter().enumerate() {
+                let selected = i == t.selected;
+                let mark = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{}{} · {} · {} · {} · {}",
+                        mark, row.kind, row.id, row.status, row.label, row.detail
+                    ),
+                    style,
+                )));
+            }
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.prompt_border_active))
+                .title(" tasks ");
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_base)),
+                rect,
+            );
+        }
         Dialog::Subagent(v) => {
             let w = area.width.saturating_sub(6).max(40);
             let h = area.height.saturating_sub(4).max(10);
@@ -571,6 +618,18 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(app.theme.text_secondary),
         ),
     ];
+    if app.term_kind != crate::term::TermKind::Plain {
+        spans.push(Span::styled(
+            format!(" · {}", app.term_kind.name()),
+            Style::default().fg(app.theme.gray_dim),
+        ));
+    }
+    if app.in_tmux {
+        spans.push(Span::styled(
+            " · tmux",
+            Style::default().fg(app.theme.gray_dim),
+        ));
+    }
     match app.state {
         RunState::Running => spans.push(Span::styled(
             " ● running",
@@ -723,6 +782,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         Dialog::Palette(_) => "type filter · ↑/↓ select · Enter run · Esc close · Ctrl+Q quit",
         Dialog::Info(_) => "q/Enter/Esc close · Ctrl+Q quit",
         Dialog::Subagent(_) => "↑/↓ scroll · q/Esc back · Ctrl+Q quit",
+        Dialog::Tasks(_) => "↑/↓ select · r refresh · q/Esc close · Ctrl+Q quit",
         Dialog::Theme(_) => "↑/↓ preview · Enter keep · Esc revert · Ctrl+Q quit",
         Dialog::Ask(d) => {
             let cur = d.current.min(d.questions.len().saturating_sub(1));
@@ -736,6 +796,11 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
             Focus::Prompt => "Enter send · Shift+Enter newline · Alt+Enter send-now · Esc cancel/2×clear · Ctrl+Q quit",
             Focus::Scrollback => "↑/↓ select · h/l fold · Tab prompt · Ctrl+E thinking · Ctrl+T theme · Ctrl+Q quit",
         },
+    };
+    let hint = if app.term_kind.is_vscode_family() {
+        hint.replace("Ctrl+Q", "Ctrl+D")
+    } else {
+        hint.to_string()
     };
     f.render_widget(
         Paragraph::new(Span::styled(

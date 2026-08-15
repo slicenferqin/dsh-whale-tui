@@ -43,6 +43,10 @@ TS 桥与协议已立起 session/cancel 扩展点，审批/ask_user 双向通道
     dsh plugin --profile tui add ./dist/*.tgz # 安装到 tui profile
     dsh --profile tui                         # 启动
 
+## 终端适配
+
+启动时探测终端（TERM_PROGRAM/TMUX）：VS Code 家族自动把退出键提示换成 Ctrl+D（宿主抢占 Ctrl+Q），状态栏显示终端名与 tmux 状态；色彩按终端能力量化（truecolor/256/16）。
+
 ## 社区发现
 
 仓库带 [dsh-plugin](https://github.com/topics/dsh-plugin) topic；发布 npm 后可被 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 精选列表与 dsh-find-plugin 检索收录。
@@ -72,6 +76,7 @@ TUI 的默认 provider/model 从 ~/.dsh/settings.yaml 的 dsh-whale-tui: 块读�
 | Ctrl+T | 切主题（dark/light） |
 | Ctrl+Q / Ctrl+D | 退出 |
 | Ctrl+P / ? | 命令面板（slash 命令+常用操作，可过滤） |
+| Ctrl+G | tasks 面板：后台任务 + 活跃子代理（r 刷新） |
 | z（问题卡内） | 自由文本回答（Enter 提交 · Esc 返回选项） |
 | y / Y | 复制选中块内容 / 元数据（剪贴板三路由：native→tmux→OSC52，备份 ~/.dsh/last-copy.txt） |
 

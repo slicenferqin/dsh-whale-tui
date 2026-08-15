@@ -13,6 +13,7 @@ use crate::bus::{AppEvent, Cmd};
 use crate::clipboard;
 use crate::files::{fuzzy_filter, list_files};
 use crate::resume::{list_sessions, read_session_events, SessionSummary};
+use crate::term::TermKind;
 use crate::theme::Theme;
 use crate::transcript::{CellKind, Transcript};
 
@@ -83,6 +84,21 @@ pub struct AskDialog {
 #[derive(Debug, Clone)]
 pub struct ResumePicker {
     pub items: Vec<SessionSummary>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRow {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TasksView {
+    pub rows: Vec<TaskRow>,
     pub selected: usize,
 }
 
@@ -179,6 +195,7 @@ pub enum Dialog {
     Info(InfoDialog),
     Theme(ThemePicker),
     Subagent(SubagentView),
+    Tasks(TasksView),
 }
 
 pub struct App {
@@ -199,6 +216,8 @@ pub struct App {
     pub demo: bool,
     pub dialog: Dialog,
     pub workspace: String,
+    pub term_kind: TermKind,
+    pub in_tmux: bool,
     at_fragment_start: Option<usize>,
     permission_presets: Vec<String>,
     preset_index: usize,
@@ -238,6 +257,8 @@ impl App {
             demo,
             dialog: Dialog::None,
             workspace,
+            term_kind: TermKind::Plain,
+            in_tmux: false,
             at_fragment_start: None,
             permission_presets: Vec::new(),
             preset_index: 0,
@@ -603,6 +624,51 @@ impl App {
                         self.status = format!("model: {provider}/{model}");
                     }
                 }
+                "tui/jobs-result" => {
+                    let mut rows: Vec<TaskRow> = params
+                        .get("jobs")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|j| {
+                                    Some(TaskRow {
+                                        id: j.get("id")?.as_str()?.to_string(),
+                                        kind: j.get("kind")?.as_str()?.to_string(),
+                                        label: j
+                                            .get("label")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        status: j
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        detail: j
+                                            .get("detail")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // 活跃子代理也列进来（与后台任务同视图）
+                    for (child, t) in &self.child_transcripts {
+                        if !rows.iter().any(|r| r.id == *child) {
+                            let turns = t.cells.iter().filter(|c| c.kind == CellKind::User).count();
+                            rows.push(TaskRow {
+                                id: child.clone(),
+                                kind: "subagent".to_string(),
+                                label: format!("live child ({} msgs)", turns),
+                                status: "running".to_string(),
+                                detail: String::new(),
+                            });
+                        }
+                    }
+                    self.dialog = Dialog::Tasks(TasksView { rows, selected: 0 });
+                }
                 "tui/session-info-result" => {
                     let get = |k: &str| {
                         params
@@ -963,6 +1029,16 @@ impl App {
             } else {
                 crate::theme::DARK
             };
+            return;
+        }
+
+        // ---- tasks pane (docs/01 section 10) ----
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            if self.has_dialog() {
+                self.dialog = Dialog::None;
+            } else {
+                let _ = self.cmd_tx.send(Cmd::FetchJobs);
+            }
             return;
         }
 
@@ -1455,6 +1531,21 @@ impl App {
                     }
                 }
                 KeyCode::Esc => {
+                    self.dialog = Dialog::None;
+                }
+                _ => {}
+            },
+            Dialog::Tasks(t) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    t.selected = t.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    t.selected = (t.selected + 1).min(t.rows.len().saturating_sub(1));
+                }
+                KeyCode::Char('r') => {
+                    let _ = self.cmd_tx.send(Cmd::FetchJobs);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.dialog = Dialog::None;
                 }
                 _ => {}

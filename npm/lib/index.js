@@ -410,6 +410,21 @@ function apply(ctx) {
     }
   }
 
+  // Background jobs (bash/subagent) for the tasks pane (Ctrl+G).
+  async function tuiJobs() {
+    const jobs = ctx.get('jobs')
+    if (jobs === undefined) return { jobs: [] }
+    return {
+      jobs: jobs.list().map((j) => ({
+        id: String(j.id),
+        kind: j.kind,
+        label: j.label,
+        status: j.status,
+        detail: j.detail ?? null,
+      })),
+    }
+  }
+
   // Our protocol extension: hard-cancel the running turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
@@ -490,6 +505,8 @@ function apply(ctx) {
         return tuiRewind(params)
       case 'tui/session-info':
         return tuiSessionInfo(params)
+      case 'tui/jobs':
+        return tuiJobs()
       case 'session/cancel':
         return cancel(params)
       case 'shutdown': {

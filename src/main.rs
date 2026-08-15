@@ -10,6 +10,7 @@ mod demo;
 mod files;
 mod proto;
 mod resume;
+mod term;
 mod theme;
 mod transcript;
 mod ui;
@@ -251,6 +252,17 @@ fn controller_loop(
                     }
                 }
             }
+            Cmd::FetchJobs => match rt.request("tui/jobs", None, Duration::from_secs(15)) {
+                Ok(res) => {
+                    let _ = bus.send(AppEvent::Rpc {
+                        method: "tui/jobs-result".to_string(),
+                        params: res,
+                    });
+                }
+                Err(e) => {
+                    let _ = bus.send(AppEvent::RuntimeStderr(format!("jobs failed: {e}")));
+                }
+            },
             Cmd::ListLive => match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
                 Ok(res) => {
                     let _ = bus.send(AppEvent::Rpc {
@@ -429,7 +441,10 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let theme = theme::theme_for(&args.theme);
+    let (term_kind, in_tmux) = term::detect();
     let mut app = App::new(theme, session_id, model, args.demo, cmd_tx.clone(), cwd);
+    app.term_kind = term_kind;
+    app.in_tmux = in_tmux;
     if args.demo {
         demo::seed(&mut app);
     }

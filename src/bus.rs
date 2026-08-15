@@ -67,6 +67,8 @@ pub enum Cmd {
     SessionInfo {
         session_id: String,
     },
+    /// Background jobs for the tasks pane (Ctrl+G).
+    FetchJobs,
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond {
         id: String,
