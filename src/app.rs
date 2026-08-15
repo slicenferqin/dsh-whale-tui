@@ -900,6 +900,14 @@ impl App {
     }
 
     fn handle_key(&mut self, ev: Event) {
+        // Bracketed paste: terminals wrap IME commits and Cmd/Ctrl+V paste in
+        // ESC[200~ ... ESC[201~. crossterm decodes that to Event::Paste, and
+        // dropping it here is what made Chinese input (and any pasted text)
+        // never reach the composer on modern terminals.
+        if let Event::Paste(text) = ev {
+            self.handle_paste(text);
+            return;
+        }
         let Event::Key(key) = ev else { return };
         if key.kind != KeyEventKind::Press {
             return;
@@ -1315,6 +1323,35 @@ impl App {
                         d.feedback.push(c);
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Route bracketed-paste text to the control that currently owns the
+    /// keyboard. Outside dialogs this is the prompt composer; inside dialogs
+    /// it is the active text field (ask_user free text / plan feedback /
+    /// filter boxes). A parked approval card hands the keyboard back to the
+    /// scrollback, so paste goes to the composer exactly like typed chars.
+    fn handle_paste(&mut self, text: String) {
+        match &mut self.dialog {
+            Dialog::Approval(d) if d.parked => {
+                self.focus = Focus::Prompt;
+                self.input.push_str(&text);
+            }
+            Dialog::Ask(d) => {
+                if d.taking_text {
+                    d.custom_text.push_str(&text);
+                } else if d.taking_feedback {
+                    d.feedback.push_str(&text);
+                }
+            }
+            Dialog::Model(d) => d.filter.push_str(&text),
+            Dialog::FilePicker(d) => d.query.push_str(&text),
+            Dialog::Palette(d) => d.filter.push_str(&text),
+            Dialog::None => {
+                self.focus = Focus::Prompt;
+                self.input.push_str(&text);
             }
             _ => {}
         }
@@ -1759,5 +1796,21 @@ mod tests {
         assert_eq!(palette_filter(&rows, "model"), vec![1]);
         assert_eq!(palette_filter(&rows, "恢复"), vec![0]);
         assert_eq!(palette_filter(&rows, "").len(), 2);
+    }
+
+    #[test]
+    fn bracketed_paste_lands_in_composer() {
+        let (tx, _rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::theme_for("dark"),
+            "s1".into(),
+            "m".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.handle_key(Event::Paste("你好世界".into()));
+        assert_eq!(app.input, "你好世界");
+        assert_eq!(app.focus, Focus::Prompt);
     }
 }
