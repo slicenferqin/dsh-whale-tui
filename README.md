@@ -6,8 +6,7 @@ grok-build 风格的 DeepSeek Harness 终端 TUI —— 自研完整实现，作
 
 > 鲸鱼在终端里替你干活。
 
-**当前状态：骨架（Skeleton）**。可编译、可跑 demo 模式（--demo 无需 runtime/API key）；
-TS 桥与协议已立起 session/cancel 扩展点，审批/ask_user 双向通道待实现。
+**当前状态：P1 全量完成**。真实线上事件解析（assistant/chunk、usage、turn/end）、Esc 状态机（取消/清屏/回溯）、审批与 ask_user 双向通道、模型切换、权限预设、会话恢复（/resume）、计划审查（a/s/c/y/q）、任务面板（Ctrl+G）、剪贴板、主题量化、终端探测。demo 模式（--demo）无需 runtime/API key 即可体验全部交互。
 
 ## 设计依据
 
@@ -37,7 +36,9 @@ TS 桥与协议已立起 session/cancel 扩展点，审批/ask_user 双向通道
     cargo run -- --demo        # 脚本化 demo（无需 runtime/API key）
     cargo run -- --demo --theme light
 
-插件模式（需要已配置的 dsh 0.1.0-rc.6）：
+插件模式（需要全局 dsh 0.1.0-rc.6，一条命令装好）：
+
+    npm install -g @deepseek-ai/dsh@0.1.0-rc.6   # 装到 /opt/homebrew/bin（或你的 npm prefix）
 
     scripts/build-npm.sh                      # cargo release + stage vendor 二进制 + npm pack
     dsh plugin --profile tui add ./dist/*.tgz # 安装到 tui profile
