@@ -20,11 +20,18 @@ use crate::transcript::{TodoItem, TodoStatus};
 /// `goal` projection (dsh-goal). Phase drives the GoalBar's badge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Goal {
+    /// Needed to match admitted-round events to this goal — a cleared and
+    /// recreated goal restarts its round count.
+    pub id: String,
     pub objective: String,
     pub phase: GoalPhase,
     /// Present exactly while `phase` is `Blocked`.
     pub blocked_reason: Option<String>,
     pub max_rounds: u64,
+    /// Rounds as of the last goal *mutation*. This is a floor, not the live
+    /// count: the projection folds `goal/change` only, so an admitted
+    /// continuation round does not move it. Use
+    /// `Transcript::goal_rounds` for the live figure.
     pub rounds_started: u64,
 }
 
@@ -185,6 +192,11 @@ fn parse_goal(value: &Value) -> Option<Goal> {
     let objective = snapshot.get("objective").and_then(Value::as_str)?.to_string();
     let phase = GoalPhase::parse(snapshot.get("phase").and_then(Value::as_str)?)?;
     Some(Goal {
+        id: snapshot
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         objective,
         phase,
         blocked_reason: snapshot

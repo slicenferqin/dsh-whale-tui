@@ -233,34 +233,76 @@ GoalMessageSource { kind: 'goal', goalId, revision, round }
 
 官方 web 的落点：`dsh-client-ui-goal` = **GoalBar 常驻输入框上方**，读 goal 投影。
 
-写路径**已经免费可用**（已核实实现）：
+写路径：**服务可用，但不要走 `/goal` 命令**（已核实实现）。
 
-服务是 **`ctx.goals`**（复数），全部同步，mutation 走 CAS 传当前 `GoalRef`：
+服务是 **`ctx.goals`**（复数）—— 注意四个近似名字别混：服务 `goals`、投影 key `goal`、持久会话事件 `goal/change`、cordis 事件 `goal/changed`。全部**同步**（没有 Promise，别 await），mutation 走 CAS 传当前 `GoalRef`：
 
-```js
-ctx.goals.get(agent)                                   // current | undefined
-ctx.goals.create(agent, { objective })
-ctx.goals.edit(agent, goalRef(current), { objective })
-ctx.goals.pause(agent, goalRef(current))
-ctx.goals.resume(agent, goalRef(current))
-ctx.goals.clear(agent, goalRef(current))
-// 失败抛 GoalError
+```ts
+get(agent): GoalView | undefined
+create(agent, { objective, maxGoalRounds? }): GoalView      // 不收 ref
+edit(agent, ref, { objective?, maxGoalRounds? }): GoalView
+pause(agent, ref) / resume(agent, ref) / complete(agent, ref): GoalView
+block(agent, ref, { code, message }): GoalView
+clear(agent, ref): GoalRef                                   // 返回墓碑 ref
+disarm(agent): GoalView | undefined                          // ← 不要用，见下
 ```
 
-而 `dsh-command-goal` 已经把这些包成一条命令（`dsh-command-goal/lib/index.js`）：
+CAS 失配抛 `GoalError`，按 **`error.code`** 路由，不要解析 message：
 
-```js
-ctx.commands.register({
-  name: 'goal',
-  description: 'set or view the goal for a long-running task',
-  input: { hint: '[<objective>|clear|edit <objective>|pause|resume]' },
-  handler: (invocation) => executeGoalCommand(ctx, invocation)
-})
+```
+GOAL_AGENT_NOT_LIVE · GOAL_NOT_FOUND · GOAL_ALREADY_EXISTS · GOAL_STALE_REVISION
+GOAL_INVALID_OBJECTIVE · GOAL_INVALID_MAX_ROUNDS · GOAL_INVALID_BLOCK_REASON
+GOAL_INVALID_EDIT · GOAL_INVALID_TRANSITION
 ```
 
-我们的能力驱动命令面板已经在用 `ctx.commands.list(agent)` + `tui/execute-command`，而 `command-goal` 在 dsh-base 里 —— 所以 **`/goal` 现在就应该能用，不需要新协议方法**。注意命令层没有 `complete` 和 `block`：完成由模型经 `dsh-tool-goal` 触发，block 是策略驱动的。
+每次成功 mutation 把 revision +1，所以**每次调用后必须刷新 ref**。桥接层要在 `inject` 里加 `'goals'`。
 
-GoalBar 也不需要新的 capability flag：没挂 goal 插件 → 没有 goal 投影 → 条自动不出现。这正是投影驱动设计的红利。
+### ⚠️ 为什么不能用 `/goal` 命令做按钮
+
+`dsh-command-goal` 的 `parseGoalCommand` 最后一行是**兜底 create**：
+
+```js
+if (control === "clear")  return { kind: "clear" }
+if (control === "pause")  return { kind: "pause" }
+if (control === "resume") return { kind: "resume" }
+if (/^edit(?=\s)/iu.test(input)) return { kind: "edit", objective: input.slice(4).trim() }
+return { kind: "create", objective: input }      // ← 任何无法识别的文本
+```
+
+四个后果：
+
+1. **静默建目标陷阱**：命令层没有 `complete` / `block`，所以 **`/goal complete` 会新建一个 objective 为字符串 `"complete"` 的目标**。`/goal block`、`/goal done` 同理。TUI 按钮一旦走命令通道就是数据污染。
+2. **错误码全被抹平**：handler 把所有 `GoalError` 映射成同一句 "The goal command is not valid for the current state."。CAS 失配和非法状态迁移分不出来 —— 对一个需要决定「重读重试」还是「告诉用户原因」的 GoalBar 是致命的。
+3. `/goal edit <objective>` 打在一个 **complete** 的目标上会**静默走 create 而不是 edit**。
+4. 只返回文本，没有结构化状态 —— 要拿状态得去 screen-scrape `Status:` / `Rounds:` 那几行。
+
+所以：**读走投影 + 事件，写走 `ctx.goals`，`/goal` 只留给用户手输。**
+
+### ⚠️ `activation` 与 `disarm()`
+
+`resume` / `create` 置 `armed`；`pause` / `complete` / `block` / `clear` 以及 `agent/session-start` 置 `disarmed`。**没有独立的 arm API** —— arm 只是 create/resume 的副作用。
+
+**不要从 TUI 调 `disarm()`**：它不写 revision、不发 `goal/changed`，所以没有任何观察者（包括我们自己的 bar）会知道状态变了。想停继续跑用 `pause()`（持久且发事件），想重启用 `resume()`。`disarm()` 归 round driver 所有。
+
+### ⚠️ 轮次计数器不能读投影
+
+**`goal` 投影的 `roundsStarted` 不会随轮次推进** —— `applyGoalProjection` 第一行就是 `if (event.type !== "goal/change") return state`。推进发生在 service 自己的 fold 里，条件是一条被采纳的 goal-sourced `user/message`。所以投影里的值**冻结在最后一次 mutation 的快照上**，只在下次 mutation 提交时跳变。
+
+这正是官方 web GoalBar **不显示轮次计数器**的原因。投影同样刻意不含 `activation`。
+
+我们的做法：从我们本来就在转发的 `user/message` 事件里取 —— `source.kind === 'goal'` 时带 `{goalId, revision, round}`，按 goalId 记录最高已采纳轮次，与投影值取 max（两者都是真值的下界）。想要权威的 live view 也可以直接 `ctx.goals.get(agent)`（含 live `roundsStarted` 和 `activation`）。
+
+另外 `blockedReason.code` 可以区分谁 block 的：`model-reported` = 模型（经 `dsh-tool-goal`），`round-limit` / `queue-failed` / `prompt-rejected` = round driver。
+
+### 订阅
+
+```js
+ctx.on('goal/changed', ({ agent, change }) => …)
+// change: { operation, ref, goal?: GoalView }   goal 缺席 = clear 墓碑
+```
+从未 scoped 的 root context 会收到**所有** agent 的，要按 `payload.agent` 过滤。`change.goal` 已经是新鲜的 `GoalView`，不用回读。
+
+GoalBar 不需要 capability flag：没挂 goal 插件 → 没有 goal 投影 → 条自动不出现。
 
 TUI 落点建议：
 - 输入框上方一条 GoalBar：objective + phase 徽标 + `roundsStarted/maxGoalRounds` + activation
@@ -298,7 +340,25 @@ if (measurement.totalTokens < spec.thresholdTokens) return null
 
 即**占用达到上下文窗口 80% 时自动压缩**，压缩后保留约 16%。比 grok 的 85% 更早。
 
-两个使用注意：`thresholdRatio` 可配置且支持按 provider/model 覆盖（`modelPolicies`）；策略比较的是它自己的 `measure().totalTokens`，不是我们展示的 `projectedTokens`。所以状态栏的色带按 0.8 画是准确的**指引**而非承诺，硬编码在 `ui.rs::COMPACT_THRESHOLD` 并注明了。
+三个使用注意：
+
+1. `thresholdRatio` 可配置且支持按 provider/model 覆盖（`modelPolicies`）。**可以宿主侧读到**：`ctx.get('compaction').config.thresholdRatio`（`BasicCompactionEngine.config` 是公开字段；抽象 `CompactionEngine` 类型上没有，要 cast）。没有 wire 暴露 —— 但我们是进程内插件，所以拿得到。目前 TUI 硬编码 `ui.rs::COMPACT_THRESHOLD = 0.80`，改成读配置是个小改进。
+2. 策略比较的是它自己的 `measure().totalTokens`（**请求+响应**压力），不是我们展示的 `projectedTokens`（只有 prompt 侧）。所以 0.8 色带是准确的**指引**而非硬线，文案该说「大约在这里压缩」。
+3. `retainRatio = 0.16` —— 压缩成功后表面回落到窗口的约 16% 加摘要，也就是仪表会掉到哪里。
+
+`resolveCompactSpec` / `resolveTargetPolicy` **不可 import**（包只导出 `BasicCompactionEngine`），所以 `floor(contextWindow * ratio)` 和 `modelPolicies` 的精确匹配都得自己重算。
+
+#### 6.3.2 压缩期间客户端看到什么（已核实）
+
+机制：投影状态必须保持 O(1)，没法记住每个节点的价格，所以压缩前一个 metering 事件先声明被替换区间的「影子价格」（`shadowedTokenCount`），替换事件再消费这个 claim。
+
+按顺序会观察到：
+
+1. **`compaction/summary` 时数字不动，但仍然收到一次变更通知** —— fold 返回了新的 state 对象（只为存 claim），而 registry 是按 state **引用**去重的，不是按 view 相等。所以会有一帧数字完全相同的空更新。**不要当成错误，也不要在这上面做动画。**
+2. **替换事件时数字下跌**：`contextBreakdown.messageTokens` 减 `shadowedTokenCount - summaryTokens`，`contextPressure.projectedTokens` 减同一个量。`pressureTokens` **不动**（压缩自己不产生 usage）—— 这就是 `projectedTokens` 存在的全部理由；只渲染 `pressureTokens` 的仪表在整个压缩期间看起来是卡住的。`projectedTokens` 在 0 处截断，所以一次大压缩配上过时的锚点可能让仪表触底到 0%，**这是预期而非 bug**。
+3. **下一次请求的 usage 到达时**，`pressureTokens` 跳到压缩后的真实 prompt 大小，此刻 `projectedTokens == pressureTokens`。
+
+投影层没有任何东西需要失效（每个值都是整体 last-wins，替换重画即可）。**需要失效的是 transcript**：替换事件的 `shadowedSeqs: number[]` 精确列出了被影子化的表面节点 seq —— 我们目前没有处理，属于待办。
 
 #### 6.4 `/context` 明细 —— `contextBreakdown`
 
@@ -412,10 +472,13 @@ ContextBreakdownProjection {
 - [x] ~~`ProjectionSnapshot` 的确切字段名~~ —— `{ asOfSeq, values }`，见 3.3
 - [x] ~~`onChanged` 的触发时机~~ —— **仅值变化时**（`!Object.is`），见 3.3
 - [x] ~~投影是否需要先注册才有值~~ —— `snapshot()` 按需 lazy fold；未注册的 key 才缺席。但 **restore 不触发 onChanged**，resume 必须主动拉快照
-- [x] ~~`goal` 的可变操作怎么调~~ —— **`ctx.goals`**（复数，同步，CAS 传 `GoalRef`）；且 `/goal` 命令已覆盖 create/edit/pause/resume/clear，见 6.1
-- [ ] `GoalActivation` 由谁 arm/disarm，TUI 是否有权改
+- [x] ~~`goal` 的可变操作怎么调~~ —— **`ctx.goals`**（复数，同步，CAS 传 `GoalRef`，按 `error.code` 路由）。**不要走 `/goal` 命令**：它把无法识别的文本兜底成 create，且抹平所有错误码 —— 见 6.1
+- [x] ~~`GoalActivation` 由谁 arm/disarm~~ —— create/resume 置 armed，pause/complete/block/clear + session-start 置 disarmed；无独立 arm API。TUI **可以**经 pause/resume 驱动，**不可**调 `disarm()`（不发事件），见 6.1
 - [ ] 沙箱当前 profile 从哪个 seam 读（`dsh-sandbox-policy` 提到「each session's current model context」）
 - [ ] spill 引用在 tool result 里的载荷形状，以及取全文的调用
 - [ ] DSH 工具调用是否真有父子关系可构树，还是 web 的树来自子代理层级
 - [x] ~~`ctx.terminal` 是否可用~~ —— **不在 dsh-base**，要用得先往 profile 加 `dsh-terminal` + `dsh-terminal-bash`；接口能力仍待查
 - [ ] `dsh-tool-cordis` 的事件形状（挂载/卸载/运行状态如何上报）
+- [ ] 压缩替换事件的 `shadowedSeqs` 目前没被处理 —— transcript 需要按它丢弃被影子化的节点（见 6.3.2）
+- [ ] `tokenUsage` 投影应当取代我们对 `assistant/chunk` 的 usage 抓取：它按 (turn, step) **替换**而非累加同一次请求的采样，所以重试不会双计；我们现在的抓取会。另注意它把 reasoning 折进 `outputTokens`，不单独暴露
+- [ ] 是否把 `dsh-session-stats` 加进 profile 的 `cordis.patch.yml`（它只在 web-app bundle 里挂）。加了能白拿六个聚合值，但会改用户的 profile，且 live/per-turn 计时无论如何仍要客户端算

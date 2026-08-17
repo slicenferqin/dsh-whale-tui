@@ -206,6 +206,9 @@ pub struct Transcript {
     pub turns: Vec<TurnMarker>,
     /// Latest task-list snapshot (Ctrl+T pane + inline checklist rendering).
     pub todos: Vec<TodoItem>,
+    /// goalId -> highest admitted continuation round, derived from goal-sourced
+    /// `user/message` events. The `goal` projection cannot supply this.
+    pub goal_rounds: HashMap<String, u64>,
     next_id: u64,
     blocks: HashMap<u64, BlockState>,
     completed_turns: HashSet<u64>,
@@ -452,13 +455,26 @@ impl Transcript {
         self.record_metrics(event, ty, data);
         match ty {
             "user/message" => {
+                let source = data.and_then(|d| d.get("source"));
+                let kind = source
+                    .and_then(|s| s.get("kind"))
+                    .and_then(Value::as_str);
+                // A goal-sourced prompt is the harness admitting a continuation
+                // round. This is the ONLY live signal for the round counter: the
+                // `goal` projection's `roundsStarted` folds `goal/change` alone,
+                // so it is frozen at whatever the last mutation snapshotted.
+                if kind == Some("goal") {
+                    if let (Some(id), Some(round)) = (
+                        source.and_then(|s| s.get("goalId")).and_then(Value::as_str),
+                        source.and_then(|s| s.get("round")).and_then(Value::as_u64),
+                    ) {
+                        let entry = self.goal_rounds.entry(id.to_string()).or_default();
+                        *entry = (*entry).max(round);
+                    }
+                }
                 // Only real user prompts belong on the chat surface; plugin /
                 // runtime-context injections (system-prompt snapshots, skills
                 // catalogs) are model-visible but not user-visible.
-                let kind = data
-                    .and_then(|d| d.get("source"))
-                    .and_then(|s| s.get("kind"))
-                    .and_then(Value::as_str);
                 if kind != Some("user") {
                     return;
                 }

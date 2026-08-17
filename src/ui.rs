@@ -80,11 +80,20 @@ fn draw_goal_bar(f: &mut Frame, app: &App, area: Rect) {
     ];
     // Rounds first: it is fixed-width, so the objective takes whatever is left
     // rather than pushing the counter off a narrow terminal.
+    //
+    // The projection's `rounds_started` only moves on a goal *mutation*, so it
+    // is a floor. The live count comes from admitted goal-sourced prompts; take
+    // whichever is higher since both are lower bounds on the truth.
+    let rounds = app
+        .transcript
+        .goal_rounds
+        .get(&goal.id)
+        .copied()
+        .unwrap_or(0)
+        .max(goal.rounds_started);
     let tail = match (goal.phase, goal.blocked_reason.as_deref()) {
         (GoalPhase::Blocked, Some(reason)) => format!(" · {reason}"),
-        _ if goal.max_rounds > 0 => {
-            format!(" · round {}/{}", goal.rounds_started, goal.max_rounds)
-        }
+        _ if goal.max_rounds > 0 => format!(" · round {}/{}", rounds, goal.max_rounds),
         _ => String::new(),
     };
     let used = unicode_width::UnicodeWidthStr::width(badge) + 3
@@ -2256,6 +2265,70 @@ mod tests {
         assert_eq!(truncated("abcdef", 5), "abcd…");
         // wide glyphs are not split
         assert_eq!(truncated("你好世界", 5), "你好…");
+    }
+
+    #[test]
+    fn goal_bar_round_counter_advances_on_admitted_rounds_not_just_mutations() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        // The projection snapshots rounds only at goal *mutations*; it folds
+        // `goal/change` alone. So this says round 1 and will keep saying 1.
+        app.projections.apply(
+            "goal",
+            &serde_json::json!({
+                "goal": {"id":"g1","revision":1,"objective":"ship it",
+                         "phase":"active","maxGoalRounds":8},
+                "roundsStarted": 1, "createdAt": 1, "updatedAt": 1
+            }),
+            1,
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(terminal.backend().to_string().contains("round 1/8"));
+
+        // The harness admits rounds 2 and 3 — goal-sourced prompts, no goal
+        // mutation in between. A projection-only counter would still read 1.
+        for round in [2u64, 3] {
+            app.transcript.apply(&serde_json::json!({
+                "type": "user/message", "seq": 10 + round, "time": 100 + round,
+                "data": {"source": {"kind": "goal", "goalId": "g1", "revision": 1, "round": round},
+                         "content": [{"type": "text", "text": "continue"}]}
+            }));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let dump = terminal.backend().to_string();
+        assert!(
+            dump.contains("round 3/8"),
+            "counter must track admitted rounds, not the stale projection:\n{dump}"
+        );
+
+        // A different goal's rounds must not leak into this one
+        app.transcript.apply(&serde_json::json!({
+            "type": "user/message", "seq": 99, "time": 200,
+            "data": {"source": {"kind": "goal", "goalId": "OTHER", "revision": 1, "round": 7},
+                     "content": [{"type": "text", "text": "continue"}]}
+        }));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            terminal.backend().to_string().contains("round 3/8"),
+            "another goal's round count must not be borrowed"
+        );
+    }
+
+    #[test]
+    fn goal_sourced_prompts_stay_off_the_chat_surface() {
+        let mut app = test_app();
+        app.transcript.apply(&serde_json::json!({
+            "type": "user/message", "seq": 1, "time": 10,
+            "data": {"source": {"kind": "goal", "goalId": "g1", "revision": 1, "round": 1},
+                     "content": [{"type": "text", "text": "keep going"}]}
+        }));
+        assert!(
+            app.transcript.cells.is_empty(),
+            "a continuation round is not a user prompt: {:?}",
+            app.transcript.cells
+        );
+        assert_eq!(app.transcript.goal_rounds.get("g1"), Some(&1));
     }
 
     #[test]
