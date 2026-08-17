@@ -327,6 +327,30 @@ mod tests {
     }
 
     #[test]
+    fn an_attach_snapshot_of_a_fresh_session_clears_rather_than_populates() {
+        // The bridge replays `snapshot().values`, which carries EVERY registered
+        // key — a domain that has produced nothing yet reports its init view,
+        // and for goal/todos that is null. A fresh session must therefore end up
+        // empty, not half-populated with defaults.
+        let mut p = Projections::default();
+        p.apply("todos", &json!([{"content": "stale", "status": "pending"}]), 5);
+        p.apply(
+            "goal",
+            &json!({"goal":{"id":"g","revision":1,"objective":"old","phase":"active","maxGoalRounds":3},
+                    "roundsStarted":1,"createdAt":1,"updatedAt":1}),
+            5,
+        );
+
+        // now a fresh-session snapshot arrives (asOfSeq -1 lands as seq 0)
+        for key in ["todos", "goal"] {
+            p.apply(key, &Value::Null, 0);
+        }
+        assert!(p.todos.is_none());
+        assert!(p.goal.is_none());
+        assert_eq!(p.seq, 5, "seq is a high-water mark, not the latest arrival");
+    }
+
+    #[test]
     fn seq_never_goes_backwards() {
         let mut p = Projections::default();
         p.apply("todos", &json!([]), 9);

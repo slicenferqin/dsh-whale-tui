@@ -126,7 +126,27 @@ const off   = ctx.sessionProjections.onChanged((session, key, value, seq) => {
 
 协议侧只需要**一个**新通知 `tui/projection { key, value, seq }`，Rust 侧按 key 分发。新增投影不需要改协议。
 
-> 未核实：`ProjectionSnapshot` 的确切字段名（已确认含「值 + 最后反映的 seq」两部分，字段名待读实现）。这是唯一需要 spike 的点。
+已核实到实现（`dsh-session-projection/lib/types/index.js`）：
+
+```ts
+interface ProjectionSnapshot {
+  asOfSeq: number                        // = session.seq - 1，空日志为 -1
+  values: Partial<SessionProjectionMap>
+}
+```
+
+三条实现层语义，都影响客户端正确性：
+
+1. **`snapshot()` 填充每一个已注册 key**，不是只填「变过的」。某个域还没产出内容时给的是 `view(init())` —— 对 `goal` / `todos` 就是 `null`。所以新会话的快照会合法地推一批 null，客户端必须把 null 读成「已清空」。key 缺席只代表**没有插件注册过它**。
+2. **`onChanged` 只在投影值真的变了时才触发**，不是每个已提交事件都触发：
+   ```js
+   const changed = !Object.is(next, cell.state)
+   if (changed && this.listeners.size > 0) { … }
+   ```
+   所以客户端不需要自己去抖动/去重。载荷还先过了 `schema.parse(view(next))`，是 wire-safe 的。
+3. **`drive()` 只处理已提交事件；checkpoint restore 不触发监听器。** 因此**恢复会话时，不主动拉快照就什么都不会显示**，要等下一次事件恰好改动某个投影。桥接层必须在 attach/resume 时调一次 `snapshot()` —— 我们挂在 `registerSession()` 这个所有路径的收口处。
+
+另外 `drive()` 有「late build mid-stream」分支：cell 不存在时先 `buildCell(def, session.events.slice(0, event.seq))` 折完历史再走正常判定，所以中途才注册的消费者不会丢历史。
 
 ---
 
@@ -347,9 +367,9 @@ ContextBreakdownProjection {
 
 ## 11. 待核实清单
 
-- [ ] `ProjectionSnapshot` 的确切字段名（已知含「值 + 最后反映的 seq」）
-- [ ] `onChanged` 的触发时机：是否每个已提交事件都触发，还是仅在投影值实际变化时
-- [ ] 投影是否需要先注册/订阅才有值，或 `snapshot()` 总能按需重放
+- [x] ~~`ProjectionSnapshot` 的确切字段名~~ —— `{ asOfSeq, values }`，见 3.3
+- [x] ~~`onChanged` 的触发时机~~ —— **仅值变化时**（`!Object.is`），见 3.3
+- [x] ~~投影是否需要先注册才有值~~ —— `snapshot()` 按需 lazy fold；未注册的 key 才缺席。但 **restore 不触发 onChanged**，resume 必须主动拉快照
 - [ ] `goal` 的可变操作在进程内怎么调（`ctx.goal`? 服务名未确认）。注意 `command-goal` 在 base 里，写路径可能走现有命令通道即可 —— 见第 10 节
 - [ ] `GoalActivation` 由谁 arm/disarm，TUI 是否有权改
 - [ ] 沙箱当前 profile 从哪个 seam 读（`dsh-sandbox-policy` 提到「each session's current model context」）

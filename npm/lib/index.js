@@ -135,6 +135,30 @@ function apply(ctx) {
   const publishProjection = (sessionId, key, value, seq) => {
     transport.notify('session.projection', { sessionId, key, value, seq })
   }
+  /**
+   * Emit every currently-known projection for one session.
+   *
+   * `snapshot()` returns `{ asOfSeq: session.seq - 1, values }` and fills `values`
+   * with EVERY registered key — a key whose domain has produced nothing yet gets
+   * its init view, which for `goal` and `todos` is `null`. So a fresh session
+   * legitimately publishes nulls here, and the TUI reads null as "cleared".
+   * A key is absent only when no plugin registered it at all.
+   */
+  const publishProjectionSnapshot = (sessionId, handle) => {
+    if (projections === undefined || handle === undefined) return
+    let snapshot
+    try {
+      snapshot = projections.snapshot(handle.agent.session)
+    } catch (error) {
+      ctx.logger.warn('projection snapshot failed for %s: %s', sessionId, error)
+      return
+    }
+    const seq = snapshot.asOfSeq
+    for (const [key, value] of Object.entries(snapshot.values)) {
+      if (value === undefined) continue
+      publishProjection(sessionId, key, value, seq)
+    }
+  }
   if (projections !== undefined) {
     disposers.push(projections.onChanged((session, key, value, seq) => {
       publishProjection(String(session.id), key, value, seq)
@@ -266,6 +290,11 @@ function apply(ctx) {
   function registerSession(sessionId, handle) {
     selectionFor(handle.agent)
     sessions.set(sessionId, handle)
+    // Seed the TUI with current projection values. `onChanged` only fires when a
+    // committed event actually changes a projection, and checkpoint restore does
+    // not drive it — so a resumed session would otherwise show no goal or todo
+    // list until the next event happened to move one.
+    publishProjectionSnapshot(sessionId, handle)
     return handle
   }
 
