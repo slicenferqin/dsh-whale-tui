@@ -1,0 +1,333 @@
+# DSH 能力地图与 TUI 落点（deepseek-harness 独有能力）
+
+> 分析基线：本机全局安装的 `@deepseek-ai/dsh@0.1.0-rc.6`
+> （`/opt/homebrew/lib/node_modules/@deepseek-ai/dsh`，含 194 个 `@deepseek-ai/*` 依赖包）
+> 分析日期：2026-08-17。材料来源：各包 `package.json` 描述 + `lib/**/*.d.ts` 类型声明。
+> 方法说明：**没有**读文档站。类型声明是本版本的事实来源；若文档站与此处冲突，以本地安装为准。
+> 用途：确定 TUI 下一阶段该做什么。docs/01 回答「grok 怎么做 TUI」，本文回答「DSH 有什么值得我们暴露」。
+> 术语：本文所说 **seam**（能力缝）= DSH 用 `ctx.*` 暴露的抽象服务，可由不同实现包替换。
+
+---
+
+## 1. DSH 不是「另一个 grok」
+
+grok-build 是一个自带 pager 的单体 agent 平台。DSH 是 **cordis 插件宿主**：所有能力都是可替换的 seam，profile 通过 patch 层组合插件。
+
+结论对 TUI 的两条直接影响：
+
+1. **不能硬编码平台逻辑。** 某个 seam 没挂实现，对应入口就该消失。上一轮把命令面板改成 Harness 能力驱动，方向是对的，要继续沿用到所有面板。
+2. **读模型是 session projection，不是原始事件。** 见第 3 节 —— 这是本次调研最重要的发现。
+
+### 1.1 已命名的 29 个 ctx.* seam
+
+从包描述中提取（可能仍有未在描述里点名的 seam）：
+
+| seam | 实现/消费包 |
+|---|---|
+| `ctx.agents` | dsh-subagent-in-process-driver, dsh-subagent-spawn-in-process |
+| `ctx.approval` | dsh-user-approval |
+| `ctx.codeRuntime` | dsh-code-runtime(-worker-thread) |
+| `ctx.compaction` | dsh-compaction, dsh-compaction-basic, dsh-compaction-tool-result-pruner |
+| `ctx.credentials` | dsh-credentials(-local) |
+| `ctx.fs` | dsh-fs, dsh-fs-local, dsh-fs-sandbox, dsh-fs-observation-policy |
+| `ctx.jobs` | dsh-jobs(-local), dsh-tool-jobs |
+| `ctx.permissionPresets` | dsh-permission-presets |
+| `ctx.sandbox` | dsh-sandbox(-local), dsh-bash-sandbox, dsh-pwsh-sandbox, dsh-sandbox-windows-acl |
+| `ctx.sessionPersistence` | dsh-session-persistence(-jsonl) |
+| `ctx.sessionProjections` | **dsh-session-projection**（见第 3 节） |
+| `ctx.sessionProjectionCache` | dsh-session-projection-cache |
+| `ctx.sessionQuery` | dsh-session-query-sqlite（**FTS5 全文检索**） |
+| `ctx.sessionReferenceResolver` | dsh-session-reference（跨会话快照引用） |
+| `ctx.settings` | dsh-settings(-file) |
+| `ctx.shell` | dsh-shell, dsh-bash-local, dsh-pwsh-local |
+| `ctx.spillStore` | dsh-spill(-local), dsh-spill-policy |
+| `ctx.storage` | dsh-storage(-domain/-json) |
+| `ctx.subagents` | dsh-subagent + fork/spawn in-process 后端 |
+| `ctx.subprocess` | dsh-subprocess(-local) |
+| `ctx.tokenMeter` | dsh-token-meter |
+| `ctx.tools` | dsh-tools, dsh-mcp-client |
+| `ctx.userQuestions` | dsh-user-questions, dsh-tool-ask-user |
+| `ctx.web` | dsh-web, dsh-web-search-deepseek |
+| `ctx.workflowEngine` | dsh-workflow(-worker-thread) |
+| `ctx.workspaceRegistry` | dsh-workspace |
+| `ctx.apiProxy` / `ctx.directoryPicker` / `ctx.layout` | web host 专用，TUI 不涉及 |
+
+另有未走 `ctx.*` 命名的：`ctx.terminal`（dsh-terminal，持久 PTY）、`ctx.commands`、`ctx.agentDefaultModel`（后两个我们已在用）。
+
+---
+
+## 2. 我们是进程内插件 —— 这是权限优势
+
+官方 web UI 走 remote（`dsh-api-gateway` / `typert.remote-client`），只能访问被显式远程暴露的服务。我们的 Rust TUI 由 cordis 插件 spawn，桥接层持有真实 `ctx`，**可直读任何 seam**。
+
+抽查结果（是否带 `lib/typert.remote-client.js`，即是否为远程客户端暴露）：
+
+| 服务 | 远程可调 |
+|---|---|
+| dsh-goal | ✅ 唯一一个 |
+| dsh-schedule / dsh-tool-todo / dsh-token-meter / dsh-plan-mode | ❌ |
+| dsh-session-query / dsh-tool-cordis / dsh-terminal / dsh-workflow | ❌ |
+
+两点结论：
+- `dsh-goal` 被 DSH 自己当成**一等客户端界面**（专门做了远程暴露），而我们零支持 —— 见 6.1。
+- 其余服务 web 拿不到、我们拿得到。这是我们相对官方 UI 的结构性优势，不该浪费。
+
+---
+
+## 3. Session Projection：TUI 该读的东西
+
+### 3.1 机制
+
+插件把会话状态发布成**投影单元**（`ProjectionDefinition`）：纯同步 `init` / `apply` / `view`，state 必须是纯 JSON。框架在每个已提交会话事件上驱动 `apply`，并支持持久化 checkpoint 与重放恢复。
+
+投影键表 `SessionProjectionMap` 是 **merge-extensible** 的 —— 任何插件都能新增键。**所以泛化读投影的客户端会自动跟随平台演进；逐个解析事件的客户端不会。**
+
+### 3.2 已有 13 个投影键
+
+| projection key | owner | TUI 现状 |
+|---|---|---|
+| `goal` | dsh-goal | ❌ 完全没有 |
+| `contextPressure` | dsh-token-meter | ❌ |
+| `contextBreakdown` | dsh-token-meter | ❌ |
+| `subagentTiming` | dsh-subagent | ❌ |
+| `todos` | dsh-tool-todo | ⚠️ 走错缝，见第 5 节 |
+| `plan` | dsh-plan-mode | 部分（计划审查有，投影未读） |
+| `title` | dsh-session-title | 部分 |
+| `subagent` | dsh-subagent | 部分（子代理卡） |
+| `sessionStats` | dsh-session-stats | ✅ 状态栏 |
+| `tokenUsage` | dsh-token-meter | ✅ 状态栏 |
+| `permissions` | dsh-permission-presets | ✅ |
+| `imageLimits` | dsh-host-apiproxy | web 专用 |
+| `sessionListMetadata` | dsh-host-apiproxy | web 专用 |
+
+### 3.3 集成路径（已核实到类型层）
+
+`SessionProjectionRegistry` 挂在 cordis `Context` 上，任何插件可见：
+
+```ts
+ctx.sessionProjections.snapshot(session): ProjectionSnapshot   // 当前全量值 + seq
+ctx.sessionProjections.onChanged(
+  (session, key, value, seq) => void
+): () => void                                                   // 取消订阅函数
+```
+
+`onChanged` 是**键无关**的：一个监听器收全部投影、全部会话的变更，按 session id 过滤即可。
+
+`Agent` 接口带 `readonly session: Session` 与 `readonly id: SessionId`，而桥接层已经在调 `ctx.agents.get(...)`，所以初始快照拿得到：
+
+```js
+const agent = ctx.agents.get(sessionId)
+const snap  = ctx.sessionProjections.snapshot(agent.session)
+const off   = ctx.sessionProjections.onChanged((session, key, value, seq) => {
+  if (session.id !== sessionId) return
+  notify('tui/projection', { key, value, seq })
+})
+```
+
+协议侧只需要**一个**新通知 `tui/projection { key, value, seq }`，Rust 侧按 key 分发。新增投影不需要改协议。
+
+> 未核实：`ProjectionSnapshot` 的确切字段名（已确认含「值 + 最后反映的 seq」两部分，字段名待读实现）。这是唯一需要 spike 的点。
+
+---
+
+## 4. 模型侧工具清单（影响工具卡分类器）
+
+19 个 `dsh-tool-*` 包。`src/toolcard.rs` 目前按名字词干分类，对下表基本命中，但有几个需要专门渲染：
+
+| 工具包 | 暴露的工具 | 工具卡现状 |
+|---|---|---|
+| fs | read / write / edit | ✅ Read / Edit |
+| fs-search | glob / grep（打包 ripgrep） | ✅ Search |
+| bash | bash（可选后台 job + **沙箱升级**） | ✅ Run；升级请求未渲染 |
+| bash-persistent | 持久 Bash（PTY 支撑） | ⚠️ 与一次性 bash 无区别 |
+| pwsh | pwsh | ⚠️ 落到 Other |
+| todo | todo_write | ✅（但见第 5 节） |
+| web | web_search / web_fetch | ✅ Web |
+| jobs | job_output / job_list / job_kill | ⚠️ 落到 Other |
+| subagent | 子代理委派 | 部分 |
+| subagent-control | send_message / interrupt_agent / list_agents | ❌ |
+| subagent-report | 子代理汇报 | ❌ |
+| ask-user | ask_user_question | ✅ 问答卡 |
+| skill | skill 加载 | ❌ |
+| goal | 目标工具（带执行期权限校验） | ❌ |
+| workflow | 跑 JS 编排脚本 | ❌ |
+| ralph | **fresh-agent Ralph 循环** | ❌ |
+| cordis | **自指：检视运行时、挂载/卸载模型写的插件** | ❌ |
+| str-replace-editor | view / create / replace / insert | ⚠️ 落到 Edit（可接受） |
+| call-timeout-policy | 非工具，是 tools/execute 包装器 | — |
+
+---
+
+## 5. 需要修正的既有实现：todos 走错了缝
+
+当前 `src/transcript.rs` 从 `tool/call` 的 `arguments` **启发式解析** todo 快照（容忍 `todos`/`items`/`tasks`/裸数组，字段容忍 `content`/`text`/`title`…）。
+
+DSH 的权威定义是投影：
+
+```ts
+todos: TodoItem[] | null                    // whole-value，last-wins
+interface TodoItem {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+```
+
+字段我们猜对了（`content` 优先、三个 status 全部命中），但**接口选错了**：
+
+- 投影是 replay-safe 且带持久化 checkpoint 的；解析事件流不是
+- 参数形状是工具实现细节，投影是契约
+- 我们多实现的 `cancelled` 状态在 DSH 下是死分支（保留无害，跨 harness 时有用）
+
+**处置**：改读 `todos` 投影，把现有解析器降级为 fallback（投影缺失时才用）。这样在 DSH 下正确，在别的 harness 下仍能工作。
+
+---
+
+## 6. DSH 独有能力：TUI 落点与优先级
+
+### Tier 1 —— 建议立刻做
+
+#### 6.1 Goal 与 GoalBar
+
+DSH 的 goal 不是 grok 的 `/goal`，是**事件溯源的目标状态机 + race-fenced 轮次驱动器**（dsh-goal + dsh-goal-round-driver + dsh-tool-goal + dsh-command-goal）。
+
+```ts
+GoalView {
+  objective: string
+  phase: 'active' | 'paused' | 'blocked' | 'complete'
+  blockedReason?: { code: string; message: string }   // phase==='blocked' 时必在
+  maxGoalRounds: number
+  roundsStarted: number
+  createdAt / updatedAt: number
+  activation: 'armed' | 'disarmed'    // 进程本地，从不持久化
+}
+// 操作：create / edit / pause / resume / complete / block / clear
+```
+
+关键点：**消息带目标轮次归属**
+
+```ts
+GoalMessageSource { kind: 'goal', goalId, revision, round }
+```
+
+所以 transcript 能标「目标 X 第 3/10 轮」—— 这是 DSH 特有的、grok 没有对应物的渲染。
+
+官方 web 的落点：`dsh-client-ui-goal` = **GoalBar 常驻输入框上方**，读 goal 投影。
+
+TUI 落点建议：
+- 输入框上方一条 GoalBar：objective + phase 徽标 + `roundsStarted/maxGoalRounds` + activation
+- `blocked` 时高亮 `blockedReason.message`
+- transcript 里给带 goal round 归属的消息加轮次标记
+- 命令：`/goal`（创建/编辑）、pause/resume/complete/clear
+- 注意 `activation` 是进程本地状态，不能当持久字段展示
+
+#### 6.2 投影驱动渲染（架构性）
+
+按 3.3 的路径落地。一次改动同时修好 todos、拿到 goal / context / subagentTiming，并且**未来任何插件新增投影自动可用**。这是本文最高杠杆的一项。
+
+#### 6.3 真正的上下文压力条 —— `contextPressure`
+
+```ts
+ContextPressureProjection {
+  pressureTokens?: number    // provider 报的最近一次 prompt 真实大小（含 cache 读写，不含输出）
+  projectedTokens?: number   // 下一次请求会花多少 = 上者 + 自采样以来增减量的启发式重定价
+  contextWindow?: number     // 最新路由容量
+}
+```
+
+`projectedTokens` 的设计值得照抄语义：锚定 provider 真实值、只对增量做估算，因此**压缩一发生就立刻反映**——`pressureTokens` 做不到，因为压缩自身不产生 usage 事件。
+
+我们现在状态栏显示的是原始 input tokens。换成 `projectedTokens / contextWindow` 会比 grok 的 context bar 更准。
+
+#### 6.4 `/context` 明细 —— `contextBreakdown`
+
+```ts
+ContextBreakdownProjection {
+  systemTokens: number    // 最新请求信封的系统提示词
+  toolsTokens: number     // 工具 schema
+  messageTokens: number   // 当前模型可见会话面
+}
+```
+
+即 grok `/context` 的分类视图，白送。
+
+**硬约束（类型注释里写明的）**：三者用固定密度估算，**系统性低估 CJK 文本与 JSON schema**，所以「present these as approximations of composition, never as a total」。实现时必须按成分展示、**不能求和当总量**，否则会和 `projectedTokens` 打架。
+
+### Tier 2 —— 独特且中等成本
+
+| # | 能力 | DSH 侧 | TUI 落点 |
+|---|---|---|---|
+| 6.5 | **沙箱状态与提权** | ctx.sandbox + dsh-sandbox-policy（per-call 解析器）+ bwrap / landlock / Windows ACL 三后端；`dsh-tool-bash` 带 sandbox-escalation | 状态栏显示当前 profile；审批卡显示「请求提权」及其范围。DSH 的沙箱故事比 grok 深得多 |
+| 6.6 | **持久终端面板** | ctx.terminal（owner-scoped **交互式** PTY seam）+ dsh-terminal-bash + dsh-tool-bash-persistent | 挂一个 pane 到活 PTY。我们本身就是终端，这是天然契合；grok 无对应物 |
+| 6.7 | **spill 解析** | ctx.spillStore + dsh-spill-policy 把超大工具输出替换成引用 | 全屏查看器按引用取全文，而不是显示截断提示 |
+| 6.8 | **`cordis_define` 卡片** | dsh-tool-cordis：模型可往运行中的宿主写并挂载插件 | 带 run/stop 的插件定义卡（web 已有 `dsh-client-ui-cordis`）。grok 完全没有这个概念 |
+| 6.9 | **产出文件尾巴** | — | 每轮末列出本轮产出/引用的文件（web 有 `dsh-client-ui-deliverables`：produced-files turn tail + 可点击文件引用） |
+| 6.10 | **嵌套工具调用树** | — | web 的 `dsh-client-ui-tool` 是 **call-tree** renderer；我们的 transcript 是平的。结构性差距 |
+| 6.11 | **会话全文检索** | ctx.sessionQuery（SQLite **FTS5**） | `/resume` 现在只能按标题过滤；全文搜索几乎免费（docs/01 §14 已标记过） |
+
+### Tier 3 —— 以后再说
+
+- **Ralph 循环**（dsh-tool-ralph，fresh-agent 循环）：需要展示迭代轮次的卡片
+- **schedule 面板**（dsh-schedule：`after` / `at` / **fixed-rate**，比 grok 只有间隔的 `/loop` 更丰富）
+- **agent presets**（dsh-agent-presets，按 preset `cordis.yml` 做**每会话 agent 组合**；`~/.dsh/.agent-presets/` 已存在）
+- **Code Mode 指示器**（dsh-agent-tool-presentation 能把一个 agent 的工具组合成 **Code Mode / native / bot** 三种呈现 —— DSH 概念，Code Mode 下调用形态完全不同，值得单独渲染）
+- 消息级反馈（dsh-message-feedback）· 重复调用提醒（dsh-repeat-tool-reminder）· 跨会话 `@` 引用（dsh-session-reference）· 文件观察策略/读后写校验（dsh-fs-observation-policy）· persona · pwsh 专属渲染 · workflow-run 嵌套披露
+
+---
+
+## 7. 官方 web UI surface 对照（32 个 `dsh-client-ui-*`）
+
+这是「一个 DSH 客户端应该暴露什么」的最佳代理。标 ❌ 的是我们完全没有的：
+
+| surface | 我们 |
+|---|---|
+| conversation / composer / commands / input-trigger（`/` `@`） | ✅ |
+| model-selection / permission-presets / plan / user-questions / theme | ✅ |
+| jobs（会话头后台任务列表） | ✅ Ctrl+G |
+| skill（skill 引用 + 专用工具行） | ❌ |
+| **goal**（GoalBar） | ❌ |
+| **trajectory**（事件账本 + 交互式时序总览） | ❌ 我们只有状态栏聚合值 |
+| **deliverables**（产出文件尾巴） | ❌ |
+| **cordis**（动态插件定义卡） | ❌ |
+| **tool**（调用**树** + 按工具的呈现槽位） | ⚠️ 平铺 |
+| **agent-preset** | ❌ |
+| **workflow-run**（持久工作流节点 + 嵌套披露） | ❌ |
+| subagent（会话目录 + 续跑路由 + `@` 源） | 部分 |
+| message-feedback | ❌ |
+| attachment（草稿图片轨 + 图片画廊） | ❌ |
+| sidebar（会话多级树 / 搜索 / 分组 / 状态点） | ❌ ≈ grok Dashboard |
+| settings-*（5 个）/ workspace / directory-picker-* / layout / slots / primitives | web 专用或不适用 |
+
+---
+
+## 8. 不追的东西
+
+- **grok 的 Dashboard / worktree**：DSH 侧有 `ctx.workspaceRegistry` 和 web 的会话树，但对 TUI 仍是低频入口。继续排最后。
+- **web host 专用**：`imageLimits`、`sessionListMetadata`、`ctx.apiProxy`、`ctx.directoryPicker`、`ctx.layout`。
+- **grok 的内核能力**（hooks / memory / marketplace）：那是 grok 平台的事，DSH 的对应物是插件与 skill，按 DSH 的形状做，不照搬 grok 的 UI。
+
+---
+
+## 9. 建议实施顺序
+
+1. **spike**：核实 `ProjectionSnapshot` 字段名，桥接层打通 `snapshot` + `onChanged`，加 `tui/projection` 通知
+2. **todos 切投影**（第 5 节），现有解析器降级为 fallback
+3. **GoalBar**（6.1）—— 最大的 DSH 独有缺口
+4. **contextPressure 压力条 + contextBreakdown 的 `/context`**（6.3 / 6.4）
+5. 之后按 Tier 2 取：沙箱状态 → spill 解析 → 产出文件尾巴 → 调用树
+
+理由：1–2 是地基且能立刻修掉一处错接口；3 是 DSH 自己都做了远程暴露的一等界面；4 用同一条投影管道，边际成本很低。
+
+---
+
+## 10. 待核实清单
+
+- [ ] `ProjectionSnapshot` 的确切字段名（已知含「值 + 最后反映的 seq」）
+- [ ] `onChanged` 的触发时机：是否每个已提交事件都触发，还是仅在投影值实际变化时
+- [ ] 投影是否需要先注册/订阅才有值，或 `snapshot()` 总能按需重放
+- [ ] `goal` 的可变操作在进程内怎么调（`ctx.goal`? 服务名未确认；只确认了它有远程客户端）
+- [ ] `GoalActivation` 由谁 arm/disarm，TUI 是否有权改
+- [ ] 沙箱当前 profile 从哪个 seam 读（`dsh-sandbox-policy` 提到「each session's current model context」）
+- [ ] spill 引用在 tool result 里的载荷形状，以及取全文的调用
+- [ ] DSH 工具调用是否真有父子关系可构树，还是 web 的树来自子代理层级
+- [ ] `ctx.terminal` 的读写接口是否够 TUI 做交互式 pane（还是只能拉快照）
+- [ ] `dsh-tool-cordis` 的事件形状（挂载/卸载/运行状态如何上报）

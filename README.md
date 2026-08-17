@@ -12,6 +12,9 @@ grok-build 风格的 DeepSeek Harness 终端 TUI —— 自研完整实现，作
 
 - docs/01-grok-tui-spec.md —— grok-build pager 交互细节复刻 spec（键盘绑定、Esc 语义、审批弹窗、工具卡、主题槽位等）+ DSH 落点对照 + P0/P1/P2 优先级
 - docs/02-openma-teardown.md —— openma/deepseek-harness-tui（唯一 Rust/ratatui 同类）架构拆解 + 差距清单 + 可复用/要重做清单
+- docs/04-dsh-capability-map.md —— deepseek-harness 0.1.0-rc.6 能力地图：29 个 `ctx.*` seam、13 个 session projection、19 个模型侧工具、32 个官方 web surface 对照，以及 DSH **独有**能力的 TUI 落点与优先级（goal/GoalBar、上下文压力、沙箱、持久 PTY、cordis 自指插件…）
+
+> docs/01 回答「grok 怎么做 TUI」，docs/04 回答「DSH 有什么值得我们暴露」。两者方向不同，不要互相当替代。
 
 ## 架构（与 openma 同构，但协议双向化）
 
