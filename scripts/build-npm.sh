@@ -20,5 +20,5 @@ node scripts/package-native.mjs stage \
   --vendor-root npm/vendor
 
 mkdir -p dist
-(cd npm && npm pack --pack-destination ../dist)
-echo "tgz written to: $(ls -1 dist/*.tgz | tail -n 1)"
+PACKAGE="$(cd npm && npm pack --pack-destination ../dist)"
+echo "tgz written to: dist/$PACKAGE"

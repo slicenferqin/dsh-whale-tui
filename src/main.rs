@@ -1,4 +1,4 @@
-//! dsh-whale-tui — grok-style terminal UI for DeepSeek Harness (skeleton).
+//! dsh-whale-tui — grok-style terminal UI for DeepSeek Harness.
 //!
 //! Architecture: docs/02-openma-teardown.md (same shape, bidirectional
 //! protocol). Interaction spec: docs/01-grok-tui-spec.md.
@@ -8,10 +8,13 @@ mod bus;
 mod clipboard;
 mod demo;
 mod files;
+mod highlight;
+mod markdown;
 mod proto;
 mod resume;
 mod term;
 mod theme;
+mod toolcard;
 mod transcript;
 mod ui;
 
@@ -40,6 +43,7 @@ USAGE:
 
 OPTIONS:
   --demo               scripted demo turn (no runtime / API key)
+  --dump-frame <WxH>   print one deterministic demo frame and exit
   --attach-fds         plugin mode: JSON-RPC over inherited fds 3/4 (unix)
   -w, --workspace <d>  agent workspace (default: cwd)
   --session-id <id>    session id (default: generated)
@@ -52,6 +56,7 @@ OPTIONS:
 
 struct Args {
     demo: bool,
+    dump_frame: Option<(u16, u16)>,
     attach_fds: bool,
     workspace: Option<String>,
     theme: String,
@@ -63,6 +68,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         demo: false,
+        dump_frame: None,
         attach_fds: false,
         workspace: None,
         theme: "dark".into(),
@@ -77,6 +83,7 @@ fn parse_args() -> Result<Args> {
         };
         match arg.as_str() {
             "--demo" => args.demo = true,
+            "--dump-frame" => args.dump_frame = Some(parse_frame_size(&take("--dump-frame")?)?),
             "--attach-fds" => args.attach_fds = true,
             "-w" | "--workspace" => args.workspace = Some(take("--workspace")?),
             "--theme" => args.theme = take("--theme")?,
@@ -95,6 +102,23 @@ fn parse_args() -> Result<Args> {
         }
     }
     Ok(args)
+}
+
+fn parse_frame_size(raw: &str) -> Result<(u16, u16)> {
+    let (width, height) = raw
+        .split_once('x')
+        .or_else(|| raw.split_once('X'))
+        .with_context(|| format!("invalid frame size {raw:?}; expected WIDTHxHEIGHT"))?;
+    let width = width
+        .parse::<u16>()
+        .with_context(|| format!("invalid frame width {width:?}"))?;
+    let height = height
+        .parse::<u16>()
+        .with_context(|| format!("invalid frame height {height:?}"))?;
+    if width < 40 || height < 12 {
+        bail!("frame must be at least 40x12");
+    }
+    Ok((width, height))
 }
 
 struct RuntimeCfg {
@@ -144,6 +168,51 @@ fn controller_loop(
                     let _ = bus.send(AppEvent::RuntimeStderr(format!("prompt failed: {e}")));
                 }
             }
+            Cmd::SendNow { session_id, text } => {
+                let params = json!({
+                    "sessionId": session_id,
+                    "contentBlocks": [ { "type": "text", "text": text } ]
+                });
+                if let Err(e) =
+                    rt.request("session/send-now", Some(params), Duration::from_secs(30))
+                {
+                    let _ = bus.send(AppEvent::RuntimeStderr(format!("send-now failed: {e}")));
+                }
+            }
+            Cmd::UpdateQueue {
+                session_id,
+                item_id,
+                action,
+            } => {
+                let params = json!({
+                    "sessionId": session_id,
+                    "itemId": item_id,
+                    "action": action,
+                });
+                if let Err(e) =
+                    rt.request("session/update-queue", Some(params), Duration::from_secs(10))
+                {
+                    let _ = bus.send(AppEvent::RuntimeStderr(format!(
+                        "queue update failed: {e}"
+                    )));
+                }
+            }
+            Cmd::ExecuteCommand { session_id, line } => {
+                let params = json!({ "sessionId": session_id, "line": line });
+                match rt.request("tui/execute-command", Some(params), Duration::from_secs(60)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/command-result".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!(
+                            "command execution failed: {e}"
+                        )));
+                    }
+                }
+            }
             Cmd::Cancel { session_id } => {
                 let params = json!({ "sessionId": session_id });
                 if let Err(e) = rt.request("session/cancel", Some(params), Duration::from_secs(10))
@@ -165,19 +234,32 @@ fn controller_loop(
                     }
                 }
             }
-            Cmd::FetchCatalog => match rt.request("tui/catalog", None, Duration::from_secs(30)) {
-                Ok(res) => {
-                    let _ = bus.send(AppEvent::Rpc {
-                        method: "tui/catalog-result".to_string(),
-                        params: res,
-                    });
+            Cmd::FetchCatalog { session_id } => {
+                let params = json!({ "sessionId": session_id });
+                match rt.request("tui/catalog", Some(params), Duration::from_secs(30)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/catalog-result".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
+                    }
                 }
-                Err(e) => {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
-                }
-            },
-            Cmd::SelectModel { provider, model } => {
-                let params = json!({ "provider": provider, "model": model });
+            }
+            Cmd::SelectModel {
+                session_id,
+                provider,
+                model,
+                reasoning_effort,
+            } => {
+                let params = json!({
+                    "sessionId": session_id,
+                    "provider": provider,
+                    "model": model,
+                    "reasoningEffort": reasoning_effort,
+                });
                 match rt.request("tui/select-model", Some(params), Duration::from_secs(30)) {
                     Ok(res) => {
                         let _ = bus.send(AppEvent::Rpc {
@@ -191,18 +273,22 @@ fn controller_loop(
                     }
                 }
             }
-            Cmd::SetPermission { session_id, preset } => {
-                let params = json!({ "sessionId": session_id, "preset": preset });
-                match rt.request("tui/permission", Some(params), Duration::from_secs(15)) {
+            Cmd::SetMode {
+                session_id,
+                plan,
+                preset,
+            } => {
+                let params = json!({ "sessionId": session_id, "plan": plan, "preset": preset });
+                match rt.request("tui/mode", Some(params), Duration::from_secs(15)) {
                     Ok(res) => {
                         let _ = bus.send(AppEvent::Rpc {
-                            method: "tui/permission-set".to_string(),
+                            method: "tui/mode-set".to_string(),
                             params: res,
                         });
                     }
                     Err(e) => {
                         let _ =
-                            bus.send(AppEvent::RuntimeStderr(format!("permission failed: {e}")));
+                            bus.send(AppEvent::RuntimeStderr(format!("mode switch failed: {e}")));
                     }
                 }
             }
@@ -338,6 +424,42 @@ fn local_defaults() -> (Option<String>, Option<String>) {
         agent
     }
 }
+
+fn dump_demo_frame(
+    size: (u16, u16),
+    theme: theme::Theme,
+    session_id: String,
+    provider: String,
+    model: String,
+    cmd_tx: mpsc::Sender<Cmd>,
+    cwd: String,
+) -> Result<()> {
+    let backend = ratatui::backend::TestBackend::new(size.0, size.1);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+    let mut app = App::new(theme, session_id, provider, model, true, cmd_tx, cwd);
+    demo::seed(&mut app);
+    terminal.draw(|frame| ui::draw(frame, &mut app))?;
+
+    let mut stdout = std::io::stdout().lock();
+    let buffer = terminal.backend().buffer();
+    for y in 0..size.1 {
+        let mut row = String::new();
+        let mut x = 0;
+        while x < size.0 {
+            if let Some(cell) = buffer.cell((x, y)) {
+                let symbol = cell.symbol();
+                row.push_str(symbol);
+                let width = unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+                x = x.saturating_add(width);
+            } else {
+                x += 1;
+            }
+        }
+        writeln!(stdout, "{}", row.trim_end())?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     #[cfg(unix)]
     unsafe {
@@ -353,19 +475,23 @@ fn main() -> Result<()> {
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
     };
     let session_id = args.session_id.clone().unwrap_or_else(|| {
-        format!(
-            "dsh-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        )
+        if args.dump_frame.is_some() {
+            "demo-session".into()
+        } else {
+            format!(
+                "dsh-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            )
+        }
     });
 
     let (bus_tx, bus_rx) = mpsc::channel::<AppEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
 
-    let runtime: Option<Arc<Runtime>> = if args.demo {
+    let runtime: Option<Arc<Runtime>> = if args.demo || args.dump_frame.is_some() {
         None
     } else if args.attach_fds {
         #[cfg(unix)]
@@ -380,11 +506,15 @@ fn main() -> Result<()> {
             bail!("--attach-fds requires a unix platform")
         }
     } else {
-        bail!("skeleton: standalone spawn not wired yet — use --demo or --attach-fds")
+        bail!("standalone mode is not implemented — use --demo or --attach-fds")
     };
 
     let (provider, model) = {
-        let local = local_defaults();
+        let local = if args.dump_frame.is_some() {
+            (None, None)
+        } else {
+            local_defaults()
+        };
         (
             args.provider
                 .clone()
@@ -396,6 +526,18 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "deepseek-v4-flash".into()),
         )
     };
+    if let Some(size) = args.dump_frame {
+        return dump_demo_frame(
+            size,
+            theme::theme_for(&args.theme),
+            session_id,
+            provider,
+            model,
+            cmd_tx,
+            cwd,
+        );
+    }
+
     {
         let tx = bus_tx.clone();
         let cfg = RuntimeCfg {
@@ -442,7 +584,15 @@ fn main() -> Result<()> {
 
     let theme = theme::theme_for(&args.theme);
     let (term_kind, in_tmux) = term::detect();
-    let mut app = App::new(theme, session_id, model, args.demo, cmd_tx.clone(), cwd);
+    let mut app = App::new(
+        theme,
+        session_id,
+        provider,
+        model,
+        args.demo,
+        cmd_tx.clone(),
+        cwd,
+    );
     app.term_kind = term_kind;
     app.in_tmux = in_tmux;
     if args.demo {
@@ -454,14 +604,19 @@ fn main() -> Result<()> {
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.needs_redraw = false;
         }
-        match bus_rx.recv_timeout(Duration::from_millis(50)) {
+        match bus_rx.recv_timeout(Duration::from_millis(80)) {
             Ok(ev) => {
                 app.handle(ev);
                 while let Ok(ev) = bus_rx.try_recv() {
                     app.handle(ev);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                app.tick();
+                if app.is_running() {
+                    app.needs_redraw = true;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         if app.quit {
@@ -486,4 +641,16 @@ fn restore_terminal() {
     );
     let _ = disable_raw_mode();
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_size_rejects_dimensions_that_cannot_render_the_shell() {
+        assert!(parse_frame_size("39x12").is_err());
+        assert!(parse_frame_size("40x11").is_err());
+        assert_eq!(parse_frame_size("40x12").unwrap(), (40, 12));
+    }
 }

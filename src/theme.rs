@@ -1,10 +1,10 @@
-//! grok-style color slots (docs/01-grok-tui-spec.md section 9).
+//! DeepSeek 品牌色槽，基于官网设计变量中的 DeepSeek 蓝与 bluish neutral。
 //! Values are full RGB; quantization to 256/16-color terminals is a later step.
 
 use ratatui::style::Color;
 
-/// grok-style color slots (docs/01 section 9); not every slot is consumed
-/// by the skeleton renderer yet — they are the theme contract.
+/// DeepSeek color slots; not every slot is consumed by the renderer yet —
+/// they are the theme contract.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct Theme {
@@ -25,6 +25,8 @@ pub struct Theme {
     pub accent_success: Color,
     pub accent_running: Color,
     pub accent_plan: Color,
+    /// DeepSeek 蓝：logo、主操作、选中态与活动边框。
+    pub accent_brand: Color,
     pub border: Color,
     pub prompt_border: Color,
     pub prompt_border_active: Color,
@@ -32,60 +34,89 @@ pub struct Theme {
     pub diff_insert_fg: Color,
     pub diff_delete_fg: Color,
     pub warning: Color,
+    // Syntax-highlight slots (docs/01 section 9). We tokenize with syntect but
+    // colour from here, so code blocks stay inside the DeepSeek palette and
+    // still go through `quantize` on 256/16-colour terminals.
+    pub syn_keyword: Color,
+    pub syn_string: Color,
+    pub syn_number: Color,
+    pub syn_comment: Color,
+    pub syn_type: Color,
+    pub syn_function: Color,
+    pub syn_variable: Color,
+    pub syn_punctuation: Color,
 }
 
 pub const DARK: Theme = Theme {
     name: "dark",
-    bg_base: Color::Rgb(16, 16, 20),
-    bg_light: Color::Rgb(24, 24, 30),
-    bg_highlight: Color::Rgb(32, 32, 40),
-    text_primary: Color::Rgb(224, 224, 232),
-    text_secondary: Color::Rgb(160, 160, 172),
-    gray_dim: Color::Rgb(96, 96, 108),
-    gray: Color::Rgb(128, 128, 140),
-    gray_bright: Color::Rgb(176, 176, 188),
-    accent_user: Color::Rgb(110, 180, 255),
-    accent_assistant: Color::Rgb(224, 224, 232),
-    accent_thinking: Color::Rgb(180, 160, 255),
-    accent_tool: Color::Rgb(255, 180, 90),
-    accent_error: Color::Rgb(255, 100, 100),
-    accent_success: Color::Rgb(120, 220, 140),
-    accent_running: Color::Rgb(255, 220, 110),
-    accent_plan: Color::Rgb(255, 160, 220),
-    border: Color::Rgb(64, 64, 76),
-    prompt_border: Color::Rgb(64, 64, 76),
-    prompt_border_active: Color::Rgb(150, 150, 170),
-    code_bg: Color::Rgb(28, 28, 36),
-    diff_insert_fg: Color::Rgb(120, 220, 140),
-    diff_delete_fg: Color::Rgb(255, 120, 120),
-    warning: Color::Rgb(255, 200, 90),
+    bg_base: Color::Rgb(21, 21, 23),
+    bg_light: Color::Rgb(35, 35, 36),
+    bg_highlight: Color::Rgb(40, 49, 66),
+    text_primary: Color::Rgb(249, 250, 251),
+    text_secondary: Color::Rgb(207, 211, 214),
+    gray_dim: Color::Rgb(97, 102, 107),
+    gray: Color::Rgb(129, 133, 140),
+    gray_bright: Color::Rgb(225, 229, 238),
+    accent_user: Color::Rgb(103, 158, 254),
+    accent_assistant: Color::Rgb(228, 237, 253),
+    accent_thinking: Color::Rgb(183, 200, 254),
+    accent_tool: Color::Rgb(96, 165, 250),
+    accent_error: Color::Rgb(242, 90, 90),
+    accent_success: Color::Rgb(78, 209, 126),
+    accent_running: Color::Rgb(103, 158, 254),
+    accent_plan: Color::Rgb(183, 200, 254),
+    accent_brand: Color::Rgb(86, 134, 254),
+    border: Color::Rgb(53, 54, 56),
+    prompt_border: Color::Rgb(52, 65, 91),
+    prompt_border_active: Color::Rgb(86, 134, 254),
+    code_bg: Color::Rgb(27, 27, 28),
+    diff_insert_fg: Color::Rgb(78, 209, 126),
+    diff_delete_fg: Color::Rgb(242, 90, 90),
+    warning: Color::Rgb(247, 173, 49),
+    syn_keyword: Color::Rgb(154, 176, 255),
+    syn_string: Color::Rgb(126, 214, 160),
+    syn_number: Color::Rgb(247, 190, 120),
+    syn_comment: Color::Rgb(116, 122, 130),
+    syn_type: Color::Rgb(122, 197, 249),
+    syn_function: Color::Rgb(151, 190, 255),
+    syn_variable: Color::Rgb(226, 232, 240),
+    syn_punctuation: Color::Rgb(154, 160, 168),
 };
 
 pub const LIGHT: Theme = Theme {
     name: "light",
-    bg_base: Color::Rgb(250, 250, 252),
-    bg_light: Color::Rgb(240, 240, 244),
-    bg_highlight: Color::Rgb(232, 232, 238),
-    text_primary: Color::Rgb(28, 28, 34),
-    text_secondary: Color::Rgb(100, 100, 112),
-    gray_dim: Color::Rgb(150, 150, 160),
-    gray: Color::Rgb(120, 120, 130),
-    gray_bright: Color::Rgb(80, 80, 92),
-    accent_user: Color::Rgb(30, 110, 220),
-    accent_assistant: Color::Rgb(40, 40, 48),
-    accent_thinking: Color::Rgb(120, 90, 220),
-    accent_tool: Color::Rgb(200, 120, 30),
-    accent_error: Color::Rgb(210, 60, 60),
-    accent_success: Color::Rgb(30, 160, 70),
-    accent_running: Color::Rgb(180, 140, 0),
-    accent_plan: Color::Rgb(190, 80, 160),
-    border: Color::Rgb(210, 210, 220),
-    prompt_border: Color::Rgb(210, 210, 220),
-    prompt_border_active: Color::Rgb(110, 110, 130),
-    code_bg: Color::Rgb(238, 238, 242),
-    diff_insert_fg: Color::Rgb(30, 160, 70),
-    diff_delete_fg: Color::Rgb(210, 60, 60),
-    warning: Color::Rgb(190, 130, 0),
+    bg_base: Color::Rgb(249, 250, 251),
+    bg_light: Color::Rgb(255, 255, 255),
+    bg_highlight: Color::Rgb(228, 237, 253),
+    text_primary: Color::Rgb(15, 17, 21),
+    text_secondary: Color::Rgb(97, 102, 107),
+    gray_dim: Color::Rgb(173, 178, 184),
+    gray: Color::Rgb(129, 133, 140),
+    gray_bright: Color::Rgb(52, 65, 91),
+    accent_user: Color::Rgb(57, 100, 254),
+    accent_assistant: Color::Rgb(40, 49, 66),
+    accent_thinking: Color::Rgb(72, 104, 178),
+    accent_tool: Color::Rgb(37, 99, 235),
+    accent_error: Color::Rgb(236, 19, 19),
+    accent_success: Color::Rgb(34, 197, 94),
+    accent_running: Color::Rgb(57, 100, 254),
+    accent_plan: Color::Rgb(72, 104, 178),
+    accent_brand: Color::Rgb(57, 100, 254),
+    border: Color::Rgb(225, 229, 238),
+    prompt_border: Color::Rgb(211, 226, 255),
+    prompt_border_active: Color::Rgb(57, 100, 254),
+    code_bg: Color::Rgb(237, 243, 254),
+    diff_insert_fg: Color::Rgb(34, 197, 94),
+    diff_delete_fg: Color::Rgb(236, 19, 19),
+    warning: Color::Rgb(221, 134, 41),
+    syn_keyword: Color::Rgb(52, 74, 186),
+    syn_string: Color::Rgb(22, 128, 76),
+    syn_number: Color::Rgb(166, 92, 12),
+    syn_comment: Color::Rgb(140, 146, 154),
+    syn_type: Color::Rgb(20, 108, 168),
+    syn_function: Color::Rgb(57, 100, 254),
+    syn_variable: Color::Rgb(28, 32, 40),
+    syn_punctuation: Color::Rgb(110, 116, 124),
 };
 
 /// Terminal color capability level (docs/01 section 9: automatic
@@ -234,6 +265,7 @@ pub fn theme_for(name: &str) -> Theme {
         accent_success: q(t.accent_success),
         accent_running: q(t.accent_running),
         accent_plan: q(t.accent_plan),
+        accent_brand: q(t.accent_brand),
         border: q(t.border),
         prompt_border: q(t.prompt_border),
         prompt_border_active: q(t.prompt_border_active),
@@ -241,6 +273,14 @@ pub fn theme_for(name: &str) -> Theme {
         diff_insert_fg: q(t.diff_insert_fg),
         diff_delete_fg: q(t.diff_delete_fg),
         warning: q(t.warning),
+        syn_keyword: q(t.syn_keyword),
+        syn_string: q(t.syn_string),
+        syn_number: q(t.syn_number),
+        syn_comment: q(t.syn_comment),
+        syn_type: q(t.syn_type),
+        syn_function: q(t.syn_function),
+        syn_variable: q(t.syn_variable),
+        syn_punctuation: q(t.syn_punctuation),
     }
 }
 
@@ -265,6 +305,14 @@ mod tests {
             quantize(Color::Rgb(16, 16, 20), ColorLevel::Ansi16),
             Color::Black
         );
+    }
+
+    #[test]
+    fn primary_accents_use_deepseek_blue_family() {
+        assert_eq!(DARK.accent_brand, Color::Rgb(86, 134, 254));
+        assert_eq!(DARK.prompt_border_active, DARK.accent_brand);
+        assert_eq!(LIGHT.accent_brand, Color::Rgb(57, 100, 254));
+        assert_eq!(LIGHT.prompt_border_active, LIGHT.accent_brand);
     }
 
     #[test]

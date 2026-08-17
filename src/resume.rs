@@ -19,9 +19,43 @@ pub struct SessionSummary {
     pub modified: SystemTime,
 }
 
-/// /Users/x/proj -> --Users-x-proj-- (the harness directory slug).
+/// Encode a workspace exactly like dsh-session-persistence-jsonl's
+/// projectKey(): separator runs become '-', unsafe UTF-16 code units become
+/// ~XXXX, and the readable component is bounded to filesystem limits.
 pub fn workspace_slug(workspace: &str) -> String {
-    format!("-{}--", workspace.replace("/", "-"))
+    assert!(!workspace.is_empty(), "cannot encode an empty project path");
+    let mut readable = String::new();
+    let mut separator_run = false;
+
+    for code in workspace.encode_utf16() {
+        let is_separator =
+            code == u16::from(b'/') || code == u16::from(b'\\') || code == u16::from(b':');
+        let ascii = u8::try_from(code).ok();
+        let is_safe = ascii.is_some_and(|byte| {
+            byte != b'~' && (byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        });
+        if is_separator {
+            if !separator_run {
+                readable.push('-');
+            }
+            separator_run = true;
+        } else if is_safe {
+            readable.push(char::from(ascii.expect("safe code unit is ASCII")));
+            separator_run = false;
+        } else {
+            readable.push_str(&format!("~{code:04X}"));
+            separator_run = false;
+        }
+    }
+
+    let readable = readable.trim_start_matches('-');
+    let readable = if readable.is_empty() {
+        "root"
+    } else {
+        readable
+    };
+    let bounded: String = readable.chars().take(251).collect();
+    format!("--{bounded}--")
 }
 
 fn session_roots() -> Vec<PathBuf> {
@@ -195,6 +229,12 @@ mod tests {
             workspace_slug("/Users/sanjiu/proj"),
             "--Users-sanjiu-proj--"
         );
+        assert_eq!(
+            workspace_slug("/Users/三九/my projects"),
+            "--Users-~4E09~4E5D-my~0020projects--"
+        );
+        assert_eq!(workspace_slug(r"C:\work"), "--C-work--");
+        assert_eq!(workspace_slug("/"), "--root--");
     }
 
     #[test]

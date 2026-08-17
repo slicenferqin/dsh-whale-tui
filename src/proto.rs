@@ -4,8 +4,8 @@
 //!
 //! Client requests: initialize / session/prompt / session/cancel / shutdown.
 //! Server notifications: session.event / session.status / subagent.*.
-//! Server->client requests (approval / ask_user bridge) are the TODO point
-//! documented in docs/02-openma-teardown.md section 12.
+//! Server->client requests: approval and ask_user dialogs, answered over the
+//! same transport so tool execution stays blocked until the human responds.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};

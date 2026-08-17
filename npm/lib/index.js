@@ -1,5 +1,5 @@
 /**
- * dsh-whale-tui runner (skeleton) — cordis plugin that mounts the native TUI.
+ * dsh-whale-tui runner — cordis plugin that mounts the native TUI.
  *
  * ESM on purpose: the harness loader imports plugins concurrently, and a CJS
  * require() of @deepseek-ai/dsh-llm from a non-loader thread hits Node's
@@ -20,9 +20,9 @@
  *
  *   session/cancel — hard-cancel the running turn via agent.cancel.
  *
- * Planned (docs/02-openma-teardown.md section 12):
- *   approval/request + ask_user_question bridging (bidirectional channel),
- *   tui/catalog + tui/select-model (model picker), tui/permission (presets).
+ * Protocol extensions include bidirectional approval / ask-user requests,
+ * model catalog and selection, permission presets, compaction, rewind,
+ * session information, resume, and background-job inspection.
  *
  * The agent, tools, persistence, and providers come from the surrounding dsh
  * profile. Stdout of the host process is the TUI screen — keep stdout
@@ -33,11 +33,12 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { JsonRpcLineTransport } from '@deepseek-ai/dsh-sdk-protocol'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, freezeMessage } from '@deepseek-ai/dsh-llm'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 
 const name = 'dsh-whale-runner'
-const inject = ['agents']
+const inject = ['agents', 'agentDefaultModel', 'commands', 'tools']
 
 function nativeBinary() {
   const key = process.platform + '-' + process.arch
@@ -78,8 +79,12 @@ function apply(ctx) {
   const sessions = new Map()
   /** sessionId -> in-flight creation promise (dedupes concurrent prompts). */
   const sessionCreations = new Map()
-  /** sessionId -> permission preset staged before the session exists. */
-  const pendingPermissions = new Map()
+  /** sessionId -> 会话创建前暂存的完整模式。 */
+  const pendingModes = new Map()
+  /** child sessionId -> delegating sessionId, for subagent completion notifications. */
+  const childParents = new Map()
+  /** Agent -> mutable selection captured at the next prompt-assembly boundary. */
+  const modelSelections = new WeakMap()
   const disposers = []
   let shuttingDown = false
   let shutdownTask
@@ -92,28 +97,73 @@ function apply(ctx) {
   disposers.push(ctx.on('agent/status', ({ agent, status }) => {
     transport.notify('session.status', { sessionId: String(agent.session.id), status })
   }))
+  const queueItems = (agent) => [
+    ...agent.inbox.nextTurn.map((message) => ({
+      id: String(message.id),
+      placement: 'queued',
+      message,
+    })),
+    ...agent.inbox.nextStep.map((message) => ({
+      id: String(message.id),
+      placement: message.source.kind === 'user' ? 'steering' : 'context',
+      message,
+    })),
+  ]
+  const publishQueue = (agent) => {
+    transport.notify('session.queue', {
+      sessionId: String(agent.session.id),
+      items: queueItems(agent),
+    })
+  }
+  disposers.push(ctx.on('agent/inbox/inserted', ({ agent }) => publishQueue(agent)))
+  disposers.push(ctx.on('agent/inbox/claimed', ({ agent }) => publishQueue(agent)))
+  disposers.push(ctx.on('agent/inbox/discarded', ({ agent }) => publishQueue(agent)))
+  const publishCapabilitiesChanged = () => transport.notify('tui.capabilities-changed', {})
+  disposers.push(ctx.on('commands/change', publishCapabilitiesChanged))
+  disposers.push(ctx.on('tools/change', publishCapabilitiesChanged))
   disposers.push(ctx.on('session/created', (session) => {
     const parentSession = session.header.parentSession
     if (parentSession === undefined) return
-    transport.notify('subagent.started', {
-      parentSessionId: String(parentSession),
-      childSessionId: String(session.id),
+    const parentSessionId = String(parentSession)
+    const childSessionId = String(session.id)
+    childParents.set(childSessionId, parentSessionId)
+    transport.notify('subagent.started', { parentSessionId, childSessionId })
+  }))
+  disposers.push(ctx.on('subagent/end', (info) => {
+    if (!info.local) return
+    const childSessionId = String(info.id)
+    const parentSessionId = childParents.get(childSessionId)
+    if (parentSessionId === undefined) return
+    childParents.delete(childSessionId)
+    transport.notify('subagent.finished', {
+      provider: info.provider,
+      agentId: childSessionId,
+      parentSessionId,
+      childSessionId,
+      status: info.stopReason === 'completed' ? 'ok' : 'error',
+      stopReason: info.stopReason,
+      ...(info.lastAssistantMessage === undefined
+        ? {}
+        : { lastAssistantMessage: info.lastAssistantMessage }),
     })
   }))
 
   // ------------------------------------------ interactive dialogs --------
+  const dialogSignal = (signal) => {
+    const timeout = AbortSignal.timeout(120000)
+    return signal === undefined ? timeout : AbortSignal.any([signal, timeout])
+  }
+
   // Approval: answer the approval/request waterfall from the TUI. On any
   // transport failure we delegate (fail-closed via the default answerer).
   disposers.push(ctx.on('approval/request', async (req, next) => {
     try {
-      const signal = AbortSignal.timeout(120000)
       const result = await transport.request('ui/approve', {
-        id: String(req.id),
         toolName: req.toolName,
+        callId: req.callId ?? null,
         reason: req.reason ?? null,
-        input: req.input ?? null,
         options: ['allowed-once', 'always-allow', 'rejected'],
-      }, signal)
+      }, dialogSignal(req.signal))
       const outcome = result && result.outcome
       if (outcome === 'allowed-once' || outcome === 'rejected' || outcome === 'cancelled') {
         // "Always allow" row: the TUI answers allowed-once and asks the
@@ -142,7 +192,6 @@ function apply(ctx) {
   if (userQuestions !== undefined) {
     disposers.push(userQuestions.registerProvider({
       ask: async (req) => {
-        const signal = AbortSignal.timeout(120000)
         const result = await transport.request('ui/ask-user', {
           questions: req.questions.map((q) => ({
             id: q.id,
@@ -156,13 +205,51 @@ function apply(ctx) {
             })),
             multiSelect: !!q.multiSelect,
           })),
-        }, signal)
+        }, dialogSignal(req.signal))
         return { answers: result.answers }
       },
     }))
   }
 
   // ---------------------------------------------------------- sessions --
+  function selectionFromLog(agent) {
+    const config = agent.session.requestHeader?.()?.config
+    if (config === undefined) {
+      return {
+        provider: defaults.provider,
+        model: defaults.model,
+        ...(defaults.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: defaults.reasoningEffort }),
+      }
+    }
+    return {
+      provider: config.provider,
+      model: config.model,
+      ...(config.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: config.reasoningEffort }),
+    }
+  }
+
+  function selectionFor(agent) {
+    const installed = modelSelections.get(agent)
+    if (installed !== undefined) return installed
+    const selection = {
+      current: selectionFromLog(agent),
+      assembled: undefined,
+    }
+    installModelSelection(agent.ctx, selection)
+    modelSelections.set(agent, selection)
+    return selection
+  }
+
+  function registerSession(sessionId, handle) {
+    selectionFor(handle.agent)
+    sessions.set(sessionId, handle)
+    return handle
+  }
+
   async function createSession(sessionId) {
     const handle = await ctx.agents.create({
       sessionId: SessionId(sessionId),
@@ -173,14 +260,18 @@ function apply(ctx) {
         ...(defaults.maxTokens === undefined ? {} : { maxTokens: defaults.maxTokens }),
       },
     })
-    sessions.set(sessionId, handle)
-    const staged = pendingPermissions.get(sessionId)
+    registerSession(sessionId, handle)
+    const staged = pendingModes.get(sessionId)
     if (staged !== undefined) {
-      pendingPermissions.delete(sessionId)
-      const svc = ctx.get('permissionPresets')
-      if (svc !== undefined) {
-        try { svc.set(handle.agent.session, staged) } catch {}
+      pendingModes.delete(sessionId)
+      const permissionPresets = ctx.get('permissionPresets')
+      const planMode = ctx.get('planMode')
+      if (permissionPresets === undefined) {
+        throw new Error('no permission-presets service in this profile')
       }
+      if (planMode === undefined) throw new Error('no plan-mode service in this profile')
+      planMode.set(handle.agent, staged.plan)
+      permissionPresets.set(handle.agent.session, staged.preset)
     }
     return handle
   }
@@ -207,10 +298,21 @@ function apply(ctx) {
       throw new TypeError('initialize maxTokens must be a positive safe integer')
     }
     defaults.cwd = path.resolve(String(params.cwd))
-    defaults.provider = String(params.provider)
-    defaults.model = String(params.model)
+    const configured = ctx.agentDefaultModel.currentSelection()
+    defaults.provider = configured.provider
+    defaults.model = configured.model
+    defaults.reasoningEffort = configured.reasoningEffort
     defaults.maxTokens = params.maxTokens
-    return { serverInfo: { name: 'dsh-whale-tui-shim', version: '0.1.5' } }
+    return {
+      serverInfo: { name: 'dsh-whale-tui-shim', version: '0.1.5' },
+      current: {
+        provider: defaults.provider,
+        model: defaults.model,
+        ...(defaults.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: defaults.reasoningEffort }),
+      },
+    }
   }
 
   async function prompt(params) {
@@ -224,6 +326,68 @@ function apply(ctx) {
     const message = createUserMessage({ content: params.contentBlocks, source: { kind: 'user' } })
     handle.agent.followup(message)
     return { messageId: message.id }
+  }
+  function prioritizeNextTurn(agent, message) {
+    agent.send(message, 'next-turn', true)
+    const index = agent.inbox.nextTurn.findIndex((candidate) => candidate.id === message.id)
+    if (index <= 0) return
+    const before = agent.inbox.nextTurn.slice(0, index)
+    agent.inbox.splice('next-turn', 0, index + 1, [message, ...before])
+  }
+
+  async function sendNow(params) {
+    const sessionId = String(params.sessionId)
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) throw new Error('unknown session: ' + sessionId)
+    const agent = handle.agent
+    if (agent.status !== 'running') return { accepted: false }
+    const message = createUserMessage({ content: params.contentBlocks, source: { kind: 'user' } })
+    agent.cancel({ kind: 'user' }, { keepInbox: true })
+    prioritizeNextTurn(agent, message)
+    return { accepted: true, messageId: message.id }
+  }
+  async function updateQueue(params) {
+    const sessionId = String(params.sessionId)
+    const itemId = String(params.itemId)
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) throw new Error('unknown session: ' + sessionId)
+    const agent = handle.agent
+    const message = agent.inbox.nextTurn.find((candidate) => String(candidate.id) === itemId)
+    if (message === undefined) throw new Error('queued item is no longer pending: ' + itemId)
+    const action = params.action
+    if (action?.kind === 'remove') {
+      agent.inbox.remove(message.id)
+      return { accepted: true }
+    }
+    if (action?.kind === 'edit') {
+      const text = action.text
+      if (typeof text !== 'string' || text.trim() === '') {
+        throw new TypeError('queue edit text must be non-empty')
+      }
+      agent.inbox.replace(message.id, freezeMessage({
+        ...message,
+        content: [{ type: 'text', text }],
+      }))
+      return { accepted: true }
+    }
+    if (action?.kind === 'steer') {
+      if (agent.status !== 'running') throw new Error('current turn no longer accepts steering')
+      if (!agent.inbox.remove(message.id)) {
+        throw new Error('queued item is no longer pending: ' + itemId)
+      }
+      agent.steer(message)
+      return { accepted: true }
+    }
+    if (action?.kind === 'send-now') {
+      if (agent.status !== 'running') return { accepted: false }
+      agent.cancel({ kind: 'user' }, { keepInbox: true })
+      if (!agent.inbox.remove(message.id)) {
+        throw new Error('queued item is no longer pending: ' + itemId)
+      }
+      prioritizeNextTurn(agent, message)
+      return { accepted: true }
+    }
+    throw new TypeError('unknown queue action: ' + String(action?.kind))
   }
 
   // Resume a persisted session (protocol extension). The harness replays
@@ -242,58 +406,141 @@ function apply(ctx) {
         ...(defaults.maxTokens === undefined ? {} : { maxTokens: defaults.maxTokens }),
       },
     })
-    sessions.set(sessionId, handle)
+    registerSession(sessionId, handle)
     return { sessionId }
   }
 
   // -------------------------------------------------------- model routes --
-  // Model catalog for the picker (providers + models + current selection).
-  async function tuiCatalog() {
+  // Resolve exact-route metadata so the picker uses the adapter-owned effort
+  // vocabulary rather than inventing generic low/medium/high values.
+  async function tuiCatalog(params) {
     const llm = ctx.get('llm')
     if (llm === undefined) throw new Error('no llm service is composed in this profile')
     const providers = llm.listProviders()
     const models = []
-    await Promise.all(providers.map(async (p) => {
+    const failures = []
+    await Promise.all(providers.map(async (provider) => {
       try {
-        for (const m of await llm.listModels(p.id)) models.push(m)
-      } catch {} // tolerate one provider's listing failure
+        const listed = await llm.listModels(provider.id)
+        for (const model of listed) {
+          const resolved = await llm.resolveModelInfo(provider.id, model.id)
+          models.push({
+            provider: provider.id,
+            id: model.id,
+            name: model.name ?? model.id,
+            description: model.description ?? null,
+            vision: !!(resolved.inputModalities || []).includes('image'),
+            contextWindow: resolved.context?.contextWindow ?? null,
+            reasoning: resolved.reasoning === undefined ? null : {
+              efforts: resolved.reasoning.efforts.map((effort) => ({
+                id: String(effort.id),
+                name: effort.name,
+                description: effort.description ?? null,
+              })),
+              defaultEffort: resolved.reasoning.defaultEffort === undefined
+                ? null
+                : String(resolved.reasoning.defaultEffort),
+            },
+          })
+        }
+      } catch (error) {
+        failures.push(provider.id + ': ' + String(error))
+      }
     }))
     let permissionPresets
     const perm = ctx.get('permissionPresets')
     if (perm !== undefined && Array.isArray(perm.names)) permissionPresets = perm.names
+    const sessionId = params?.sessionId === undefined ? undefined : String(params.sessionId)
+    const handle = sessionId === undefined ? undefined : sessions.get(sessionId)
+    const current = handle === undefined
+      ? {
+          provider: defaults.provider,
+          model: defaults.model,
+          ...(defaults.reasoningEffort === undefined
+            ? {}
+            : { reasoningEffort: defaults.reasoningEffort }),
+        }
+      : selectionFor(handle.agent).current
+    const commands = handle === undefined
+      ? []
+      : ctx.commands.list(handle.agent).map((command) => ({
+          name: command.name,
+          description: command.description,
+          inputHint: command.input?.hint ?? null,
+        }))
+    const tools = ctx.tools.schemas(handle?.agent).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+    }))
+    const capabilities = {
+      models: true,
+      permissions: perm !== undefined,
+      planMode: ctx.get('planMode') !== undefined,
+      compaction: ctx.get('compaction') !== undefined,
+      jobs: ctx.get('jobs') !== undefined,
+      userQuestions: userQuestions !== undefined,
+      sessionSearch: ctx.get('sessionQuery') !== undefined,
+      commands: commands.length > 0,
+      tools: tools.length > 0,
+    }
     return {
       permissionPresets: permissionPresets ?? null,
-      providers: providers.map((p) => ({ id: p.id, name: p.name ?? p.id })),
-      models: models.map((m) => ({
-        provider: m.provider,
-        id: m.id,
-        name: m.name ?? m.id,
-        vision: !!(m.inputModalities || []).includes('image'),
-      })),
-      current: { provider: defaults.provider, model: defaults.model },
+      capabilities,
+      commands,
+      tools,
+      providers: providers.map((provider) => ({ id: provider.id, name: provider.name ?? provider.id })),
+      models,
+      failures,
+      current,
     }
   }
 
-  // Per-session model switch. Future sessions inherit the new defaults;
-  // session-level hot switch (openma's installModelSelection) is a later step.
   async function tuiSelectModel(params) {
     const llm = ctx.get('llm')
     if (llm === undefined) throw new Error('no llm service is composed in this profile')
     const provider = params.provider === undefined ? defaults.provider : String(params.provider)
     const model = params.model === undefined ? defaults.model : String(params.model)
-    const effort = params.reasoningEffort === undefined
-      ? defaults.reasoningEffort
-      : (params.reasoningEffort ?? undefined)
-    const next = {
+    const requested = {
       provider,
       model,
-      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+      ...(params.reasoningEffort === undefined || params.reasoningEffort === null
+        ? {}
+        : { reasoningEffort: String(params.reasoningEffort) }),
     }
-    await llm.resolveCallConfig(next)
-    defaults.provider = provider
-    defaults.model = model
-    defaults.reasoningEffort = effort
-    return { ok: true, current: next }
+    const resolved = await llm.resolveCallConfig(requested)
+    const current = {
+      provider: resolved.provider,
+      model: resolved.model,
+      ...(resolved.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: String(resolved.reasoningEffort) }),
+    }
+    const sessionId = params.sessionId === undefined ? undefined : String(params.sessionId)
+    const handle = sessionId === undefined ? undefined : sessions.get(sessionId)
+    if (handle !== undefined) selectionFor(handle.agent).current = current
+
+    defaults.provider = current.provider
+    defaults.model = current.model
+    defaults.reasoningEffort = current.reasoningEffort
+    try {
+      await ctx.agentDefaultModel.saveSelection(current)
+    } catch (error) {
+      ctx.logger.warn('dsh-whale-tui: model switch applies to this session but default save failed: ' + String(error))
+    }
+    return { ok: true, current }
+  }
+
+  async function tuiExecuteCommand(params) {
+    const sessionId = String(params.sessionId)
+    const handle = sessions.get(sessionId)
+    if (handle === undefined) throw new Error('unknown session: ' + sessionId)
+    const line = String(params.line)
+    const execution = await ctx.commands.execute(handle.agent, line, new AbortController().signal)
+    if (execution === undefined) throw new Error('unknown Harness command: ' + line)
+    return {
+      commandId: String(execution.commandId),
+      ...execution.result,
+    }
   }
 
   // Live agents owned by THIS host (the TUI's own sessions). Used by the
@@ -308,24 +555,31 @@ function apply(ctx) {
     return { ids }
   }
 
-  // Switch the live session's permission preset (Shift+Tab cycling). A
-  // preset chosen before the first prompt is staged and applied at creation.
-  async function tuiPermission(params) {
-    const svc = ctx.get('permissionPresets')
-    if (svc === undefined) throw new Error('no permission-presets service in this profile')
+  // Grok 风格模式由 DSH 的计划协作与权限预设两个独立服务组成，
+  // 因此 TUI 通过一次 RPC 同时驱动二者；首次提示前的选择先暂存。
+  async function tuiMode(params) {
+    const permissionPresets = ctx.get('permissionPresets')
+    if (permissionPresets === undefined) {
+      throw new Error('no permission-presets service in this profile')
+    }
+    const planMode = ctx.get('planMode')
+    if (planMode === undefined) throw new Error('no plan-mode service in this profile')
     const sessionId = String(params.sessionId)
+    const plan = params.plan
+    if (typeof plan !== 'boolean') throw new TypeError('mode plan must be a boolean')
     const preset = String(params.preset)
-    const names = Array.isArray(svc.names) ? svc.names : undefined
+    const names = Array.isArray(permissionPresets.names) ? permissionPresets.names : undefined
     if (names !== undefined && !names.includes(preset)) {
       throw new Error('unknown permission preset ' + preset + ' (known: ' + names.join(', ') + ')')
     }
     const handle = sessions.get(sessionId)
     if (handle === undefined) {
-      pendingPermissions.set(sessionId, preset)
-      return { ok: true, applied: preset, staged: true }
+      pendingModes.set(sessionId, { plan, preset })
+      return { ok: true, plan, applied: preset, staged: true }
     }
-    svc.set(handle.agent.session, preset)
-    return { ok: true, applied: preset }
+    const planOutcome = planMode.set(handle.agent, plan)
+    permissionPresets.set(handle.agent.session, preset)
+    return { ok: true, plan, planOutcome, applied: preset }
   }
 
   // Manual compaction over the harness's compaction seam. The agent must be
@@ -370,7 +624,7 @@ function apply(ctx) {
         ...(defaults.maxTokens === undefined ? {} : { maxTokens: defaults.maxTokens }),
       },
     })
-    sessions.set(String(childId), childHandle)
+    registerSession(String(childId), childHandle)
     return { ok: true, newSessionId: String(childId), boundary }
   }
 
@@ -425,12 +679,13 @@ function apply(ctx) {
     }
   }
 
-  // Our protocol extension: hard-cancel the running turn.
+  // Cancel only the current turn. Harness keeps queued work and background
+  // agents alive; a prompt accepted after abort becomes the next turn.
   async function cancel(params) {
     const sessionId = String(params.sessionId)
     const handle = sessions.get(sessionId)
     if (handle === undefined) throw new Error('unknown session: ' + sessionId)
-    handle.agent.cancel({ kind: 'user' })
+    handle.agent.cancel({ kind: 'user' }, { keepInbox: true })
     return { ok: true }
   }
 
@@ -439,7 +694,7 @@ function apply(ctx) {
     shuttingDown = true
     // Cancel any running turns first so dispose never blocks on live work.
     for (const rec of sessions.values()) {
-      try { rec.agent.cancel({ kind: 'shutdown' }) } catch {}
+      try { rec.agent.cancel({ kind: 'disposed' }) } catch {}
     }
     await Promise.allSettled([...sessionCreations.values()])
     sessionCreations.clear()
@@ -489,16 +744,22 @@ function apply(ctx) {
         return initialize(params)
       case 'session/prompt':
         return prompt(params)
+      case 'session/send-now':
+        return sendNow(params)
+      case 'tui/execute-command':
+        return tuiExecuteCommand(params)
+      case 'session/update-queue':
+        return updateQueue(params)
       case 'session/load':
         return load(params)
       case 'tui/catalog':
-        return tuiCatalog()
+        return tuiCatalog(params)
       case 'tui/select-model':
         return tuiSelectModel(params)
       case 'tui/live-sessions':
         return tuiLiveSessions()
-      case 'tui/permission':
-        return tuiPermission(params)
+      case 'tui/mode':
+        return tuiMode(params)
       case 'tui/compact':
         return tuiCompact(params)
       case 'tui/rewind':

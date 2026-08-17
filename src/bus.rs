@@ -28,6 +28,16 @@ pub enum Cmd {
         session_id: String,
         text: String,
     },
+    SendNow {
+        session_id: String,
+        text: String,
+    },
+    /// Apply one mutation to a Harness-owned pending queue item.
+    UpdateQueue {
+        session_id: String,
+        item_id: String,
+        action: Value,
+    },
     /// Our protocol extension: hard-cancel the running turn (agent.cancel).
     Cancel {
         session_id: String,
@@ -40,18 +50,23 @@ pub enum Cmd {
     Load {
         session_id: String,
     },
-    /// Fetch the provider/model catalog for the picker.
-    FetchCatalog,
-    /// Switch the model route (applies to future sessions).
+    /// Fetch the provider/model catalog for the current session.
+    FetchCatalog {
+        session_id: String,
+    },
+    /// Switch the current session's model route and optional reasoning effort.
     SelectModel {
+        session_id: String,
         provider: String,
         model: String,
+        reasoning_effort: Option<String>,
     },
     /// Ask the bridge which sessions are already live in this host.
     ListLive,
-    /// Switch the live session's permission preset.
-    SetPermission {
+    /// 原子切换计划协作状态与权限预设。
+    SetMode {
         session_id: String,
+        plan: bool,
         preset: String,
     },
     /// Manual compaction (the agent must be idle).
@@ -69,6 +84,11 @@ pub enum Cmd {
     },
     /// Background jobs for the tasks pane (Ctrl+G).
     FetchJobs,
+    /// Execute one command from the Harness command registry.
+    ExecuteCommand {
+        session_id: String,
+        line: String,
+    },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond {
         id: String,

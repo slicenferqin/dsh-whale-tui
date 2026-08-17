@@ -18,22 +18,6 @@ pub enum TermKind {
 }
 
 impl TermKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            TermKind::Vscode => "vscode",
-            TermKind::Cursor => "cursor",
-            TermKind::Windsurf => "windsurf",
-            TermKind::Zed => "zed",
-            TermKind::AppleTerminal => "apple-terminal",
-            TermKind::Kitty => "kitty",
-            TermKind::WezTerm => "wezterm",
-            TermKind::Ghostty => "ghostty",
-            TermKind::Alacritty => "alacritty",
-            TermKind::Iterm2 => "iterm2",
-            TermKind::Plain => "plain",
-        }
-    }
-
     /// VS Code / Cursor / Windsurf / Zed capture Ctrl+Q in their
     /// integrated terminals; these hosts advertise Ctrl+D as the quit key.
     pub fn is_vscode_family(self) -> bool {
@@ -74,7 +58,6 @@ mod tests {
         assert!(TermKind::Vscode.is_vscode_family());
         assert!(TermKind::Cursor.is_vscode_family());
         assert!(!TermKind::Kitty.is_vscode_family());
-        assert_eq!(TermKind::WezTerm.name(), "wezterm");
     }
 
     #[test]
