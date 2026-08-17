@@ -10,6 +10,7 @@ mod demo;
 mod files;
 mod highlight;
 mod markdown;
+mod projection;
 mod proto;
 mod resume;
 mod term;

@@ -319,15 +319,41 @@ ContextBreakdownProjection {
 
 ---
 
-## 10. 待核实清单
+## 10. 我们 profile 里到底有什么（已核实）
+
+投影和服务存在于包里 ≠ 存在于我们的运行时。`~/.dsh/profiles/tui` 的 bundles 是 `['@deepseek-ai/dsh-base', 'dsh-whale-tui']`，profile 自己的 `cordis.patch.yml` 是空的，所以**能力完全由 dsh-base 决定**。
+
+核验 `dsh-base/cordis.patch.yml` 的实际 row：
+
+| plugin row | 在 base | 影响 |
+|---|---|---|
+| `session-projection` | ✅ | 投影管道可用 |
+| `goal` + `goal-round-driver` + `command-goal` | ✅ **三件套齐全** | GoalBar 可做，且 `/goal` 命令应该已经能通过现有 Harness 命令路径工作 |
+| `token-meter` | ✅ | `tokenUsage` / `contextPressure` / `contextBreakdown` 可用 |
+| `tool-todo` | ✅ 配置 `allowParallelInProgress: true` | `todos` 投影可用；**多条可同时 in_progress** |
+| `compaction-basic` | ✅ | 压缩压力可读 |
+| `sandbox` | ✅ | Tier 2 沙箱状态可做 |
+| **`session-stats`** | ❌ **不在 base** | **`sessionStats` 投影在我们 profile 里不存在**。状态栏的 turns/steps/LLM 耗时/工具耗时/TTFB/TPS 必须继续自己算 |
+| **`terminal`** | ❌ 不在 base | Tier 2 的持久 PTY 面板需要先往 profile 加插件，不能假定可用 |
+
+两条直接结论：
+
+1. **不要按 `sessionStats` 投影重写状态栏** —— 那个插件没挂。现有自算逻辑保留。
+2. **`allowParallelInProgress: true` 意味着 todos 可以有多条 `in_progress`**。`App::open_todos` 现在用 `.position(|i| status == InProgress)` 取第一条，在并行场景下这个"落在进行中那行"的语义是任意的。渲染本身没问题（全部行都画），但选中语义要改成明确的策略。
+
+另外：桥接层已经在用 `ctx.commands.list(agent)` 列 Harness 命令、`tui/execute-command` 执行，而 `command-goal` 在 base 里 —— 所以 **goal 的写路径可能已经免费可用**，GoalBar 只需要补读路径（投影）。`capabilities` 里还没有 `goal` 标志，要加。
+
+---
+
+## 11. 待核实清单
 
 - [ ] `ProjectionSnapshot` 的确切字段名（已知含「值 + 最后反映的 seq」）
 - [ ] `onChanged` 的触发时机：是否每个已提交事件都触发，还是仅在投影值实际变化时
 - [ ] 投影是否需要先注册/订阅才有值，或 `snapshot()` 总能按需重放
-- [ ] `goal` 的可变操作在进程内怎么调（`ctx.goal`? 服务名未确认；只确认了它有远程客户端）
+- [ ] `goal` 的可变操作在进程内怎么调（`ctx.goal`? 服务名未确认）。注意 `command-goal` 在 base 里，写路径可能走现有命令通道即可 —— 见第 10 节
 - [ ] `GoalActivation` 由谁 arm/disarm，TUI 是否有权改
 - [ ] 沙箱当前 profile 从哪个 seam 读（`dsh-sandbox-policy` 提到「each session's current model context」）
 - [ ] spill 引用在 tool result 里的载荷形状，以及取全文的调用
 - [ ] DSH 工具调用是否真有父子关系可构树，还是 web 的树来自子代理层级
-- [ ] `ctx.terminal` 的读写接口是否够 TUI 做交互式 pane（还是只能拉快照）
+- [x] ~~`ctx.terminal` 是否可用~~ —— **不在 dsh-base**，要用得先往 profile 加 `dsh-terminal` + `dsh-terminal-bash`；接口能力仍待查
 - [ ] `dsh-tool-cordis` 的事件形状（挂载/卸载/运行状态如何上报）

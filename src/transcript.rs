@@ -104,6 +104,19 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
+    /// Strict mapping of DSH's `todos` projection vocabulary. The wire contract
+    /// is exactly three values; anything else is a protocol surprise and lands
+    /// on `Pending` rather than being invented into a new state.
+    pub fn parse_wire(raw: &str) -> Self {
+        match raw {
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            _ => Self::Pending,
+        }
+    }
+
+    /// Lenient mapping for the tool-argument fallback path, which has to cope
+    /// with whatever vocabulary a non-DSH harness uses.
     fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
             "in_progress" | "active" | "running" | "doing" => Self::InProgress,

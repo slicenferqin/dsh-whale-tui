@@ -369,6 +369,8 @@ pub enum Dialog {
 pub struct App {
     pub theme: Theme,
     pub transcript: Transcript,
+    /// DSH session projections (docs/04 section 3) — the canonical read model.
+    pub projections: crate::projection::Projections,
     pub input: String,
     /// Caret as a byte offset into `input`. Always on a UTF-8 boundary and
     /// never past the end — `clamp_cursor` restores that before every edit,
@@ -436,6 +438,7 @@ impl App {
         Self {
             theme,
             transcript: Transcript::new(),
+            projections: crate::projection::Projections::default(),
             input: String::new(),
             cursor: 0,
             undo: Vec::new(),
@@ -509,6 +512,27 @@ impl App {
             editing: false,
             draft: String::new(),
         });
+    }
+
+    /// The `todos` projection is authoritative when present (docs/04 section 5).
+    /// The tool-argument parser in `transcript.rs` stays as the fallback for
+    /// harnesses that publish no projection, so this only ever overwrites the
+    /// transcript's guess with the real contract.
+    fn sync_todos_from_projection(&mut self) {
+        if let Some(items) = self.projections.todos.clone() {
+            self.transcript.todos = items;
+            if let Dialog::Todos(view) = &mut self.dialog {
+                view.selected = view
+                    .selected
+                    .min(self.transcript.todos.len().saturating_sub(1));
+            }
+            if self.transcript.todos.is_empty() {
+                if let Dialog::Todos(_) = self.dialog {
+                    self.dialog = Dialog::None;
+                    self.notice = Some("task list cleared".into());
+                }
+            }
+        }
     }
 
     fn open_todos(&mut self) {
@@ -1554,6 +1578,23 @@ impl App {
                         } else {
                             let t = self.child_transcripts.entry(sid.to_string()).or_default();
                             t.apply(event);
+                        }
+                    }
+                }
+                "session.projection" => {
+                    // One key-agnostic channel for every projection, present and
+                    // future (docs/04 section 3.3): a new harness projection
+                    // needs no protocol change.
+                    let sid = params
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if sid == self.session_id {
+                        if let Some(key) = params.get("key").and_then(|v| v.as_str()) {
+                            let value = params.get("value").unwrap_or(&Value::Null);
+                            let seq = params.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                            self.projections.apply(key, value, seq);
+                            self.sync_todos_from_projection();
                         }
                     }
                 }

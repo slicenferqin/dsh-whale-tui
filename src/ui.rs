@@ -25,6 +25,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let composer_height = composer_height(&app.input, area.width.saturating_sub(5));
     let stats_lines = stats_lines(app, area.width);
+    // GoalBar docks directly above the composer, matching where DSH's own web
+    // client puts it (dsh-client-ui-goal). Zero rows when there is no goal, so
+    // a session that never sets one loses no space.
+    let goal_height = u16::from(app.projections.goal.is_some());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -32,20 +36,82 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(stats_lines.len() as u16),
             Constraint::Min(3),
             Constraint::Length(1),
+            Constraint::Length(goal_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
         .split(area);
-    app.composer_top = chunks[4].y;
+    app.composer_top = chunks[5].y;
     draw_status(f, app, chunks[0]);
     draw_stats(f, app, chunks[1], &stats_lines);
     draw_scrollback(f, app, chunks[2]);
     draw_activity(f, app, chunks[3]);
-    draw_composer(f, app, chunks[4]);
-    draw_shortcuts(f, app, chunks[5]);
+    if goal_height > 0 {
+        draw_goal_bar(f, app, chunks[4]);
+    }
+    draw_composer(f, app, chunks[5]);
+    draw_shortcuts(f, app, chunks[6]);
     if app.has_dialog() {
         draw_dialog(f, app, area);
     }
+}
+
+/// GoalBar: objective, phase badge, and round progress. A blocked goal shows
+/// its reason instead of the round counter — that is the actionable fact.
+fn draw_goal_bar(f: &mut Frame, app: &App, area: Rect) {
+    use crate::projection::GoalPhase;
+    let Some(goal) = app.projections.goal.as_ref() else {
+        return;
+    };
+    let (badge_color, badge) = match goal.phase {
+        GoalPhase::Active => (app.theme.accent_running, "◆ goal"),
+        GoalPhase::Paused => (app.theme.gray, "‖ goal"),
+        GoalPhase::Blocked => (app.theme.warning, "! goal"),
+        GoalPhase::Complete => (app.theme.accent_success, "✓ goal"),
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("  {badge} "),
+            Style::default()
+                .fg(badge_color)
+                .bg(app.theme.bg_base)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    // Rounds first: it is fixed-width, so the objective takes whatever is left
+    // rather than pushing the counter off a narrow terminal.
+    let tail = match (goal.phase, goal.blocked_reason.as_deref()) {
+        (GoalPhase::Blocked, Some(reason)) => format!(" · {reason}"),
+        _ if goal.max_rounds > 0 => {
+            format!(" · round {}/{}", goal.rounds_started, goal.max_rounds)
+        }
+        _ => String::new(),
+    };
+    let used = unicode_width::UnicodeWidthStr::width(badge) + 3
+        + unicode_width::UnicodeWidthStr::width(tail.as_str());
+    let budget = (area.width as usize).saturating_sub(used).max(8);
+    spans.push(Span::styled(
+        truncated(&goal.objective, budget),
+        Style::default()
+            .fg(app.theme.text_primary)
+            .bg(app.theme.bg_base),
+    ));
+    if !tail.is_empty() {
+        spans.push(Span::styled(
+            tail,
+            Style::default()
+                .fg(if goal.phase == GoalPhase::Blocked {
+                    app.theme.warning
+                } else {
+                    app.theme.gray
+                })
+                .bg(app.theme.bg_base),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(app.theme.bg_base)),
+        area,
+    );
 }
 
 fn composer_height(input: &str, content_width: u16) -> u16 {
@@ -127,20 +193,28 @@ fn popup_block<'a>(title: impl Into<Line<'a>>, color: ratatui::style::Color) -> 
         .title(title)
 }
 
+/// Truncate to a display-column budget. The ellipsis is counted *against* the
+/// budget, so the result is never wider than asked — callers lay out around
+/// this, and one extra column silently clips whatever follows.
 fn truncated(text: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    if unicode_width::UnicodeWidthStr::width(text) <= budget {
+        return text.to_string();
+    }
+    let limit = budget - 1;
     let mut out = String::new();
     let mut used = 0usize;
     for ch in text.chars() {
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > budget {
+        if used + w > limit {
             break;
         }
         out.push(ch);
         used += w;
     }
-    if out.chars().count() < text.chars().count() {
-        out.push('…');
-    }
+    out.push('…');
     out
 }
 
@@ -1224,16 +1298,56 @@ fn workspace_label(workspace: &str) -> String {
     workspace.to_string()
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let usage = app.transcript.usage;
-    let used = usage
-        .input
-        .saturating_add(usage.cache)
-        .saturating_add(usage.cache_write);
-    let context = match app.context_window {
-        Some(window) => format!("{} / {}", compact_number(used), compact_number(window)),
-        None => compact_number(used),
+/// Top-right context chip and its pressure colour.
+///
+/// Prefers DSH's `contextPressure` projection: `projectedTokens` is what the
+/// NEXT request's prompt will cost, anchored on the provider's own figure and
+/// repriced only for the delta — so unlike a running token sum it *drops* the
+/// moment a compaction shadows a span. Falls back to the scraped usage totals
+/// when no projection has arrived (non-DSH harness, or before the first
+/// provider-reported usage).
+///
+/// The colour bands are visual pressure only. They are deliberately not
+/// labelled as the auto-compaction threshold — DSH's actual threshold lives in
+/// `dsh-compaction-basic` config and is not read here.
+fn context_chip(app: &App) -> (String, ratatui::style::Color) {
+    let projection = app.projections.context_pressure;
+    let used = projection
+        .and_then(|p| p.projected_tokens.or(p.pressure_tokens))
+        .unwrap_or_else(|| {
+            let usage = app.transcript.usage;
+            usage
+                .input
+                .saturating_add(usage.cache)
+                .saturating_add(usage.cache_write)
+        });
+    let window = projection
+        .and_then(|p| p.context_window)
+        .or(app.context_window);
+    let fraction = app.projections.context_fraction().or_else(|| {
+        let window = window?;
+        (window > 0).then(|| (used as f64 / window as f64).clamp(0.0, 1.0))
+    });
+    let color = match fraction {
+        Some(f) if f >= 0.90 => app.theme.accent_error,
+        Some(f) if f >= 0.70 => app.theme.warning,
+        _ => app.theme.gray_bright,
     };
+    let text = match (window, fraction) {
+        (Some(window), Some(f)) => format!(
+            "{} / {} · {}%",
+            compact_number(used),
+            compact_number(window),
+            (f * 100.0).round() as u64
+        ),
+        (Some(window), None) => format!("{} / {}", compact_number(used), compact_number(window)),
+        _ => compact_number(used),
+    };
+    (text, color)
+}
+
+fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    let (context, context_color) = context_chip(app);
     let context_width = unicode_width::UnicodeWidthStr::width(context.as_str()) as u16;
     let split = Layout::default()
         .direction(Direction::Horizontal)
@@ -1267,7 +1381,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(Span::styled(
             format!("{context} "),
             Style::default()
-                .fg(app.theme.gray_bright)
+                .fg(context_color)
                 .add_modifier(Modifier::BOLD),
         )))
         .alignment(Alignment::Right)
@@ -2011,6 +2125,159 @@ mod tests {
         assert!(dump.contains("… 7 more lines"), "ellipsis row:\n{dump}");
         assert!(dump.contains("line 12"), "tail kept:\n{dump}");
         assert!(!dump.contains("line 6"), "middle should be hidden:\n{dump}");
+    }
+
+    #[test]
+    fn context_chip_prefers_the_projection_and_reacts_to_compaction() {
+        let mut app = test_app();
+        app.context_window = Some(100_000);
+        app.transcript.usage.input = 40_000;
+
+        // no projection yet: fall back to the scraped usage sum
+        let (text, color) = context_chip(&app);
+        assert!(text.contains("40.0K / 100K"), "fallback text: {text}");
+        assert!(text.contains("40%"), "fallback percent: {text}");
+        assert_eq!(color, DARK.gray_bright);
+
+        // the projection wins, including its own window
+        app.projections.apply(
+            "contextPressure",
+            &serde_json::json!({
+                "pressureTokens": 150_000, "projectedTokens": 160_000, "contextWindow": 200_000
+            }),
+            1,
+        );
+        let (text, color) = context_chip(&app);
+        assert!(text.contains("160K / 200K"), "projection text: {text}");
+        assert!(text.contains("80%"), "projection percent: {text}");
+        assert_eq!(color, DARK.warning, "80% is the warning band");
+
+        // a compaction shadows a span: projectedTokens drops even though the
+        // provider-reported pressure has not been re-sampled
+        app.projections.apply(
+            "contextPressure",
+            &serde_json::json!({
+                "pressureTokens": 150_000, "projectedTokens": 20_000, "contextWindow": 200_000
+            }),
+            2,
+        );
+        let (text, color) = context_chip(&app);
+        assert!(text.contains("20.0K / 200K"), "after compaction: {text}");
+        assert!(text.contains("10%"), "after compaction: {text}");
+        assert_eq!(color, DARK.gray_bright, "pressure relieved");
+
+        // over the top band
+        app.projections.apply(
+            "contextPressure",
+            &serde_json::json!({"projectedTokens": 195_000, "contextWindow": 200_000}),
+            3,
+        );
+        assert_eq!(context_chip(&app).1, DARK.accent_error);
+    }
+
+    #[test]
+    fn context_chip_shows_a_bare_count_when_no_window_is_known() {
+        let mut app = test_app();
+        app.context_window = None;
+        app.transcript.usage.input = 1_234;
+        let (text, _) = context_chip(&app);
+        assert!(!text.contains('/'), "no window means no ratio: {text}");
+        assert!(!text.contains('%'), "and no percent: {text}");
+
+        // a projection with tokens but no advertised window behaves the same
+        app.projections.apply(
+            "contextPressure",
+            &serde_json::json!({"projectedTokens": 5_000}),
+            1,
+        );
+        let (text, color) = context_chip(&app);
+        assert!(text.contains("5.0K"), "{text}");
+        assert!(!text.contains('%'), "{text}");
+        assert_eq!(color, DARK.gray_bright);
+    }
+
+    #[test]
+    fn truncated_never_exceeds_its_budget_including_the_ellipsis() {
+        use unicode_width::UnicodeWidthStr;
+        for budget in 0..12usize {
+            for text in ["", "abc", "abcdefghijklmnop", "你好世界你好世界", "a你b好c"] {
+                let out = truncated(text, budget);
+                assert!(
+                    UnicodeWidthStr::width(out.as_str()) <= budget,
+                    "budget {budget} exceeded by {out:?} from {text:?}"
+                );
+            }
+        }
+        // exact fits are returned whole, with no ellipsis
+        assert_eq!(truncated("abcde", 5), "abcde");
+        assert_eq!(truncated("abcdef", 5), "abcd…");
+        // wide glyphs are not split
+        assert_eq!(truncated("你好世界", 5), "你好…");
+    }
+
+    #[test]
+    fn goal_bar_appears_only_with_a_goal_and_shows_rounds_or_block_reason() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+
+        // no goal: the bar must not steal a row
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let without = terminal.backend().to_string();
+        assert!(!without.contains("goal"), "no goal, no bar:\n{without}");
+
+        app.projections.apply(
+            "goal",
+            &serde_json::json!({
+                "goal": {"id":"g1","revision":1,"objective":"ship the TUI",
+                         "phase":"active","maxGoalRounds":10},
+                "roundsStarted": 3, "createdAt": 1, "updatedAt": 2
+            }),
+            1,
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let active = terminal.backend().to_string();
+        assert!(active.contains("ship the TUI"), "objective:\n{active}");
+        assert!(active.contains("round 3/10"), "round counter:\n{active}");
+
+        // blocked: the reason replaces the counter, since it is the actionable bit
+        app.projections.apply(
+            "goal",
+            &serde_json::json!({
+                "goal": {"id":"g1","revision":2,"objective":"ship the TUI",
+                         "phase":"blocked","maxGoalRounds":10,
+                         "blockedReason":{"code":"needs-input","message":"waiting on approval"}},
+                "roundsStarted": 3, "createdAt": 1, "updatedAt": 3
+            }),
+            2,
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let blocked = terminal.backend().to_string();
+        assert!(blocked.contains("waiting on approval"), "reason:\n{blocked}");
+        assert!(!blocked.contains("round 3/10"), "counter yields to reason:\n{blocked}");
+    }
+
+    #[test]
+    fn goal_bar_keeps_the_round_counter_on_a_narrow_terminal() {
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        app.projections.apply(
+            "goal",
+            &serde_json::json!({
+                "goal": {"id":"g1","revision":1,
+                         "objective":"a very long objective that cannot possibly fit in forty columns",
+                         "phase":"active","maxGoalRounds":9},
+                "roundsStarted": 7, "createdAt": 1, "updatedAt": 2
+            }),
+            1,
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let dump = terminal.backend().to_string();
+        assert!(
+            dump.contains("round 7/9"),
+            "the objective must yield, not the counter:\n{dump}"
+        );
     }
 
     #[test]

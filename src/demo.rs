@@ -29,6 +29,40 @@ pub fn seed(app: &mut App) {
     for e in events {
         app.transcript.apply(&e);
     }
+    // Projections arrive out-of-band from the harness (docs/04 section 3), not
+    // in the event stream, so the demo feeds them the same way the bridge does.
+    for (key, value, seq) in [
+        (
+            "goal",
+            json!({
+                "goal": {
+                    "id": "demo-goal", "revision": 2,
+                    "objective": "修好 parse 的空串分支并补上回归测试",
+                    "phase": "active",
+                    "maxGoalRounds": 8
+                },
+                "roundsStarted": 3,
+                "createdAt": 1000, "updatedAt": 3011
+            }),
+            17u64,
+        ),
+        (
+            "contextPressure",
+            json!({
+                "pressureTokens": 15_461,
+                "projectedTokens": 16_204,
+                "contextWindow": 200_000
+            }),
+            17,
+        ),
+        (
+            "contextBreakdown",
+            json!({ "systemTokens": 2_140, "toolsTokens": 4_802, "messageTokens": 9_262 }),
+            17,
+        ),
+    ] {
+        app.projections.apply(key, &value, seq);
+    }
     app.state = RunState::Idle;
     app.status = "demo seeded".into();
 }

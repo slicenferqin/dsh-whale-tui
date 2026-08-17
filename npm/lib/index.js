@@ -121,6 +121,25 @@ function apply(ctx) {
   const publishCapabilitiesChanged = () => transport.notify('tui.capabilities-changed', {})
   disposers.push(ctx.on('commands/change', publishCapabilitiesChanged))
   disposers.push(ctx.on('tools/change', publishCapabilitiesChanged))
+
+  // --------------------------------------- session projections ----------
+  // DSH's canonical read model (docs/04 section 3). One key-agnostic channel
+  // carries every projection, so a projection a future plugin adds needs no
+  // protocol change here or in the TUI. Reading these beats re-deriving state
+  // from raw events: they are replay-safe and carry persisted checkpoints.
+  //
+  // `sessionProjections` is optional on purpose — a profile that does not mount
+  // dsh-session-projection simply gets no projection traffic, and the TUI keeps
+  // its own fallbacks.
+  const projections = ctx.get('sessionProjections')
+  const publishProjection = (sessionId, key, value, seq) => {
+    transport.notify('session.projection', { sessionId, key, value, seq })
+  }
+  if (projections !== undefined) {
+    disposers.push(projections.onChanged((session, key, value, seq) => {
+      publishProjection(String(session.id), key, value, seq)
+    }))
+  }
   disposers.push(ctx.on('session/created', (session) => {
     const parentSession = session.header.parentSession
     if (parentSession === undefined) return
