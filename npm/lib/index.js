@@ -132,6 +132,15 @@ function apply(ctx) {
   // dsh-session-projection simply gets no projection traffic, and the TUI keeps
   // its own fallbacks.
   const projections = ctx.get('sessionProjections')
+  // Smoke-test diagnostics: if this service is missing, the GoalBar and the
+  // context percentage silently render nothing. Say so once, loudly, rather
+  // than leaving a blank surface with no explanation.
+  if (projections === undefined) {
+    ctx.logger.warn(
+      'sessionProjections unavailable — goal bar, context pressure and todo sync are disabled. '
+      + 'Expected @deepseek-ai/dsh-session-projection to be mounted by the dsh-base bundle.',
+    )
+  }
   const publishProjection = (sessionId, key, value, seq) => {
     transport.notify('session.projection', { sessionId, key, value, seq })
   }
@@ -154,6 +163,8 @@ function apply(ctx) {
       return
     }
     const seq = snapshot.asOfSeq
+    const keys = Object.keys(snapshot.values)
+    ctx.logger.info('projections for %s @seq %d: %s', sessionId, seq, keys.join(', ') || '(none)')
     for (const [key, value] of Object.entries(snapshot.values)) {
       if (value === undefined) continue
       publishProjection(sessionId, key, value, seq)
@@ -528,6 +539,8 @@ function apply(ctx) {
       jobs: ctx.get('jobs') !== undefined,
       userQuestions: userQuestions !== undefined,
       sessionSearch: ctx.get('sessionQuery') !== undefined,
+      projections: projections !== undefined,
+      goals: ctx.get('goals') !== undefined,
       commands: commands.length > 0,
       tools: tools.length > 0,
     }

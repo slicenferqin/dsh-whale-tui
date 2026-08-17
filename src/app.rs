@@ -184,6 +184,10 @@ pub struct HarnessCapabilities {
     pub session_search: bool,
     pub commands: bool,
     pub tools: bool,
+    /// Is the session-projection registry mounted? Without it the goal bar,
+    /// context pressure and todo sync all go quiet, so `/context` reports it.
+    pub projections: bool,
+    pub goals: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -544,6 +548,33 @@ impl App {
     /// `contextPressure.projectedTokens`, reported separately as `context`.
     fn context_rows(&self) -> Vec<(String, String)> {
         let mut rows = Vec::new();
+        // Report the seam's presence first. Without it every row below is
+        // absent, and "no rows" is indistinguishable from "nothing happened
+        // yet" — which is exactly the confusion a smoke test hits.
+        if !self.demo {
+            rows.push((
+                "projections".to_string(),
+                if self.projections.seq == 0 && self.projections.context_pressure.is_none() {
+                    if self.capabilities.projections {
+                        "mounted · none received yet".to_string()
+                    } else {
+                        "NOT MOUNTED".to_string()
+                    }
+                } else {
+                    format!("@seq {}", self.projections.seq)
+                },
+            ));
+            // ctx.goals is what a future goal write path needs; report whether
+            // it is reachable so the answer is known before it is relied on.
+            rows.push((
+                "goal service".to_string(),
+                if self.capabilities.goals {
+                    "available".to_string()
+                } else {
+                    "absent".to_string()
+                },
+            ));
+        }
         if let Some(p) = self.projections.context_pressure {
             let fmt = |v: Option<u64>| match v {
                 Some(n) => n.to_string(),
@@ -1781,6 +1812,8 @@ impl App {
                         session_search: capability_flag(capabilities, "sessionSearch"),
                         commands: capability_flag(capabilities, "commands"),
                         tools: capability_flag(capabilities, "tools"),
+                        projections: capability_flag(capabilities, "projections"),
+                        goals: capability_flag(capabilities, "goals"),
                     };
                     self.harness_commands = params
                         .get("commands")
@@ -4074,11 +4107,35 @@ mod tests {
     }
 
     #[test]
-    fn context_rows_are_empty_without_projections() {
-        let app = test_app();
-        assert!(
-            app.context_rows().is_empty(),
-            "a harness with no projections adds no rows"
+    fn context_rows_say_so_when_the_projection_seam_is_missing() {
+        // "No rows" used to be indistinguishable from "the harness never mounted
+        // dsh-session-projection", which makes a silent failure undiagnosable.
+        let mut app = test_app();
+        let rows = app.context_rows();
+        assert_eq!(
+            rows.iter().find(|(k, _)| k == "projections").map(|(_, v)| v.as_str()),
+            Some("NOT MOUNTED"),
+            "an absent seam must be stated: {rows:?}"
+        );
+
+        // mounted but quiet is a different, also-reportable state
+        app.capabilities.projections = true;
+        let rows = app.context_rows();
+        assert_eq!(
+            rows.iter().find(|(k, _)| k == "projections").map(|(_, v)| v.as_str()),
+            Some("mounted · none received yet"),
+        );
+
+        // once values flow, report the log position instead
+        app.projections.apply(
+            "contextPressure",
+            &json!({"projectedTokens": 10, "contextWindow": 100}),
+            42,
+        );
+        let rows = app.context_rows();
+        assert_eq!(
+            rows.iter().find(|(k, _)| k == "projections").map(|(_, v)| v.as_str()),
+            Some("@seq 42"),
         );
     }
 
