@@ -410,9 +410,15 @@ pub fn render_cached(text: &str, theme: &Theme, base: Style) -> Vec<Line<'static
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
-    // `base` carries the cell background, which changes with the theme; hash it
-    // so a theme switch cannot serve stale colours.
-    format!("{base:?}").hash(&mut hasher);
+    // `base` carries the cell background, which changes with the theme, so it has
+    // to be part of the key. Hash its fields directly — `format!("{base:?}")`
+    // allocated and formatted a String on every lookup, i.e. once per visible
+    // cell per frame.
+    base.fg.hash(&mut hasher);
+    base.bg.hash(&mut hasher);
+    base.underline_color.hash(&mut hasher);
+    base.add_modifier.bits().hash(&mut hasher);
+    base.sub_modifier.bits().hash(&mut hasher);
     let key = (hasher.finish(), theme.name);
 
     CACHE.with(|cache| {

@@ -567,7 +567,8 @@ fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    set_mouse_reporting(true);
+    // Mouse reporting is applied from app state on the first loop pass, so the
+    // default lives in one place (App::new) rather than being duplicated here.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -594,16 +595,37 @@ fn main() -> Result<()> {
         demo::seed(&mut app);
     }
 
+    // Frame budget. A busy session can emit many events per visible change
+    // (session.event plus one notification per changed projection), and drawing
+    // once per event floods the terminal with escape sequences it then has to
+    // parse — which shows up as input lag, because keystrokes queue on the same
+    // bus behind that work. Cap the draw rate and let the coalesced state catch
+    // up in one frame instead.
+    const FRAME: Duration = Duration::from_millis(16);
+    const IDLE_WAIT: Duration = Duration::from_millis(80);
+    let mut last_draw = std::time::Instant::now() - FRAME;
+
     loop {
         if app.mouse_capture_dirty {
             set_mouse_reporting(app.mouse_capture);
             app.mouse_capture_dirty = false;
         }
-        if app.needs_redraw {
-            terminal.draw(|f| ui::draw(f, &mut app))?;
-            app.needs_redraw = false;
-        }
-        match bus_rx.recv_timeout(Duration::from_millis(80)) {
+        // Wait only as long as the pending frame allows, so a deferred draw is
+        // never delayed by the full idle timeout.
+        let wait = if app.needs_redraw {
+            let since = last_draw.elapsed();
+            if since >= FRAME {
+                terminal.draw(|f| ui::draw(f, &mut app))?;
+                app.needs_redraw = false;
+                last_draw = std::time::Instant::now();
+                IDLE_WAIT
+            } else {
+                FRAME - since
+            }
+        } else {
+            IDLE_WAIT
+        };
+        match bus_rx.recv_timeout(wait) {
             Ok(ev) => {
                 app.handle(ev);
                 while let Ok(ev) = bus_rx.try_recv() {

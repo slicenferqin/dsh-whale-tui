@@ -410,9 +410,14 @@ pub struct App {
     pub follow_selection: bool,
     pub composer_top: u16,
     pub needs_redraw: bool,
-    /// Is mouse reporting on? While on, the terminal routes mouse events here
-    /// and its own text selection is suppressed (Shift usually overrides that).
-    /// `/mouse` turns it off so selection and copy work natively.
+    /// Is mouse reporting on? Defaults to OFF.
+    ///
+    /// Any tracking mode makes the terminal hand mouse input to us and stop
+    /// doing its own text selection. We do not implement drag-selection, so
+    /// capturing the mouse would buy only wheel-scroll and click-to-focus while
+    /// costing native select-and-copy — a bad trade, and Shift-to-override is
+    /// not universal. Keyboard scrolling covers navigation (PageUp/PageDown,
+    /// Ctrl+U/D, Ctrl+J/K, j/k, g/G); `/mouse` opts into the wheel.
     pub mouse_capture: bool,
     /// Set when `mouse_capture` changed and the event loop must re-issue the
     /// escape sequence.
@@ -478,8 +483,9 @@ impl App {
             follow_selection: true,
             composer_top: 0,
             needs_redraw: true,
-            mouse_capture: true,
-            mouse_capture_dirty: false,
+            mouse_capture: false,
+            // Applied on the first loop pass, so the default holds whatever it is.
+            mouse_capture_dirty: true,
             quit: false,
             demo,
             dialog: Dialog::None,
@@ -1427,7 +1433,12 @@ impl App {
             },
             ShortcutRow {
                 label: "Select / copy text with the mouse",
-                keys: "hold Shift, or /mouse to turn reporting off",
+                keys: "works by default (mouse reporting is off)",
+                section: Actions,
+            },
+            ShortcutRow {
+                label: "Mouse wheel scrolling",
+                keys: "/mouse to enable (then Shift to select)",
                 section: Actions,
             },
             ShortcutRow {
@@ -1638,9 +1649,9 @@ impl App {
                 self.mouse_capture = !self.mouse_capture;
                 self.mouse_capture_dirty = true;
                 self.notice = Some(if self.mouse_capture {
-                    "mouse on · wheel scrolls · hold Shift to select text".into()
+                    "mouse on · wheel scrolls · text selection needs Shift now".into()
                 } else {
-                    "mouse off · select and copy natively · /mouse to re-enable".into()
+                    "mouse off · select and copy text normally".into()
                 });
             }
             "/theme" => {
@@ -4286,16 +4297,19 @@ mod tests {
     #[test]
     fn mouse_toggle_flags_the_event_loop_to_reissue_the_sequence() {
         let mut app = test_app();
-        assert!(app.mouse_capture);
-        assert!(!app.mouse_capture_dirty);
+        // Off by default so native select-and-copy works without a ceremony;
+        // dirty at construction so the loop applies whatever the default is.
+        assert!(!app.mouse_capture);
+        assert!(app.mouse_capture_dirty);
+        app.mouse_capture_dirty = false;
 
         app.run_command("/mouse");
-        assert!(!app.mouse_capture, "reporting off so text can be selected");
+        assert!(app.mouse_capture, "opting into the wheel");
         assert!(app.mouse_capture_dirty);
 
         app.mouse_capture_dirty = false;
         app.run_command("/mouse");
-        assert!(app.mouse_capture);
+        assert!(!app.mouse_capture);
         assert!(app.mouse_capture_dirty);
     }
 
