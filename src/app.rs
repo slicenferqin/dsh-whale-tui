@@ -535,6 +535,56 @@ impl App {
         }
     }
 
+    /// `/context` rows built from DSH's token-meter projections (docs/04 6.4).
+    ///
+    /// The breakdown figures are the meter's fixed-density estimates, which
+    /// systematically underprice CJK text and JSON schemas. Upstream is explicit
+    /// that they are composition, never a total — so they are labelled `~` and
+    /// deliberately not summed. The one trustworthy total is
+    /// `contextPressure.projectedTokens`, reported separately as `context`.
+    fn context_rows(&self) -> Vec<(String, String)> {
+        let mut rows = Vec::new();
+        if let Some(p) = self.projections.context_pressure {
+            let fmt = |v: Option<u64>| match v {
+                Some(n) => n.to_string(),
+                None => "-".to_string(),
+            };
+            rows.push((
+                "context (next req)".to_string(),
+                match (p.projected_tokens, p.context_window) {
+                    (Some(used), Some(window)) if window > 0 => format!(
+                        "{used} / {window} · {}%",
+                        (used as f64 / window as f64 * 100.0).round() as u64
+                    ),
+                    _ => fmt(p.projected_tokens),
+                },
+            ));
+            rows.push(("context (last req)".to_string(), fmt(p.pressure_tokens)));
+        }
+        if let Some(b) = self.projections.context_breakdown {
+            // `~` marks these as estimates, and they are listed individually so
+            // no reader is invited to add them up.
+            rows.push(("~ system prompt".to_string(), b.system_tokens.to_string()));
+            rows.push(("~ tool schemas".to_string(), b.tools_tokens.to_string()));
+            rows.push(("~ conversation".to_string(), b.message_tokens.to_string()));
+        }
+        if let Some(goal) = self.projections.goal.as_ref() {
+            rows.push((
+                "goal".to_string(),
+                format!(
+                    "{} · round {}/{}",
+                    goal.objective, goal.rounds_started, goal.max_rounds
+                ),
+            ));
+        }
+        // Projections we do not model yet still surface here, so a capability a
+        // future plugin adds is visible without a code change.
+        for (key, value) in &self.projections.extra {
+            rows.push((key.clone(), truncate_value(value)));
+        }
+        rows
+    }
+
     fn open_todos(&mut self) {
         if self.transcript.todos.is_empty() {
             self.notice = Some("no task list yet".into());
@@ -1067,7 +1117,7 @@ impl App {
         let mut rows = vec![
             row("Session", "New Session", "/new", Some("Ctrl+N")),
             row("Session", "Resume Session", "/resume", Some("Ctrl+S")),
-            row("Session", "Session Info", "/session-info", None),
+            row("Session", "Session Info & Context", "/context", None),
             row("Session", "Copy Last Response", "/copy", None),
             row("Session", "Quit", "/exit", Some("Ctrl+Q")),
             row("Context", "Rewind Conversation", "/rewind", Some("2×Esc")),
@@ -1487,6 +1537,21 @@ impl App {
                 self.copy_text(text);
             }
             "/session-info" | "/context" | "/status" | "/info" => {
+                if self.demo {
+                    // No bridge in demo mode, so answer locally — the demo is
+                    // meant to exercise every surface without a runtime.
+                    self.handle(AppEvent::Rpc {
+                        method: "tui/session-info-result".into(),
+                        params: json!({
+                            "sessionId": self.session_id,
+                            "provider": self.provider,
+                            "model": self.model,
+                            "cwd": self.workspace,
+                            "turns": self.transcript.stats.turns,
+                        }),
+                    });
+                    return;
+                }
                 let _ = self.cmd_tx.send(Cmd::SessionInfo {
                     session_id: self.session_id.clone(),
                 });
@@ -2001,6 +2066,7 @@ impl App {
                     if stats.steps == 0 {
                         rows[3].1 = get("turns");
                     }
+                    rows.extend(self.context_rows());
                     self.dialog = Dialog::Info(InfoDialog { rows });
                 }
                 "tui/rewound" => {
@@ -3713,6 +3779,20 @@ impl App {
     }
 }
 
+/// One-line rendering of an unmodelled projection value for the `/context` list.
+fn truncate_value(value: &Value) -> String {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 60 {
+        format!("{}…", flat.chars().take(59).collect::<String>())
+    } else {
+        flat
+    }
+}
+
 fn history_matches(history: &[String], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
     history
@@ -3943,6 +4023,63 @@ mod tests {
         // already on the first line, so Up now reaches for history
         app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input, "older");
+    }
+
+    #[test]
+    fn context_rows_report_a_total_and_estimates_without_inviting_a_sum() {
+        let mut app = test_app();
+        app.projections.apply(
+            "contextPressure",
+            &json!({"pressureTokens": 90_000, "projectedTokens": 95_000, "contextWindow": 200_000}),
+            1,
+        );
+        app.projections.apply(
+            "contextBreakdown",
+            &json!({"systemTokens": 2_000, "toolsTokens": 5_000, "messageTokens": 40_000}),
+            1,
+        );
+        let rows = app.context_rows();
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(k, _)| k == label)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing row {label}: {rows:?}"))
+        };
+
+        // the one trustworthy total
+        assert_eq!(find("context (next req)"), "95000 / 200000 · 48%");
+        assert_eq!(find("context (last req)"), "90000");
+
+        // estimates are marked and listed separately; upstream forbids summing
+        // them, and 2000+5000+40000 = 47000 is NOT the total above
+        assert_eq!(find("~ system prompt"), "2000");
+        assert_eq!(find("~ tool schemas"), "5000");
+        assert_eq!(find("~ conversation"), "40000");
+        assert!(
+            !rows.iter().any(|(k, _)| k.contains("total")),
+            "must not present a summed breakdown total: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn context_rows_surface_projections_we_do_not_model_yet() {
+        let mut app = test_app();
+        app.projections
+            .apply("subagentTiming", &json!({"childA": 1234}), 1);
+        let rows = app.context_rows();
+        assert!(
+            rows.iter().any(|(k, _)| k == "subagentTiming"),
+            "an unmodelled projection must still be visible: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn context_rows_are_empty_without_projections() {
+        let app = test_app();
+        assert!(
+            app.context_rows().is_empty(),
+            "a harness with no projections adds no rows"
+        );
     }
 
     #[test]

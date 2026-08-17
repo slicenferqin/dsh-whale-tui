@@ -583,7 +583,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Info(d) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
-            let h = (d.rows.len() as u16 + 2)
+            // rows + header + blank spacer + the block's two borders. Getting
+            // this short silently drops the last rows off the bottom.
+            let h = (d.rows.len() as u16 + 4)
                 .min(area.height.saturating_sub(4))
                 .max(6);
             let rect = centered_rect(w, h, area);
@@ -2135,6 +2137,26 @@ mod tests {
         assert!(dump.contains("… 7 more lines"), "ellipsis row:\n{dump}");
         assert!(dump.contains("line 12"), "tail kept:\n{dump}");
         assert!(!dump.contains("line 6"), "middle should be hidden:\n{dump}");
+    }
+
+    #[test]
+    fn info_dialog_is_tall_enough_for_every_row() {
+        let backend = TestBackend::new(90, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        let rows: Vec<(String, String)> = (0..14)
+            .map(|i| (format!("key{i}"), format!("value{i}")))
+            .collect();
+        app.dialog = crate::app::Dialog::Info(crate::app::InfoDialog { rows });
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let dump = terminal.backend().to_string();
+        for i in 0..14 {
+            assert!(
+                dump.contains(&format!("key{i}")),
+                "row {i} clipped off the bottom:\n{dump}"
+            );
+        }
     }
 
     #[test]
