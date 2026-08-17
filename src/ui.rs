@@ -1298,6 +1298,17 @@ fn workspace_label(workspace: &str) -> String {
     workspace.to_string()
 }
 
+/// DSH's default auto-compaction trigger: `dsh-compaction-basic` compacts once
+/// measured context reaches `floor(contextWindow * DEFAULT_THRESHOLD_RATIO)`,
+/// where that ratio defaults to 0.8 (it retains ~16% afterwards).
+///
+/// This is the *default*; the ratio is configurable and can be overridden per
+/// provider/model via `modelPolicies`, and the policy compares its own
+/// `measure().totalTokens` rather than the `projectedTokens` we display. So the
+/// band is an accurate guide, not a promise. Reading the resolved threshold from
+/// the harness would make it exact — worth doing if it ever matters.
+const COMPACT_THRESHOLD: f64 = 0.80;
+
 /// Top-right context chip and its pressure colour.
 ///
 /// Prefers DSH's `contextPressure` projection: `projectedTokens` is what the
@@ -1306,10 +1317,6 @@ fn workspace_label(workspace: &str) -> String {
 /// moment a compaction shadows a span. Falls back to the scraped usage totals
 /// when no projection has arrived (non-DSH harness, or before the first
 /// provider-reported usage).
-///
-/// The colour bands are visual pressure only. They are deliberately not
-/// labelled as the auto-compaction threshold — DSH's actual threshold lives in
-/// `dsh-compaction-basic` config and is not read here.
 fn context_chip(app: &App) -> (String, ratatui::style::Color) {
     let projection = app.projections.context_pressure;
     let used = projection
@@ -1329,8 +1336,11 @@ fn context_chip(app: &App) -> (String, ratatui::style::Color) {
         (window > 0).then(|| (used as f64 / window as f64).clamp(0.0, 1.0))
     });
     let color = match fraction {
-        Some(f) if f >= 0.90 => app.theme.accent_error,
-        Some(f) if f >= 0.70 => app.theme.warning,
+        // At or past the threshold auto-compaction will fire; approaching it is
+        // the warning. Neither is an error — compaction is routine — but the
+        // user deserves to see it coming.
+        Some(f) if f >= COMPACT_THRESHOLD => app.theme.accent_error,
+        Some(f) if f >= COMPACT_THRESHOLD - 0.15 => app.theme.warning,
         _ => app.theme.gray_bright,
     };
     let text = match (window, fraction) {
@@ -2150,7 +2160,10 @@ mod tests {
         let (text, color) = context_chip(&app);
         assert!(text.contains("160K / 200K"), "projection text: {text}");
         assert!(text.contains("80%"), "projection percent: {text}");
-        assert_eq!(color, DARK.warning, "80% is the warning band");
+        assert_eq!(
+            color, DARK.accent_error,
+            "80% IS DSH's auto-compaction threshold, not merely approaching it"
+        );
 
         // a compaction shadows a span: projectedTokens drops even though the
         // provider-reported pressure has not been re-sampled
@@ -2166,13 +2179,21 @@ mod tests {
         assert!(text.contains("10%"), "after compaction: {text}");
         assert_eq!(color, DARK.gray_bright, "pressure relieved");
 
-        // over the top band
+        // approaching the threshold warns before reaching it
         app.projections.apply(
             "contextPressure",
-            &serde_json::json!({"projectedTokens": 195_000, "contextWindow": 200_000}),
+            &serde_json::json!({"projectedTokens": 140_000, "contextWindow": 200_000}),
             3,
         );
-        assert_eq!(context_chip(&app).1, DARK.accent_error);
+        assert_eq!(context_chip(&app).1, DARK.warning, "70% approaches 80%");
+
+        // and well clear of it is neutral
+        app.projections.apply(
+            "contextPressure",
+            &serde_json::json!({"projectedTokens": 100_000, "contextWindow": 200_000}),
+            4,
+        );
+        assert_eq!(context_chip(&app).1, DARK.gray_bright, "50% is fine");
     }
 
     #[test]

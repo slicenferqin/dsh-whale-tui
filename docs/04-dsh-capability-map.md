@@ -233,6 +233,35 @@ GoalMessageSource { kind: 'goal', goalId, revision, round }
 
 官方 web 的落点：`dsh-client-ui-goal` = **GoalBar 常驻输入框上方**，读 goal 投影。
 
+写路径**已经免费可用**（已核实实现）：
+
+服务是 **`ctx.goals`**（复数），全部同步，mutation 走 CAS 传当前 `GoalRef`：
+
+```js
+ctx.goals.get(agent)                                   // current | undefined
+ctx.goals.create(agent, { objective })
+ctx.goals.edit(agent, goalRef(current), { objective })
+ctx.goals.pause(agent, goalRef(current))
+ctx.goals.resume(agent, goalRef(current))
+ctx.goals.clear(agent, goalRef(current))
+// 失败抛 GoalError
+```
+
+而 `dsh-command-goal` 已经把这些包成一条命令（`dsh-command-goal/lib/index.js`）：
+
+```js
+ctx.commands.register({
+  name: 'goal',
+  description: 'set or view the goal for a long-running task',
+  input: { hint: '[<objective>|clear|edit <objective>|pause|resume]' },
+  handler: (invocation) => executeGoalCommand(ctx, invocation)
+})
+```
+
+我们的能力驱动命令面板已经在用 `ctx.commands.list(agent)` + `tui/execute-command`，而 `command-goal` 在 dsh-base 里 —— 所以 **`/goal` 现在就应该能用，不需要新协议方法**。注意命令层没有 `complete` 和 `block`：完成由模型经 `dsh-tool-goal` 触发，block 是策略驱动的。
+
+GoalBar 也不需要新的 capability flag：没挂 goal 插件 → 没有 goal 投影 → 条自动不出现。这正是投影驱动设计的红利。
+
 TUI 落点建议：
 - 输入框上方一条 GoalBar：objective + phase 徽标 + `roundsStarted/maxGoalRounds` + activation
 - `blocked` 时高亮 `blockedReason.message`
@@ -257,6 +286,19 @@ ContextPressureProjection {
 `projectedTokens` 的设计值得照抄语义：锚定 provider 真实值、只对增量做估算，因此**压缩一发生就立刻反映**——`pressureTokens` 做不到，因为压缩自身不产生 usage 事件。
 
 我们现在状态栏显示的是原始 input tokens。换成 `projectedTokens / contextWindow` 会比 grok 的 context bar 更准。
+
+#### 6.3.1 自动压缩阈值（已核实）
+
+`dsh-compaction-basic`：`DEFAULT_THRESHOLD_RATIO = 0.8`、`DEFAULT_RETAIN_RATIO = 0.16`。触发判定是
+
+```js
+if (measurement.totalTokens < spec.thresholdTokens) return null
+// thresholdTokens = floor(contextWindow * policy.thresholdRatio)
+```
+
+即**占用达到上下文窗口 80% 时自动压缩**，压缩后保留约 16%。比 grok 的 85% 更早。
+
+两个使用注意：`thresholdRatio` 可配置且支持按 provider/model 覆盖（`modelPolicies`）；策略比较的是它自己的 `measure().totalTokens`，不是我们展示的 `projectedTokens`。所以状态栏的色带按 0.8 画是准确的**指引**而非承诺，硬编码在 `ui.rs::COMPACT_THRESHOLD` 并注明了。
 
 #### 6.4 `/context` 明细 —— `contextBreakdown`
 
@@ -370,7 +412,7 @@ ContextBreakdownProjection {
 - [x] ~~`ProjectionSnapshot` 的确切字段名~~ —— `{ asOfSeq, values }`，见 3.3
 - [x] ~~`onChanged` 的触发时机~~ —— **仅值变化时**（`!Object.is`），见 3.3
 - [x] ~~投影是否需要先注册才有值~~ —— `snapshot()` 按需 lazy fold；未注册的 key 才缺席。但 **restore 不触发 onChanged**，resume 必须主动拉快照
-- [ ] `goal` 的可变操作在进程内怎么调（`ctx.goal`? 服务名未确认）。注意 `command-goal` 在 base 里，写路径可能走现有命令通道即可 —— 见第 10 节
+- [x] ~~`goal` 的可变操作怎么调~~ —— **`ctx.goals`**（复数，同步，CAS 传 `GoalRef`）；且 `/goal` 命令已覆盖 create/edit/pause/resume/clear，见 6.1
 - [ ] `GoalActivation` 由谁 arm/disarm，TUI 是否有权改
 - [ ] 沙箱当前 profile 从哪个 seam 读（`dsh-sandbox-policy` 提到「each session's current model context」）
 - [ ] spill 引用在 tool result 里的载荷形状，以及取全文的调用
