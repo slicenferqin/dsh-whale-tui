@@ -640,9 +640,11 @@ impl App {
             ));
         }
         // Projections we do not model yet still surface here, so a capability a
-        // future plugin adds is visible without a code change.
+        // future plugin adds is visible without a code change. Values are stored
+        // WHOLE — `y` copies these rows, and a truncated JSON blob is useless.
+        // The card truncates for display only.
         for (key, value) in &self.projections.extra {
-            rows.push((key.clone(), truncate_value(value)));
+            rows.push((key.clone(), flatten_value(value)));
         }
         rows
     }
@@ -2786,6 +2788,22 @@ impl App {
             return;
         }
 
+        // ---- viewport paging works from either focus ----
+        // PageUp/PageDown have no meaning in a composer, and they must not be
+        // gated on scrollback focus: the mouse wheel used to be the only way to
+        // scroll while typing, and mouse reporting is off by default now. After
+        // /resume the focus is the prompt, so without this there is no way to
+        // reach the replayed history at all.
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            self.follow_selection = false;
+            self.scroll = if key.code == KeyCode::PageUp {
+                self.scroll.saturating_add(10)
+            } else {
+                self.scroll.saturating_sub(10)
+            };
+            return;
+        }
+
         // ---- scrollback navigation ----
         if self.focus == Focus::Scrollback {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2869,14 +2887,6 @@ impl App {
                 KeyCode::Char('G') | KeyCode::End => {
                     self.follow_selection = true;
                     self.select_last_block();
-                }
-                KeyCode::PageUp => {
-                    self.follow_selection = false;
-                    self.scroll = self.scroll.saturating_add(10);
-                }
-                KeyCode::PageDown => {
-                    self.follow_selection = false;
-                    self.scroll = self.scroll.saturating_sub(10);
                 }
                 // Enter opens the block viewer; Ctrl+F is Grok's alt binding for
                 // the same thing. A bare `f` still auto-focuses the composer.
@@ -3928,18 +3938,15 @@ impl App {
     }
 }
 
-/// One-line rendering of an unmodelled projection value for the `/context` list.
-fn truncate_value(value: &Value) -> String {
+/// Collapse an unmodelled projection value onto one line, WITHOUT truncating.
+/// The info card shortens it for display; the row keeps the whole thing so `y`
+/// yields something usable rather than a clipped JSON fragment.
+fn flatten_value(value: &Value) -> String {
     let text = match value {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > 60 {
-        format!("{}…", flat.chars().take(59).collect::<String>())
-    } else {
-        flat
-    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn history_matches(history: &[String], query: &str) -> Vec<usize> {
@@ -4292,6 +4299,64 @@ mod tests {
             app.scroll, 25,
             "a click must not scroll the transcript to the bottom"
         );
+    }
+
+    #[test]
+    fn paging_works_from_the_composer_not_only_the_scrollback() {
+        // Regression: PageUp/PageDown used to be gated on scrollback focus, and
+        // the mouse wheel was the only way to scroll while the prompt had focus.
+        // With mouse reporting off by default that left a resumed session with
+        // no way to reach its own replayed history.
+        let mut app = test_app();
+        for i in 0..60 {
+            app.transcript
+                .push(CellKind::Assistant, String::new(), format!("line {i}"));
+        }
+        app.focus = Focus::Prompt;
+        app.scroll = 0;
+
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 10, "PageUp must scroll from the composer");
+        assert_eq!(app.focus, Focus::Prompt, "and must not steal focus");
+        assert!(!app.follow_selection, "paging detaches from selection");
+
+        app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 0);
+
+        // it must not consume the keys as composer input
+        assert!(app.input.is_empty());
+
+        // still works from the scrollback
+        app.focus = Focus::Scrollback;
+        app.handle_key(key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 10);
+    }
+
+    #[test]
+    fn info_rows_keep_whole_values_so_copying_them_is_useful() {
+        let mut app = test_app();
+        let long = serde_json::json!({
+            "currentValue": "danger-full-access",
+            "options": [{"name": "read-only"}, {"name": "workspace-write"}]
+        });
+        app.projections.apply("permissions", &long, 1);
+        let rows = app.context_rows();
+        let value = rows
+            .iter()
+            .find(|(k, _)| k == "permissions")
+            .map(|(_, v)| v.clone())
+            .expect("permissions row");
+
+        assert!(
+            !value.contains('…'),
+            "the stored row must not be truncated — y copies it: {value}"
+        );
+        assert!(
+            value.contains("workspace-write"),
+            "the tail of the value has to survive: {value}"
+        );
+        // and it is still one line
+        assert!(!value.contains('\n'));
     }
 
     #[test]

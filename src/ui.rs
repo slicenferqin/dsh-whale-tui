@@ -625,13 +625,18 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
             ))];
             lines.push(Line::from(""));
             for (k, v) in &d.rows {
-                let one: String = v.chars().take(60).collect();
+                // Fit the value to the card; `y` still copies the whole row.
+                let label_width = unicode_width::UnicodeWidthStr::width(k.as_str()) + 3;
+                let budget = (w as usize).saturating_sub(label_width + 3).max(12);
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!(" {}: ", k),
                         Style::default().fg(app.theme.accent_plan),
                     ),
-                    Span::styled(one, Style::default().fg(app.theme.text_primary)),
+                    Span::styled(
+                        truncated(v, budget),
+                        Style::default().fg(app.theme.text_primary),
+                    ),
                 ]));
             }
             let block = popup_block(" ◉ info ", app.theme.accent_user)
@@ -2173,6 +2178,50 @@ mod tests {
         assert!(dump.contains("… 7 more lines"), "ellipsis row:\n{dump}");
         assert!(dump.contains("line 12"), "tail kept:\n{dump}");
         assert!(!dump.contains("line 6"), "middle should be hidden:\n{dump}");
+    }
+
+    #[test]
+    fn info_card_is_opaque_no_transcript_bleeds_through() {
+        // A linear mouse selection over the card also grabs the transcript on the
+        // same screen rows — that is the overlay's nature, not a bleed. This pins
+        // the actual invariant: no transcript cell survives *inside* the card.
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        for _ in 0..40 {
+            app.transcript.push(
+                CellKind::Assistant,
+                String::new(),
+                "UNIQUEMARKER transcript body text".to_string(),
+            );
+        }
+        app.dialog = crate::app::Dialog::Info(crate::app::InfoDialog {
+            rows: (0..10)
+                .map(|i| (format!("key{i}"), format!("value{i}")))
+                .collect(),
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // find the card by its border, then assert its interior holds no marker
+        let dump = terminal.backend().to_string();
+        assert!(dump.contains("key0"), "card rendered:\n{dump}");
+        let rows: Vec<&str> = dump.lines().collect();
+        for (y, row) in rows.iter().enumerate() {
+            if !row.contains("key0") {
+                continue;
+            }
+            // the row containing card content must not also contain the
+            // transcript marker *within the card's columns*
+            let start = row.find('│').unwrap_or(0);
+            let end = row.rfind('│').unwrap_or(row.len());
+            let interior = &row[start..end];
+            assert!(
+                !interior.contains("UNIQUEMARKER"),
+                "transcript text found inside the card at row {y}: {interior}"
+            );
+            let _ = buffer;
+        }
     }
 
     #[test]
