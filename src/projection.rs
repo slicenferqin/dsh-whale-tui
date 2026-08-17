@@ -11,7 +11,7 @@
 //! `extra`, so a projection a future plugin adds is visible in `/context`
 //! instead of being silently dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -86,6 +86,10 @@ pub struct ContextBreakdown {
 pub struct Projections {
     /// Seq of the newest projection change applied.
     pub seq: u64,
+    /// Every key ever delivered, whatever its value. Distinguishes "the harness
+    /// sent nothing" from "it sent nulls because the session is fresh" — those
+    /// look identical if you only inspect the typed fields.
+    pub seen: BTreeSet<String>,
     /// `None` = the harness has published no todo list; `Some(vec![])` = an
     /// explicit empty list ("all done"). The distinction is meaningful.
     pub todos: Option<Vec<TodoItem>>,
@@ -102,6 +106,7 @@ impl Projections {
     /// state, so one bad payload cannot blank the UI.
     pub fn apply(&mut self, key: &str, value: &Value, seq: u64) {
         self.seq = self.seq.max(seq);
+        self.seen.insert(key.to_string());
         match key {
             "todos" => {
                 if value.is_null() {

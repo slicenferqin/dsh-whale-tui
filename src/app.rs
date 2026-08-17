@@ -564,16 +564,29 @@ impl App {
         // absent, and "no rows" is indistinguishable from "nothing happened
         // yet" — which is exactly the confusion a smoke test hits.
         if !self.demo {
+            // Name the keys. "none received yet" could not distinguish a silent
+            // pipeline from one delivering nulls on a fresh session, which is
+            // exactly the ambiguity that made a real report unreadable.
             rows.push((
                 "projections".to_string(),
-                if self.projections.seq == 0 && self.projections.context_pressure.is_none() {
+                if self.projections.seen.is_empty() {
                     if self.capabilities.projections {
-                        "mounted · none received yet".to_string()
+                        "mounted · 0 keys received".to_string()
                     } else {
                         "NOT MOUNTED".to_string()
                     }
                 } else {
-                    format!("@seq {}", self.projections.seq)
+                    format!(
+                        "{} keys @seq {} · {}",
+                        self.projections.seen.len(),
+                        self.projections.seq,
+                        self.projections
+                            .seen
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
                 },
             ));
             // ctx.goals is what a future goal write path needs; report whether
@@ -3616,9 +3629,35 @@ impl App {
                     _ => {}
                 }
             }
-            Dialog::Info(_) => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-                    self.dialog = Dialog::None;
+            Dialog::Info(info) => {
+                // Grok's /session-info offers both: y copies the whole block,
+                // c copies just the session id. A dialog you cannot get text out
+                // of is a dead end when mouse reporting owns the selection.
+                match key.code {
+                    KeyCode::Char('y') => {
+                        let text = info
+                            .rows
+                            .iter()
+                            .map(|(k, v)| format!("{k}: {v}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        self.dialog = Dialog::None;
+                        self.copy_text(text);
+                    }
+                    KeyCode::Char('c') => {
+                        let id = info
+                            .rows
+                            .iter()
+                            .find(|(k, _)| k == "session")
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_else(|| self.session_id.clone());
+                        self.dialog = Dialog::None;
+                        self.copy_text(id);
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.dialog = Dialog::None;
+                    }
+                    _ => {}
                 }
             }
             Dialog::Theme(t) => match key.code {
@@ -4261,6 +4300,37 @@ mod tests {
     }
 
     #[test]
+    fn info_dialog_can_be_copied_out() {
+        let rows = vec![
+            ("session".to_string(), "dsh-123".to_string()),
+            ("model".to_string(), "p/m".to_string()),
+        ];
+
+        // y takes the whole block, one "key: value" per line
+        let mut app = test_app();
+        app.dialog = Dialog::Info(InfoDialog { rows: rows.clone() });
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(app.dialog, Dialog::None), "copying closes the card");
+        assert!(
+            app.notice.as_deref().is_some_and(|n| n.contains("copied")),
+            "expected a copy confirmation, got {:?}",
+            app.notice
+        );
+
+        // c takes just the session id
+        let mut app = test_app();
+        app.dialog = Dialog::Info(InfoDialog { rows });
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(app.dialog, Dialog::None));
+
+        // and the close keys still close without copying
+        let mut app = test_app();
+        app.dialog = Dialog::Info(InfoDialog { rows: Vec::new() });
+        app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(app.dialog, Dialog::None));
+    }
+
+    #[test]
     fn context_rows_say_so_when_the_projection_seam_is_missing() {
         // "No rows" used to be indistinguishable from "the harness never mounted
         // dsh-session-projection", which makes a silent failure undiagnosable.
@@ -4281,10 +4351,11 @@ mod tests {
             rows.iter()
                 .find(|(k, _)| k == "projections")
                 .map(|(_, v)| v.as_str()),
-            Some("mounted · none received yet"),
+            Some("mounted · 0 keys received"),
         );
 
-        // once values flow, report the log position instead
+        // once values flow, name the keys — a count alone could not tell a silent
+        // pipeline from one delivering nulls on a fresh session
         app.projections.apply(
             "contextPressure",
             &json!({"projectedTokens": 10, "contextWindow": 100}),
@@ -4295,7 +4366,21 @@ mod tests {
             rows.iter()
                 .find(|(k, _)| k == "projections")
                 .map(|(_, v)| v.as_str()),
-            Some("@seq 42"),
+            Some("1 keys @seq 42 · contextPressure"),
+        );
+
+        // nulls on a fresh session ARE arrivals and must not read as silence
+        let mut fresh = test_app();
+        fresh.capabilities.projections = true;
+        for key in ["goal", "todos"] {
+            fresh.projections.apply(key, &Value::Null, 0);
+        }
+        let rows = fresh.context_rows();
+        assert_eq!(
+            rows.iter()
+                .find(|(k, _)| k == "projections")
+                .map(|(_, v)| v.as_str()),
+            Some("2 keys @seq 0 · goal todos"),
         );
     }
 

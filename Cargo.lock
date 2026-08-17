@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-whale-tui"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "base64",

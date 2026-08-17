@@ -620,7 +620,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-                " session info — q/Enter/Esc 关闭",
+                " session info — y 复制全部 · c 复制会话 ID · q/Enter/Esc 关闭",
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
@@ -1995,7 +1995,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
             "type search · ↑/↓ select · Enter/Tab edit · Delete remove · Esc close"
         }
         Dialog::Shortcuts(_) => "↑/↓ nav · e/Space/→ expand · ← collapse · / search · Esc close",
-        Dialog::Info(_) => "q/Enter/Esc close · Ctrl+Q quit",
+        Dialog::Info(_) => "y copy all · c copy session id · q/Enter/Esc close",
         Dialog::Subagent(_) => "↑/↓ scroll · q/Esc back · Ctrl+Q quit",
         Dialog::Tasks(_) => "↑/↓ select · r refresh · q/Esc close · Ctrl+Q quit",
         Dialog::Todos(_) => "↑/↓ select · g/G ends · y copy list · q/Esc close",
