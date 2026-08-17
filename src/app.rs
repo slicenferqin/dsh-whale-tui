@@ -97,7 +97,10 @@ pub struct AskDialog {
 
 impl AskDialog {
     fn has_pending_input(&self) -> bool {
-        self.taking_text || self.taking_feedback || !self.custom_text.is_empty() || !self.feedback.is_empty()
+        self.taking_text
+            || self.taking_feedback
+            || !self.custom_text.is_empty()
+            || !self.feedback.is_empty()
     }
 }
 
@@ -407,6 +410,13 @@ pub struct App {
     pub follow_selection: bool,
     pub composer_top: u16,
     pub needs_redraw: bool,
+    /// Is mouse reporting on? While on, the terminal routes mouse events here
+    /// and its own text selection is suppressed (Shift usually overrides that).
+    /// `/mouse` turns it off so selection and copy work natively.
+    pub mouse_capture: bool,
+    /// Set when `mouse_capture` changed and the event loop must re-issue the
+    /// escape sequence.
+    pub mouse_capture_dirty: bool,
     pub quit: bool,
     pub demo: bool,
     pub dialog: Dialog,
@@ -468,6 +478,8 @@ impl App {
             follow_selection: true,
             composer_top: 0,
             needs_redraw: true,
+            mouse_capture: true,
+            mouse_capture_dirty: false,
             quit: false,
             demo,
             dialog: Dialog::None,
@@ -700,7 +712,6 @@ impl App {
         }
     }
 
-
     pub fn has_dialog(&self) -> bool {
         !matches!(self.dialog, Dialog::None)
     }
@@ -865,7 +876,9 @@ impl App {
             }
             at = i;
         }
-        let Some((_, anchor)) = prev(at) else { return at };
+        let Some((_, anchor)) = prev(at) else {
+            return at;
+        };
         let want_word = Self::is_word_char(anchor);
         while let Some((i, c)) = prev(at) {
             if c.is_whitespace() || Self::is_word_char(c) != want_word {
@@ -885,7 +898,9 @@ impl App {
             }
             at = i;
         }
-        let Some((_, anchor)) = next(at) else { return at };
+        let Some((_, anchor)) = next(at) else {
+            return at;
+        };
         let want_word = Self::is_word_char(anchor);
         while let Some((i, c)) = next(at) {
             if c.is_whitespace() || Self::is_word_char(c) != want_word {
@@ -1136,15 +1151,13 @@ impl App {
                 session_id: self.session_id.clone(),
             });
         }
-        let row = |section: &'static str,
-                   action: &str,
-                   label: &str,
-                   shortcut: Option<&str>| PaletteRow {
-            label: label.to_string(),
-            action: action.to_string(),
-            shortcut: shortcut.map(str::to_string),
-            section,
-        };
+        let row =
+            |section: &'static str, action: &str, label: &str, shortcut: Option<&str>| PaletteRow {
+                label: label.to_string(),
+                action: action.to_string(),
+                shortcut: shortcut.map(str::to_string),
+                section,
+            };
         let mut rows = vec![
             row("Session", "New Session", "/new", Some("Ctrl+N")),
             row("Session", "Resume Session", "/resume", Some("Ctrl+S")),
@@ -1152,15 +1165,31 @@ impl App {
             row("Session", "Copy Last Response", "/copy", None),
             row("Session", "Quit", "/exit", Some("Ctrl+Q")),
             row("Context", "Rewind Conversation", "/rewind", Some("2×Esc")),
-            row("Model & Input", "Toggle Multiline", "/multiline", Some("Ctrl+M")),
-            row("Model & Input", "Prompt History", "/history", Some("Ctrl+R")),
+            row(
+                "Model & Input",
+                "Toggle Multiline",
+                "/multiline",
+                Some("Ctrl+M"),
+            ),
+            row(
+                "Model & Input",
+                "Prompt History",
+                "/history",
+                Some("Ctrl+R"),
+            ),
             row("Appearance", "Switch Theme", "/theme", None),
+            row("Appearance", "Mouse Reporting (off to select text)", "/mouse", None),
             row("Appearance", "Keyboard Shortcuts", "/help", Some("Ctrl+X")),
             row("Panels", "Prompt Queue", "/queue", Some("Ctrl+;")),
             row("Panels", "Todos", "/todos", Some("Ctrl+T")),
         ];
         if !self.catalog_loaded || self.capabilities.models {
-            rows.push(row("Model & Input", "Switch Model", "/model", Some("Ctrl+M")));
+            rows.push(row(
+                "Model & Input",
+                "Switch Model",
+                "/model",
+                Some("Ctrl+M"),
+            ));
         }
         if !self.catalog_loaded || self.capabilities.compaction {
             rows.push(row("Context", "Compact History", "/compact", None));
@@ -1384,6 +1413,11 @@ impl App {
                 section: Actions,
             },
             ShortcutRow {
+                label: "Select / copy text with the mouse",
+                keys: "hold Shift, or /mouse to turn reporting off",
+                section: Actions,
+            },
+            ShortcutRow {
                 label: "Copy selected block",
                 keys: "y",
                 section: Actions,
@@ -1585,6 +1619,15 @@ impl App {
                 }
                 let _ = self.cmd_tx.send(Cmd::SessionInfo {
                     session_id: self.session_id.clone(),
+                });
+            }
+            "/mouse" => {
+                self.mouse_capture = !self.mouse_capture;
+                self.mouse_capture_dirty = true;
+                self.notice = Some(if self.mouse_capture {
+                    "mouse on · wheel scrolls · hold Shift to select text".into()
+                } else {
+                    "mouse off · select and copy natively · /mouse to re-enable".into()
                 });
             }
             "/theme" => {
@@ -1821,18 +1864,20 @@ impl App {
                         .map(|commands| {
                             commands
                                 .iter()
-                                .filter_map(|command| Some(HarnessCommand {
-                                    name: command.get("name")?.as_str()?.to_string(),
-                                    description: command
-                                        .get("description")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    input_hint: command
-                                        .get("inputHint")
-                                        .and_then(Value::as_str)
-                                        .map(String::from),
-                                }))
+                                .filter_map(|command| {
+                                    Some(HarnessCommand {
+                                        name: command.get("name")?.as_str()?.to_string(),
+                                        description: command
+                                            .get("description")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        input_hint: command
+                                            .get("inputHint")
+                                            .and_then(Value::as_str)
+                                            .map(String::from),
+                                    })
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -1982,7 +2027,10 @@ impl App {
                     });
                 }
                 "tui/command-result" => {
-                    let kind = params.get("kind").and_then(Value::as_str).unwrap_or("success");
+                    let kind = params
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("success");
                     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
                     self.notice = Some(if text.is_empty() {
                         format!("Harness command {kind}")
@@ -2175,7 +2223,17 @@ impl App {
             AppEvent::ServerRequest { id, method, params } => {
                 self.open_dialog(id, &method, &params);
             }
-            AppEvent::Term(ev) => self.handle_key(ev),
+            AppEvent::Term(ev) => {
+                // A mouse event that changed nothing must not force a frame.
+                // Wheel and click still do; bare movement does not.
+                if let Event::Mouse(mouse) = ev {
+                    if self.handle_mouse(mouse) {
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                self.handle_key(ev);
+            }
             AppEvent::RuntimeStderr(line) => {
                 self.notice = Some(line);
             }
@@ -2313,42 +2371,50 @@ impl App {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+    /// Returns true when this event actually changed something. A mouse event
+    /// that changed nothing must not trigger a redraw — with motion reporting on
+    /// that alone made the screen judder under a moving pointer.
+    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         use crossterm::event::MouseEventKind;
 
         if self.has_dialog() {
-            return;
+            return false;
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.focus = Focus::Scrollback;
                 self.follow_selection = false;
                 self.scroll = self.scroll.saturating_add(3);
+                true
             }
             MouseEventKind::ScrollDown => {
                 self.focus = Focus::Scrollback;
                 self.follow_selection = false;
                 self.scroll = self.scroll.saturating_sub(3);
+                true
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                if mouse.row >= self.composer_top {
-                    self.focus = Focus::Prompt;
-                    self.scroll = 0;
+                // Only move focus. This used to also slam `scroll` to 0, so a
+                // click near the composer yanked the viewport to the bottom —
+                // which read as the UI jumping while trying to select text.
+                let next = if mouse.row >= self.composer_top {
+                    Focus::Prompt
                 } else {
-                    self.focus = Focus::Scrollback;
+                    Focus::Scrollback
+                };
+                if next == Focus::Scrollback {
                     self.follow_selection = true;
                 }
+                let changed = self.focus != next;
+                self.focus = next;
+                changed
             }
-            _ => {}
+            _ => false,
         }
     }
 
     fn handle_key(&mut self, ev: Event) {
         // Bracketed paste: terminals wrap IME commits and Cmd/Ctrl+V paste in
-        if let Event::Mouse(mouse) = ev {
-            self.handle_mouse(mouse);
-            return;
-        }
         // ESC[200~ ... ESC[201~. crossterm decodes that to Event::Paste, and
         // dropping it here is what made Chinese input (and any pasted text)
         // never reach the composer on modern terminals.
@@ -3857,7 +3923,10 @@ fn queue_item_from_value(value: &Value) -> Option<QueueItem> {
     let mut text_only = true;
     for block in blocks {
         if block.get("type").and_then(Value::as_str) == Some("text") {
-            let part = block.get("text").and_then(Value::as_str).unwrap_or_default();
+            let part = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             text.push_str(part);
             preview_parts.push(part.to_string());
         } else {
@@ -4001,11 +4070,8 @@ mod tests {
     #[test]
     fn ctrl_e_ends_the_line_in_the_composer_but_folds_thinking_in_the_scrollback() {
         let mut app = test_app();
-        app.transcript.push(
-            CellKind::Thinking,
-            "t".to_string(),
-            "reasoning".to_string(),
-        );
+        app.transcript
+            .push(CellKind::Thinking, "t".to_string(), "reasoning".to_string());
         for cell in &mut app.transcript.cells {
             cell.folded = false;
         }
@@ -4033,14 +4099,18 @@ mod tests {
     #[test]
     fn scrollback_autofocus_ignores_control_chords() {
         let mut app = test_app();
-        app.transcript.push(CellKind::Assistant, String::new(), "hi".to_string());
+        app.transcript
+            .push(CellKind::Assistant, String::new(), "hi".to_string());
         app.focus = Focus::Scrollback;
         app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL));
         assert!(app.input.is_empty(), "Ctrl+V must not type a literal v");
         assert_eq!(app.focus, Focus::Scrollback);
 
         app.handle_key(key(KeyCode::Char('v'), KeyModifiers::NONE));
-        assert_eq!(app.input, "v", "a bare letter still auto-focuses the composer");
+        assert_eq!(
+            app.input, "v",
+            "a bare letter still auto-focuses the composer"
+        );
     }
 
     #[test]
@@ -4051,7 +4121,10 @@ mod tests {
 
         app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input, "one\ntwo", "still editing, not recalling");
-        assert_eq!(app.cursor, 3, "column held at end of the shorter first line");
+        assert_eq!(
+            app.cursor, 3,
+            "column held at end of the shorter first line"
+        );
 
         // already on the first line, so Up now reaches for history
         app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
@@ -4107,13 +4180,96 @@ mod tests {
     }
 
     #[test]
+    fn mouse_events_that_change_nothing_do_not_request_a_redraw() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.transcript
+            .push(CellKind::Assistant, String::new(), "body".to_string());
+        let at = |kind, row| MouseEvent {
+            kind,
+            column: 10,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Bare pointer movement is the case that caused the judder: reporting it
+        // is now off, but if anything ever sends one it must not draw a frame.
+        assert!(
+            !app.handle_mouse(at(MouseEventKind::Moved, 5)),
+            "pointer movement must not request a frame"
+        );
+        assert!(!app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 5)));
+        assert!(!app.handle_mouse(at(MouseEventKind::Up(MouseButton::Left), 5)));
+
+        // Wheel still does.
+        assert!(app.handle_mouse(at(MouseEventKind::ScrollUp, 5)));
+        assert!(app.handle_mouse(at(MouseEventKind::ScrollDown, 5)));
+
+        // A click that changes focus does; the same click repeated does not.
+        app.composer_top = 30;
+        app.focus = Focus::Prompt;
+        assert!(
+            app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 5)),
+            "clicking into the scrollback changes focus"
+        );
+        assert_eq!(app.focus, Focus::Scrollback);
+        assert!(
+            !app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 5)),
+            "clicking where focus already is changes nothing"
+        );
+    }
+
+    #[test]
+    fn clicking_the_composer_does_not_yank_the_viewport() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        for i in 0..40 {
+            app.transcript
+                .push(CellKind::Assistant, String::new(), format!("line {i}"));
+        }
+        app.composer_top = 30;
+        app.focus = Focus::Scrollback;
+        app.scroll = 25;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 32, // inside the composer
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Prompt);
+        assert_eq!(
+            app.scroll, 25,
+            "a click must not scroll the transcript to the bottom"
+        );
+    }
+
+    #[test]
+    fn mouse_toggle_flags_the_event_loop_to_reissue_the_sequence() {
+        let mut app = test_app();
+        assert!(app.mouse_capture);
+        assert!(!app.mouse_capture_dirty);
+
+        app.run_command("/mouse");
+        assert!(!app.mouse_capture, "reporting off so text can be selected");
+        assert!(app.mouse_capture_dirty);
+
+        app.mouse_capture_dirty = false;
+        app.run_command("/mouse");
+        assert!(app.mouse_capture);
+        assert!(app.mouse_capture_dirty);
+    }
+
+    #[test]
     fn context_rows_say_so_when_the_projection_seam_is_missing() {
         // "No rows" used to be indistinguishable from "the harness never mounted
         // dsh-session-projection", which makes a silent failure undiagnosable.
         let mut app = test_app();
         let rows = app.context_rows();
         assert_eq!(
-            rows.iter().find(|(k, _)| k == "projections").map(|(_, v)| v.as_str()),
+            rows.iter()
+                .find(|(k, _)| k == "projections")
+                .map(|(_, v)| v.as_str()),
             Some("NOT MOUNTED"),
             "an absent seam must be stated: {rows:?}"
         );
@@ -4122,7 +4278,9 @@ mod tests {
         app.capabilities.projections = true;
         let rows = app.context_rows();
         assert_eq!(
-            rows.iter().find(|(k, _)| k == "projections").map(|(_, v)| v.as_str()),
+            rows.iter()
+                .find(|(k, _)| k == "projections")
+                .map(|(_, v)| v.as_str()),
             Some("mounted · none received yet"),
         );
 
@@ -4134,7 +4292,9 @@ mod tests {
         );
         let rows = app.context_rows();
         assert_eq!(
-            rows.iter().find(|(k, _)| k == "projections").map(|(_, v)| v.as_str()),
+            rows.iter()
+                .find(|(k, _)| k == "projections")
+                .map(|(_, v)| v.as_str()),
             Some("@seq 42"),
         );
     }
@@ -4552,7 +4712,6 @@ mod tests {
         assert_eq!(app.input, "fix authentication timeout!");
         assert_eq!(app.history_cursor, None);
     }
-
 
     #[test]
     fn ask_arrow_moves_cursor_before_submit() {

@@ -118,7 +118,12 @@ impl TodoStatus {
     /// Lenient mapping for the tool-argument fallback path, which has to cope
     /// with whatever vocabulary a non-DSH harness uses.
     fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+        match raw
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
             "in_progress" | "active" | "running" | "doing" => Self::InProgress,
             "completed" | "complete" | "done" | "finished" => Self::Completed,
             "cancelled" | "canceled" | "skipped" | "dropped" => Self::Cancelled,
@@ -456,9 +461,7 @@ impl Transcript {
         match ty {
             "user/message" => {
                 let source = data.and_then(|d| d.get("source"));
-                let kind = source
-                    .and_then(|s| s.get("kind"))
-                    .and_then(Value::as_str);
+                let kind = source.and_then(|s| s.get("kind")).and_then(Value::as_str);
                 // A goal-sourced prompt is the harness admitting a continuation
                 // round. This is the ONLY live signal for the round counter: the
                 // `goal` projection's `roundsStarted` folds `goal/change` alone,
@@ -778,7 +781,6 @@ fn render_todo_list(items: &[TodoItem]) -> String {
 }
 
 fn tool_preview(arguments: &str) -> String {
-
     let parsed = serde_json::from_str::<Value>(arguments).ok();
     let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
         return summarize(&Value::String(arguments.to_string()));
@@ -981,7 +983,6 @@ mod tests {
         assert!(!transcript.cells[0].folded);
     }
 
-
     #[test]
     fn parses_todo_snapshots_in_the_shapes_harnesses_actually_send() {
         // Claude/DSH style
@@ -991,7 +992,10 @@ mod tests {
         assert_eq!(a[1].status, TodoStatus::Pending);
 
         // alternate container + text key + status spellings
-        let b = parse_todos(r#"{"items":[{"text":"ship","state":"done"},{"title":"drop","state":"cancelled"}]}"#).unwrap();
+        let b = parse_todos(
+            r#"{"items":[{"text":"ship","state":"done"},{"title":"drop","state":"cancelled"}]}"#,
+        )
+        .unwrap();
         assert_eq!(b[0].status, TodoStatus::Completed);
         assert_eq!(b[1].status, TodoStatus::Cancelled);
 

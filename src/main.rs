@@ -24,9 +24,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -190,12 +188,12 @@ fn controller_loop(
                     "itemId": item_id,
                     "action": action,
                 });
-                if let Err(e) =
-                    rt.request("session/update-queue", Some(params), Duration::from_secs(10))
-                {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!(
-                        "queue update failed: {e}"
-                    )));
+                if let Err(e) = rt.request(
+                    "session/update-queue",
+                    Some(params),
+                    Duration::from_secs(10),
+                ) {
+                    let _ = bus.send(AppEvent::RuntimeStderr(format!("queue update failed: {e}")));
                 }
             }
             Cmd::ExecuteCommand { session_id, line } => {
@@ -568,12 +566,8 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    set_mouse_reporting(true);
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -601,6 +595,10 @@ fn main() -> Result<()> {
     }
 
     loop {
+        if app.mouse_capture_dirty {
+            set_mouse_reporting(app.mouse_capture);
+            app.mouse_capture_dirty = false;
+        }
         if app.needs_redraw {
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.needs_redraw = false;
@@ -632,14 +630,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Mouse reporting, narrowed to what we actually use.
+///
+/// crossterm's `EnableMouseCapture` also turns on `?1003h` (any-event tracking),
+/// which reports **every pointer movement** — not just drags. Each of those woke
+/// a full redraw, so simply moving the mouse across the TUI made the screen
+/// judder. We only need button press/release (`?1000h`, which also carries wheel
+/// events) plus SGR coordinates (`?1006h`) for terminals wider than 223 columns.
+///
+/// Any tracking mode suppresses the terminal's own text selection. Most
+/// terminals let you hold Shift to get it back; `/mouse` turns reporting off
+/// entirely for the ones that do not.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
+fn set_mouse_reporting(enabled: bool) {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(if enabled { MOUSE_ON } else { MOUSE_OFF }.as_bytes());
+    let _ = stdout.flush();
+}
+
 fn restore_terminal() {
     let mut stdout = std::io::stdout();
-    let _ = execute!(
-        stdout,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    );
+    let _ = stdout.write_all(MOUSE_OFF.as_bytes());
+    let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     let _ = stdout.flush();
 }

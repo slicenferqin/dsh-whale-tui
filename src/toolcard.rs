@@ -35,9 +35,19 @@ impl ToolKind {
             Self::Web
         } else if has(&["bash", "shell", "exec", "terminal", "command", "run_"]) || n == "run" {
             Self::Execute
-        } else if has(&["edit", "write", "patch", "apply", "replace", "create_file", "insert"]) {
+        } else if has(&[
+            "edit",
+            "write",
+            "patch",
+            "apply",
+            "replace",
+            "create_file",
+            "insert",
+        ]) {
             Self::Edit
-        } else if has(&["grep", "search", "glob", "find", "list_dir", "ls", "ripgrep", "rg"]) {
+        } else if has(&[
+            "grep", "search", "glob", "find", "list_dir", "ls", "ripgrep", "rg",
+        ]) {
             Self::Search
         } else if has(&["read", "cat", "view", "open", "load_file"]) {
             Self::Read
@@ -162,7 +172,11 @@ pub fn fold_preview(kind: ToolKind, body: &str) -> Vec<String> {
         out.extend(lines[lines.len() - TAIL..].iter().map(|l| l.to_string()));
         return out;
     }
-    vec![body.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ")]
+    vec![body
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")]
 }
 
 /// Style one body line. Diffs use the dedicated `diff_*` theme slots; execute
@@ -249,7 +263,8 @@ mod tests {
 
     #[test]
     fn diff_stat_counts_hunks_and_ignores_prose() {
-        let diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n ctx\n-old\n+new\n+extra\n";
+        let diff =
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n ctx\n-old\n+new\n+extra\n";
         assert_eq!(diff_stat(diff), Some((2, 1)));
 
         // prose with a single leading dash is not a diff

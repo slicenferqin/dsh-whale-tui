@@ -189,7 +189,10 @@ fn parse_goal(value: &Value) -> Option<Goal> {
     // GoalProjection nests the snapshot under `goal` and keeps the replay
     // counters beside it.
     let snapshot = obj.get("goal").and_then(Value::as_object)?;
-    let objective = snapshot.get("objective").and_then(Value::as_str)?.to_string();
+    let objective = snapshot
+        .get("objective")
+        .and_then(Value::as_str)?
+        .to_string();
     let phase = GoalPhase::parse(snapshot.get("phase").and_then(Value::as_str)?)?;
     Some(Goal {
         id: snapshot
@@ -209,7 +212,10 @@ fn parse_goal(value: &Value) -> Option<Goal> {
             .get("maxGoalRounds")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        rounds_started: obj.get("roundsStarted").and_then(Value::as_u64).unwrap_or(0),
+        rounds_started: obj
+            .get("roundsStarted")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -330,7 +336,11 @@ mod tests {
     #[test]
     fn a_malformed_known_key_does_not_clobber_good_state() {
         let mut p = Projections::default();
-        p.apply("todos", &json!([{"content": "keep me", "status": "pending"}]), 1);
+        p.apply(
+            "todos",
+            &json!([{"content": "keep me", "status": "pending"}]),
+            1,
+        );
         // not an array, and a goal missing its phase
         p.apply("todos", &json!({"nope": true}), 2);
         p.apply("goal", &json!({"goal": {"objective": "x"}}), 3);
@@ -345,7 +355,11 @@ mod tests {
         // and for goal/todos that is null. A fresh session must therefore end up
         // empty, not half-populated with defaults.
         let mut p = Projections::default();
-        p.apply("todos", &json!([{"content": "stale", "status": "pending"}]), 5);
+        p.apply(
+            "todos",
+            &json!([{"content": "stale", "status": "pending"}]),
+            5,
+        );
         p.apply(
             "goal",
             &json!({"goal":{"id":"g","revision":1,"objective":"old","phase":"active","maxGoalRounds":3},

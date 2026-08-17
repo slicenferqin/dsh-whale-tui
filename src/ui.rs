@@ -69,15 +69,13 @@ fn draw_goal_bar(f: &mut Frame, app: &App, area: Rect) {
         GoalPhase::Blocked => (app.theme.warning, "! goal"),
         GoalPhase::Complete => (app.theme.accent_success, "✓ goal"),
     };
-    let mut spans = vec![
-        Span::styled(
-            format!("  {badge} "),
-            Style::default()
-                .fg(badge_color)
-                .bg(app.theme.bg_base)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let mut spans = vec![Span::styled(
+        format!("  {badge} "),
+        Style::default()
+            .fg(badge_color)
+            .bg(app.theme.bg_base)
+            .add_modifier(Modifier::BOLD),
+    )];
     // Rounds first: it is fixed-width, so the objective takes whatever is left
     // rather than pushing the counter off a narrow terminal.
     //
@@ -96,7 +94,8 @@ fn draw_goal_bar(f: &mut Frame, app: &App, area: Rect) {
         _ if goal.max_rounds > 0 => format!(" · round {}/{}", rounds, goal.max_rounds),
         _ => String::new(),
     };
-    let used = unicode_width::UnicodeWidthStr::width(badge) + 3
+    let used = unicode_width::UnicodeWidthStr::width(badge)
+        + 3
         + unicode_width::UnicodeWidthStr::width(tail.as_str());
     let budget = (area.width as usize).saturating_sub(used).max(8);
     spans.push(Span::styled(
@@ -329,12 +328,19 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 .max(7);
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
-            let mut lines = vec![Line::from(Span::styled(
-                format!(" {} queued follow-up{}", queued.len(), if queued.len() == 1 { "" } else { "s" }),
-                Style::default()
-                    .fg(app.theme.accent_plan)
-                    .add_modifier(Modifier::BOLD),
-            )), Line::from("")];
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        " {} queued follow-up{}",
+                        queued.len(),
+                        if queued.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default()
+                        .fg(app.theme.accent_plan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
             for (index, item) in queued.iter().enumerate() {
                 let selected = index == view.selected;
                 let mark = if selected { "›" } else { " " };
@@ -462,10 +468,17 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{}{} ", if selected { "› " } else { "  " }, item.status.marker()),
+                        format!(
+                            "{}{} ",
+                            if selected { "› " } else { "  " },
+                            item.status.marker()
+                        ),
                         marker_style,
                     ),
-                    Span::styled(truncated(&item.text, w.saturating_sub(9) as usize), text_style),
+                    Span::styled(
+                        truncated(&item.text, w.saturating_sub(9) as usize),
+                        text_style,
+                    ),
                 ]));
             }
             let block = popup_block(" ◈ todos ", app.theme.accent_plan)
@@ -519,10 +532,12 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
             };
             let body = if raw {
                 text.lines()
-                    .map(|line| Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(app.theme.text_secondary),
-                    )))
+                    .map(|line| {
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(app.theme.text_secondary),
+                        ))
+                    })
                     .collect::<Vec<_>>()
             } else {
                 tool_body_lines(app, text)
@@ -548,15 +563,16 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
             let w = area.width.min(88).saturating_sub(4).max(40);
             let max_rows = area.height.saturating_sub(8).max(4) as usize;
             let shown = view.visible.len().min(max_rows);
-            let h = (shown as u16 + 5)
-                .min(area.height.saturating_sub(4))
-                .max(7);
+            let h = (shown as u16 + 5).min(area.height.saturating_sub(4)).max(7);
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
-            let mut lines = vec![Line::from(vec![
-                Span::styled(" search: ", Style::default().fg(app.theme.gray)),
-                Span::styled(&view.query, Style::default().fg(app.theme.text_primary)),
-            ]), Line::from("")];
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(" search: ", Style::default().fg(app.theme.gray)),
+                    Span::styled(&view.query, Style::default().fg(app.theme.text_primary)),
+                ]),
+                Line::from(""),
+            ];
             if view.visible.is_empty() {
                 lines.push(Line::from(Span::styled(
                     " no matching prompts",
@@ -564,7 +580,8 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 )));
             } else {
                 let start = view.selected.saturating_sub(max_rows.saturating_sub(1));
-                for (position, index) in view.visible.iter().enumerate().skip(start).take(max_rows) {
+                for (position, index) in view.visible.iter().enumerate().skip(start).take(max_rows)
+                {
                     let selected = position == view.selected;
                     let mark = if selected { "› " } else { "  " };
                     let preview = app.history[*index].replace('\n', " ");
@@ -576,7 +593,10 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(app.theme.text_secondary)
                     };
                     lines.push(Line::from(Span::styled(
-                        format!("{mark}{}", truncated(&preview, w.saturating_sub(6) as usize)),
+                        format!(
+                            "{mark}{}",
+                            truncated(&preview, w.saturating_sub(6) as usize)
+                        ),
                         style,
                     )));
                 }
@@ -1042,7 +1062,12 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
             let rect = centered_rect(w, h, area);
             f.render_widget(Clear, rect);
             let title = if q.header.is_empty() {
-                format!(" 问题 {}/{}{} ", cur + 1, n, if d.parked { " · parked" } else { "" })
+                format!(
+                    " 问题 {}/{}{} ",
+                    cur + 1,
+                    n,
+                    if d.parked { " · parked" } else { "" }
+                )
             } else {
                 format!(" {}{} ", q.header, if d.parked { " · parked" } else { "" })
             };
@@ -1966,7 +1991,9 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Rewind(_) => "↑/↓ select · Enter rewind · Esc close · Ctrl+Q quit",
         Dialog::Palette(_) => "type filter · ↑/↓ nav · Enter select · Esc close",
-        Dialog::History(_) => "type search · ↑/↓ select · Enter/Tab edit · Delete remove · Esc close",
+        Dialog::History(_) => {
+            "type search · ↑/↓ select · Enter/Tab edit · Delete remove · Esc close"
+        }
         Dialog::Shortcuts(_) => "↑/↓ nav · e/Space/→ expand · ← collapse · / search · Esc close",
         Dialog::Info(_) => "q/Enter/Esc close · Ctrl+Q quit",
         Dialog::Subagent(_) => "↑/↓ scroll · q/Esc back · Ctrl+Q quit",
@@ -2369,8 +2396,14 @@ mod tests {
         );
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let blocked = terminal.backend().to_string();
-        assert!(blocked.contains("waiting on approval"), "reason:\n{blocked}");
-        assert!(!blocked.contains("round 3/10"), "counter yields to reason:\n{blocked}");
+        assert!(
+            blocked.contains("waiting on approval"),
+            "reason:\n{blocked}"
+        );
+        assert!(
+            !blocked.contains("round 3/10"),
+            "counter yields to reason:\n{blocked}"
+        );
     }
 
     #[test]
@@ -2425,8 +2458,14 @@ mod tests {
                 }
             }
         }
-        assert!(fgs.contains(&DARK.accent_success), "completed marker colour");
-        assert!(fgs.contains(&DARK.accent_running), "in-progress marker colour");
+        assert!(
+            fgs.contains(&DARK.accent_success),
+            "completed marker colour"
+        );
+        assert!(
+            fgs.contains(&DARK.accent_running),
+            "in-progress marker colour"
+        );
         assert!(bgs.contains(&DARK.bg_highlight), "selected row highlight");
     }
 
@@ -2458,7 +2497,10 @@ mod tests {
             ("comment", DARK.syn_comment),
             ("function", DARK.syn_function),
         ] {
-            assert!(seen.contains(&color), "{label} colour missing from the frame");
+            assert!(
+                seen.contains(&color),
+                "{label} colour missing from the frame"
+            );
         }
         // and the slab background is still there behind the code
         let backgrounds: std::collections::HashSet<_> = (0..buffer.area.height)

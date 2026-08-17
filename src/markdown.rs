@@ -124,10 +124,7 @@ impl<'a> MarkdownRenderer<'a> {
         }
         let code = std::mem::take(&mut self.code_buffer);
         let lang = std::mem::take(&mut self.code_lang);
-        let slab = self
-            .base
-            .fg(self.theme.text_primary)
-            .bg(self.theme.code_bg);
+        let slab = self.base.fg(self.theme.text_primary).bg(self.theme.code_bg);
         let gutter = Span::styled("  ", slab);
         for mut spans in crate::highlight::code_lines(&code, &lang, self.theme, slab) {
             let mut row = vec![gutter.clone()];
@@ -531,8 +528,17 @@ cargo test --all && cargo clippy -- -D warnings
         let style = Style::default();
         let dark = render_cached(body, &DARK, style);
         let light = render_cached(body, &crate::theme::LIGHT, style);
-        let dark_fg: Vec<_> = dark.iter().flat_map(|l| l.spans.iter().map(|s| s.style.fg)).collect();
-        let light_fg: Vec<_> = light.iter().flat_map(|l| l.spans.iter().map(|s| s.style.fg)).collect();
-        assert_ne!(dark_fg, light_fg, "a theme switch must not serve cached colours");
+        let dark_fg: Vec<_> = dark
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.style.fg))
+            .collect();
+        let light_fg: Vec<_> = light
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.style.fg))
+            .collect();
+        assert_ne!(
+            dark_fg, light_fg,
+            "a theme switch must not serve cached colours"
+        );
     }
 }
