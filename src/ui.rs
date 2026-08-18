@@ -2029,9 +2029,9 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
                 "Enter:newline  │  Alt+Enter:send  │  Ctrl+Enter:send-now  │  Ctrl+;:queue"
             }
             Focus::Prompt => {
-                "Enter:send/queue  │  Ctrl+Enter:send-now  │  Ctrl+;:queue  │  Ctrl+P:commands"
+                "Enter:send  │  Shift+↑↓:scroll  │  Ctrl+Enter:send-now  │  Ctrl+P:commands"
             }
-            Focus::Scrollback => "↑/↓:select  │  h/l/e:fold  │  r:raw  │  Enter:view  │  y:copy",
+            Focus::Scrollback => "↑/↓:select  │  Shift+↑↓:scroll  │  h/l/e:fold  │  Enter:view  │  y:copy",
         },
     };
     let hint = if unicode_width::UnicodeWidthStr::width(hint) > area.width as usize {
@@ -2178,6 +2178,56 @@ mod tests {
         assert!(dump.contains("… 7 more lines"), "ellipsis row:\n{dump}");
         assert!(dump.contains("line 12"), "tail kept:\n{dump}");
         assert!(!dump.contains("line 6"), "middle should be hidden:\n{dump}");
+    }
+
+    #[test]
+    fn paging_after_a_resume_actually_moves_the_viewport() {
+        // End-to-end, mimicking the post-resume state: a long replayed transcript,
+        // focus on the prompt, scroll at the bottom. Asserting on `app.scroll`
+        // alone would not catch the draw clamping it back.
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        for i in 0..80 {
+            app.transcript.push(
+                CellKind::Assistant,
+                String::new(),
+                format!("history line {i}"),
+            );
+        }
+        app.focus = crate::app::Focus::Prompt;
+        app.scroll = 0;
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let bottom = terminal.backend().to_string();
+        assert!(
+            bottom.contains("history line 79"),
+            "starts at the tail:\n{bottom}"
+        );
+
+        app.handle(crate::bus::AppEvent::Term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let paged = terminal.backend().to_string();
+        assert_ne!(bottom, paged, "PageUp must change what is on screen");
+        assert!(
+            !paged.contains("history line 79"),
+            "the tail should have scrolled out of view:\n{paged}"
+        );
+
+        // and paging back returns to the tail
+        app.handle(crate::bus::AppEvent::Term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(terminal.backend().to_string().contains("history line 79"));
     }
 
     #[test]

@@ -1389,6 +1389,11 @@ impl App {
                 section: Navigation,
             },
             ShortcutRow {
+                label: "Scroll viewport (any focus)",
+                keys: "Shift+↑ / Shift+↓ · PageUp / PageDown",
+                section: Navigation,
+            },
+            ShortcutRow {
                 label: "Scroll one line",
                 keys: "Ctrl+K / Ctrl+J",
                 section: Navigation,
@@ -2788,18 +2793,29 @@ impl App {
             return;
         }
 
-        // ---- viewport paging works from either focus ----
-        // PageUp/PageDown have no meaning in a composer, and they must not be
-        // gated on scrollback focus: the mouse wheel used to be the only way to
-        // scroll while typing, and mouse reporting is off by default now. After
-        // /resume the focus is the prompt, so without this there is no way to
-        // reach the replayed history at all.
-        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        // ---- viewport scrolling works from either focus ----
+        // These must not be gated on scrollback focus: the mouse wheel used to be
+        // the only way to scroll while typing, and mouse reporting is off by
+        // default now. After /resume the focus is the prompt, so without these
+        // there is no way to reach the replayed history at all.
+        //
+        // Shift+arrows exist because laptops have no PageUp/PageDown key — Fn+↑
+        // is not a binding anyone discovers. Shift+Up/Down are unused elsewhere
+        // (Shift+Left/Right are turn navigation, handled in the scrollback block).
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let scroll_by = match key.code {
+            KeyCode::PageUp => Some(10isize),
+            KeyCode::PageDown => Some(-10),
+            KeyCode::Up if shift => Some(3),
+            KeyCode::Down if shift => Some(-3),
+            _ => None,
+        };
+        if let Some(step) = scroll_by {
             self.follow_selection = false;
-            self.scroll = if key.code == KeyCode::PageUp {
-                self.scroll.saturating_add(10)
+            self.scroll = if step > 0 {
+                self.scroll.saturating_add(step as usize)
             } else {
-                self.scroll.saturating_sub(10)
+                self.scroll.saturating_sub(step.unsigned_abs())
             };
             return;
         }
@@ -4299,6 +4315,37 @@ mod tests {
             app.scroll, 25,
             "a click must not scroll the transcript to the bottom"
         );
+    }
+
+    #[test]
+    fn shift_arrows_scroll_from_the_composer_because_laptops_lack_pageup() {
+        let mut app = test_app();
+        for i in 0..60 {
+            app.transcript
+                .push(CellKind::Assistant, String::new(), format!("line {i}"));
+        }
+        app.focus = Focus::Prompt;
+        app.scroll = 0;
+
+        app.handle_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(app.scroll, 3, "Shift+Up scrolls while typing");
+        assert_eq!(app.focus, Focus::Prompt);
+        assert!(app.input.is_empty(), "must not land in the draft");
+
+        app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.scroll, 0);
+
+        // a bare Up is still history recall, not scrolling
+        app.history.push("older".into());
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "older");
+        assert_eq!(app.scroll, 0);
+
+        // and Shift+Left/Right stay turn navigation in the scrollback
+        app.focus = Focus::Scrollback;
+        app.scroll = 5;
+        app.handle_key(key(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(app.scroll, 5, "turn navigation must not scroll the viewport");
     }
 
     #[test]

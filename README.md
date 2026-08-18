@@ -104,6 +104,8 @@ TUI 的默认 provider/model 从 ~/.dsh/settings.yaml 的 dsh-whale-tui: 块读�
 | Ctrl+G | tasks 面板：后台任务 + 活跃子代理（r 刷新） |
 | z（问题卡内） | 自由文本回答（Enter 提交 · Esc 返回选项） |
 | y / Y | 复制选中块内容 / 元数据（剪贴板三路由：native→tmux→OSC52，备份 ~/.dsh/last-copy.txt） |
+| Shift+↑ / Shift+↓ | **滚动会话视口（任何焦点）** —— 笔记本没有 PageUp 键，用这个 |
+| PageUp / PageDown | 翻页滚动（任何焦点） |
 | 选中/复制文字 | **默认就能用** —— 鼠标上报默认关闭，选区归终端 |
 | `/mouse` | 开启滚轮滚动与点击切焦点。开启后终端把鼠标交给程序，选区要按住 **Shift**（并非所有终端支持）。只开按键上报（`?1000h`+`?1006h`），不开 motion 上报 |
 | 滚动（不用鼠标） | PageUp / PageDown、Ctrl+U / Ctrl+D 半页、Ctrl+J / Ctrl+K 单行、j / k、g / G |
