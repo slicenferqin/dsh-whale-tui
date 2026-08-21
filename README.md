@@ -42,7 +42,7 @@ dsh-whale-tui 将 DSH 的完整 agent 能力带入终端：真实会话、流式
 
 ## 安装与运行
 
-前置依赖：Rust 工具链、Node.js、全局 dsh 0.1.0-rc.6。
+前置依赖：Rust 工具链、Node.js、全局 dsh 0.1.0-rc.6。发布包为原生二进制，当前支持 macOS（Apple Silicon / Intel）与 Linux x64；Windows 请使用 WSL。
 
     npm install -g @deepseek-ai/dsh@0.1.0-rc.6
 

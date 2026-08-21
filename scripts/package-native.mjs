@@ -6,7 +6,6 @@ const supported = [
   { platform: 'darwin', arch: 'arm64', file: 'dsh-whale-tui' },
   { platform: 'darwin', arch: 'x64', file: 'dsh-whale-tui' },
   { platform: 'linux', arch: 'x64', file: 'dsh-whale-tui' },
-  { platform: 'win32', arch: 'x64', file: 'dsh-whale-tui.exe' },
 ]
 
 function options(args) {

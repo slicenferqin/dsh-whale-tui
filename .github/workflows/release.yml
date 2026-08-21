@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, platform: darwin, arch: arm64, target: darwin-arm64 }
+          - { os: macos-13, platform: darwin, arch: x64, target: darwin-x64 }
+          - { os: ubuntu-24.04, platform: linux, arch: x64, target: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: rustup update stable && rustup default stable
+      # 每个目标平台都跑完整测试套件，这就是该平台的验证。
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Stage native binary
+        run: >
+          node scripts/package-native.mjs stage
+          --source target/release/dsh-whale-tui
+          --platform ${{ matrix.platform }}
+          --arch ${{ matrix.arch }}
+          --vendor-root vendor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vendor-${{ matrix.target }}
+          path: vendor/${{ matrix.target }}/dsh-whale-tui
+          if-no-files-found: error
+
+  package:
+    name: Pack npm bundle
+    needs: build-native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Tag must match npm package version
+        run: |
+          pkg="$(node -p "require('./npm/package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$pkg" = "$tag" ] || { echo "version mismatch: package.json=$pkg tag=$tag"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vendor-*
+          path: vendor-tmp
+      # artifact 不保留可执行位，逐个落位后补回。
+      - name: Assemble vendor tree
+        run: |
+          set -euo pipefail
+          mkdir -p npm/vendor
+          for d in vendor-tmp/vendor-*; do
+            target="${d##*/vendor-}"
+            mkdir -p "npm/vendor/$target"
+            cp "$d/dsh-whale-tui" "npm/vendor/$target/"
+            chmod +x "npm/vendor/$target/dsh-whale-tui"
+          done
+      - run: node scripts/package-native.mjs verify --vendor-root npm/vendor
+      - run: node --check npm/lib/index.js && node --check npm/bin/dsh-whale-tui.js
+      # 用 linux 二进制做一次无 TTY 冒烟，证明产物可执行。
+      - run: npm/vendor/linux-x64/dsh-whale-tui --dump-frame 80x24 > /dev/null
+      - name: npm pack
+        run: |
+          mkdir -p dist
+          cd npm && npm pack --pack-destination ../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tgz
+          path: dist/*.tgz
+          if-no-files-found: error
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tgz --generate-notes
