@@ -5,7 +5,7 @@
 //!   assistant/message: data.message.content[]
 //! Full taxonomy follows docs/01-grok-tui-spec.md section 4.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -220,6 +220,9 @@ pub struct Transcript {
     open_steps: HashMap<(u64, u64), OpenStep>,
     pending_tools: HashMap<String, u64>,
     last_usage: Option<UsageSample>,
+    /// 乐观上屏的用户消息 (cell index, text)：发送即上屏，等 user/message
+    /// 回执到达时认领而不是重复入列。
+    pending_user: VecDeque<(usize, String)>,
 }
 
 impl Transcript {
@@ -253,6 +256,14 @@ impl Transcript {
             link: None,
         });
         self.cells.len() - 1
+    }
+
+    /// 发送即上屏的用户消息：不等运行时回执，先把消息放进会话，回执到达时
+    /// 由 user/message 分支按文本认领（见 pending_user）。
+    pub(crate) fn push_user_optimistic(&mut self, text: String) {
+        let i = self.push(CellKind::User, String::new(), text.clone());
+        self.pending_user.push_back((i, text));
+        self.selected = Some(i);
     }
 
     pub(crate) fn from_cell(cell: Cell, selected: bool) -> Self {
@@ -483,6 +494,18 @@ impl Transcript {
                 }
                 let text = text_blocks(data);
                 if !text.is_empty() {
+                    // 发送时已乐观上屏的同文消息：认领而不是重复入列。
+                    let claimed = match self.pending_user.front() {
+                        Some((_, pending)) if *pending == text => self.pending_user.pop_front(),
+                        _ => None,
+                    };
+                    if let Some((i, _)) = claimed {
+                        if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+                            self.turns.push(TurnMarker { seq, cell: i });
+                        }
+                        self.selected = Some(i);
+                        return;
+                    }
                     let i = self.push(CellKind::User, String::new(), text);
                     if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
                         self.turns.push(TurnMarker { seq, cell: i });

@@ -49,6 +49,45 @@ pub fn detect() -> (TermKind, bool) {
     (kind, in_tmux)
 }
 
+/// 标准 base64（OSC52 载荷要求）。无依赖实现，输入是任意 UTF-8 字节流。
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// OSC52 写系统剪贴板：`\x1b]52;c;<base64>\x07`。tmux 里需要 DCS 包装且
+/// 服务端 `set-clipboard on` 才放行，否则序列被 tmux 吃掉（无害但无效）。
+pub fn osc52_copy(text: &str, in_tmux: bool) {
+    use std::io::Write;
+    let payload = base64_encode(text.as_bytes());
+    let mut out = std::io::stdout();
+    if in_tmux {
+        let _ = write!(out, "\x1bPtmux;\x1b\x1b]52;c;{payload}\x07\x1b\\");
+    } else {
+        let _ = write!(out, "\x1b]52;c;{payload}\x07");
+    }
+    let _ = out.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +102,14 @@ mod tests {
     #[test]
     fn detect_runs() {
         let _ = detect();
+    }
+
+    #[test]
+    fn base64_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode("你好".as_bytes()), "5L2g5aW9");
     }
 }

@@ -839,6 +839,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                         let current = i == wizard.model_cursor;
                         let checkbox = if model.included { "[x]" } else { "[ ]" };
                         let mut summary = String::new();
+                        if let Some(window) = model.context_window {
+                            summary.push_str(&format!("{} · ", crate::app::format_window(window)));
+                        }
                         if model.vision {
                             summary.push_str("img · ");
                         }
@@ -908,6 +911,36 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                                 }
                                 lines.push(Line::from(chips));
                             }
+                            // 上下文窗口行：Window 焦点时是编辑态（draft + 光标），
+                            // 否则显示自定义值或"默认"（适配器决定，很多端点即 256K）。
+                            let window_editing =
+                                wizard.models_focus == ModelsFocus::Window && current;
+                            let (window_value, window_style) = if window_editing {
+                                (format!("{}▌", wizard.window_draft), sel_style)
+                            } else {
+                                match model.context_window {
+                                    Some(w) => (
+                                        format!("{} ({} tokens)", crate::app::format_window(w), w),
+                                        Style::default().fg(app.theme.accent_success),
+                                    ),
+                                    None => (
+                                        "默认（适配器决定）".to_string(),
+                                        Style::default().fg(app.theme.gray),
+                                    ),
+                                }
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled("      上下文窗口 ", dim),
+                                Span::styled(window_value, window_style),
+                                Span::styled(
+                                    if window_editing {
+                                        "  tokens / 128k / 1m · Enter set · 空=默认"
+                                    } else {
+                                        "  w 编辑"
+                                    },
+                                    dim,
+                                ),
+                            ]));
                         }
                     }
                     if wizard.models.is_empty() {
@@ -2512,28 +2545,50 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
     let visible_start = composer_visible_start(all_rows.len(), layout.cursor_row);
     let visible_rows = &all_rows[visible_start..(visible_start + view_rows).min(all_rows.len())];
     let mut lines = Vec::with_capacity(visible_rows.len());
+    let text_style = Style::default()
+        .fg(app.theme.text_primary)
+        .bg(app.theme.bg_light);
+    let sel_style = Style::default()
+        .fg(app.theme.text_primary)
+        .bg(app.theme.bg_highlight);
+    let sel = app.input_selection_range();
     for (index, raw) in visible_rows.iter().enumerate() {
         let first_visual_row = visible_start + index == 0;
         let prefix = if first_visual_row { "› " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                Style::default()
-                    .fg(if app.focus == Focus::Prompt {
-                        app.theme.accent_brand
-                    } else {
-                        app.theme.gray
-                    })
-                    .bg(app.theme.bg_light)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                raw.clone(),
-                Style::default()
-                    .fg(app.theme.text_primary)
-                    .bg(app.theme.bg_light),
-            ),
-        ]));
+        let mut spans = vec![Span::styled(
+            prefix,
+            Style::default()
+                .fg(if app.focus == Focus::Prompt {
+                    app.theme.accent_brand
+                } else {
+                    app.theme.gray
+                })
+                .bg(app.theme.bg_light)
+                .add_modifier(Modifier::BOLD),
+        )];
+        // 拖选高亮：选区与本行 [row_start, row_start+len) 求交后拆三段。
+        // 行文本不含换行符，跨行选区的换行本身不涂色。
+        let row_start = layout
+            .row_starts
+            .get(visible_start + index)
+            .copied()
+            .unwrap_or(0);
+        let row_end = row_start + raw.len();
+        match sel {
+            Some((lo, hi)) if lo < row_end && hi > row_start => {
+                let s = lo.max(row_start) - row_start;
+                let e = hi.min(row_end) - row_start;
+                if s > 0 {
+                    spans.push(Span::styled(raw[..s].to_string(), text_style));
+                }
+                spans.push(Span::styled(raw[s..e].to_string(), sel_style));
+                if e < raw.len() {
+                    spans.push(Span::styled(raw[e..].to_string(), text_style));
+                }
+            }
+            _ => spans.push(Span::styled(raw.clone(), text_style)),
+        }
+        lines.push(Line::from(spans));
     }
     f.render_widget(
         Paragraph::new(lines)
@@ -2575,10 +2630,13 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
                     PS::Known => "↑/↓ select · Enter choose · o key page · Shift+Tab back · Esc",
                     PS::Models => match wizard.models_focus {
                         ModelsFocus::List => {
-                            "↑/↓ · Space include · → configure · f fetch · i add · Tab next · Esc"
+                            "↑/↓ · Space include · → configure · w window · f fetch · i add · Tab next · Esc"
                         }
                         ModelsFocus::Manual => "type model id · Enter add · Esc back",
                         ModelsFocus::Detail => "←/→ move · Space toggle · ↑/↓ row · Esc back",
+                        ModelsFocus::Window => {
+                            "tokens / 128k / 1m · Enter set · empty = 默认 · Esc back"
+                        }
                     },
                     PS::Confirm => "Enter create · Shift+Tab back · Esc cancel",
                     _ => "type value · Enter next · Shift+Tab back · Esc cancel",

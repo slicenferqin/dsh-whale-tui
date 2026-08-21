@@ -452,6 +452,8 @@ pub struct ProviderWizard {
     pub(crate) detail_col: usize,
     /// 手填模型 id 的输入缓冲（Manual 焦点）。
     pub(crate) manual: String,
+    /// 上下文窗口编辑缓冲（Window 焦点）；空 = 恢复服务商适配器默认。
+    pub(crate) window_draft: String,
     /// 模型拉取请求在飞（桥端 GET {baseURL}/models）。
     pub fetching: bool,
     pub saving: bool,
@@ -464,12 +466,13 @@ pub(crate) enum WizardKind {
     Custom,
 }
 
-/// Models 步内部的焦点：列表导航 / 手填输入 / 展开行详情。
+/// Models 步内部的焦点：列表导航 / 手填输入 / 展开行详情 / 上下文窗口编辑。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ModelsFocus {
     List,
     Manual,
     Detail,
+    Window,
 }
 
 /// 思考强度级别：(配置 id, 中文标签)。写入 reasoningEfforts 的 identity map。
@@ -489,7 +492,46 @@ pub struct ModelDraft {
     pub vision: bool,
     pub reasoning: bool,
     pub efforts: Vec<String>,
+    /// 上下文窗口（tokens）；None = 由服务商适配器按目录/默认决定。
+    pub context_window: Option<u64>,
     pub open: bool,
+}
+
+/// 解析上下文窗口输入：裸数字 / `128k` / `1m`（1024 进制）。
+/// 空串 = 清除自定义值，回到适配器默认。
+pub(crate) fn parse_window(text: &str) -> Result<Option<u64>, String> {
+    let t = text.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let (digits, mult) = if let Some(n) = t.strip_suffix('m') {
+        (n, 1_048_576u64)
+    } else if let Some(n) = t.strip_suffix('k') {
+        (n, 1024)
+    } else {
+        (t.as_str(), 1)
+    };
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| format!("invalid window \"{text}\" — e.g. 131072 / 128k / 1m"))?;
+    let total = value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("window \"{text}\" is too large"))?;
+    if total == 0 {
+        return Err("window must be positive".into());
+    }
+    Ok(Some(total))
+}
+
+/// 窗口值的紧凑展示：能整除时用 K/M（1024 进制），否则裸数字。
+pub(crate) fn format_window(tokens: u64) -> String {
+    if tokens % 1_048_576 == 0 {
+        format!("{}M", tokens / 1_048_576)
+    } else if tokens % 1024 == 0 {
+        format!("{}K", tokens / 1024)
+    } else {
+        tokens.to_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +642,7 @@ impl ProviderWizard {
             models_focus: ModelsFocus::List,
             detail_col: 0,
             manual: String::new(),
+            window_draft: String::new(),
             fetching: false,
             saving: false,
             error: None,
@@ -734,23 +777,32 @@ impl ProviderWizard {
                 "apiKey": self.api_key,
                 "models": self.models.iter()
                     .filter(|m| m.included)
-                    .map(|m| json!({
-                        "id": m.id,
-                        "vision": m.vision,
-                        "efforts": if m.reasoning { m.efforts.clone() } else { Vec::new() },
-                    }))
+                    .map(|m| {
+                        let mut entry = json!({
+                            "id": m.id,
+                            "vision": m.vision,
+                            "efforts": if m.reasoning { m.efforts.clone() } else { Vec::new() },
+                        });
+                        if let Some(window) = m.context_window {
+                            entry["contextWindow"] = json!(window);
+                        }
+                        entry
+                    })
                     .collect::<Vec<_>>(),
             }),
         }
     }
 
-    /// ↑/↓ 移动模型光标后保持焦点一致：Detail 跟随到新行（未展开则回 List）。
+    /// ↑/↓ 移动模型光标后保持焦点一致：Detail 跟随到新行（未展开则回 List）；
+    /// Window 编辑不跨行携带，光标一动就退回 List。
     pub(crate) fn sync_models_focus(&mut self) {
-        if self.models_focus == ModelsFocus::Detail {
-            match self.models.get(self.model_cursor) {
+        match self.models_focus {
+            ModelsFocus::Detail => match self.models.get(self.model_cursor) {
                 Some(model) if model.open => self.detail_col = 0,
                 _ => self.models_focus = ModelsFocus::List,
-            }
+            },
+            ModelsFocus::Window => self.models_focus = ModelsFocus::List,
+            _ => {}
         }
     }
 }
@@ -816,6 +868,9 @@ pub struct App {
     pub history_cursor: Option<usize>,
     pub history_draft: String,
     pub multiline: bool,
+    /// 输入框拖选（锚点, 移动端）字节偏移；相等即无选区。
+    /// 编辑键先删选区，移动键清除选区。
+    pub(crate) input_sel: Option<(usize, usize)>,
     pub focus: Focus,
     pub state: RunState,
     pub esc: EscArm,
@@ -906,6 +961,7 @@ impl App {
             history_cursor: None,
             history_draft: String::new(),
             multiline: false,
+            input_sel: None,
             focus: Focus::Prompt,
             state: RunState::Idle,
             esc: EscArm::None,
@@ -1148,6 +1204,9 @@ impl App {
         self.history.push(text.clone());
         self.clear_input();
         self.leave_history_navigation();
+        if !self.demo {
+            self.transcript.push_user_optimistic(text.clone());
+        }
         let _ = self.cmd_tx.send(Cmd::SendNow {
             session_id: self.session_id.clone(),
             text,
@@ -1199,6 +1258,9 @@ impl App {
         self.history_cursor = None;
         self.history_draft.clear();
         self.state = RunState::Starting;
+        // 乐观上屏：消息立刻出现在会话里，运行时回执由 transcript 按文本认领。
+        // 之前要等 user/message 回绕一圈，运行端卡住时像"没发出去"。
+        self.transcript.push_user_optimistic(text.clone());
         if self.demo {
             self.transcript.push(
                 CellKind::Assistant,
@@ -1268,6 +1330,7 @@ impl App {
             return;
         };
         self.input = text;
+        self.input_sel = None;
         self.cursor = cursor;
         self.typing_run = false;
         self.clamp_cursor();
@@ -1278,6 +1341,7 @@ impl App {
     /// queue edit, tests).
     pub fn set_input(&mut self, text: impl Into<String>) {
         self.input = text.into();
+        self.input_sel = None;
         self.cursor = self.input.len();
         self.typing_run = false;
     }
@@ -1285,10 +1349,12 @@ impl App {
     fn take_input(&mut self) -> String {
         self.push_undo(false);
         self.cursor = 0;
+        self.input_sel = None;
         std::mem::take(&mut self.input)
     }
 
     fn clear_input(&mut self) {
+        self.input_sel = None;
         if self.input.is_empty() {
             return;
         }
@@ -1297,16 +1363,41 @@ impl App {
         self.cursor = 0;
     }
 
-    fn insert_str(&mut self, text: &str) {
-        self.clamp_cursor();
+    /// 当前拖选范围（归一化、非空）；无选区返回 None。
+    pub(crate) fn input_selection_range(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.input_sel?;
+        let (lo, hi) = (a.min(b), a.max(b));
+        (lo != hi && hi <= self.input.len()).then_some((lo, hi))
+    }
+
+    /// 删除当前选区（若存在），光标落到选区起点。返回是否有选区被删。
+    /// 调用方负责后续的 undo 快照（这里只推一次）。
+    fn delete_input_selection(&mut self) -> bool {
+        let Some((lo, hi)) = self.input_selection_range() else {
+            return false;
+        };
         self.push_undo(true);
+        self.input.replace_range(lo..hi, "");
+        self.cursor = lo;
+        self.input_sel = None;
+        self.typing_run = false;
+        true
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        if !self.delete_input_selection() {
+            self.clamp_cursor();
+            self.push_undo(true);
+        }
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
 
     fn insert_char(&mut self, c: char) {
-        self.clamp_cursor();
-        self.push_undo(true);
+        if !self.delete_input_selection() {
+            self.clamp_cursor();
+            self.push_undo(true);
+        }
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
@@ -1389,36 +1480,42 @@ impl App {
     }
 
     fn cursor_left(&mut self) {
+        self.input_sel = None;
         self.clamp_cursor();
         self.cursor = self.prev_boundary(self.cursor);
         self.typing_run = false;
     }
 
     fn cursor_right(&mut self) {
+        self.input_sel = None;
         self.clamp_cursor();
         self.cursor = self.next_boundary(self.cursor);
         self.typing_run = false;
     }
 
     fn cursor_word_left(&mut self) {
+        self.input_sel = None;
         self.clamp_cursor();
         self.cursor = self.word_start_before(self.cursor);
         self.typing_run = false;
     }
 
     fn cursor_word_right(&mut self) {
+        self.input_sel = None;
         self.clamp_cursor();
         self.cursor = self.word_end_after(self.cursor);
         self.typing_run = false;
     }
 
     fn cursor_line_start(&mut self) {
+        self.input_sel = None;
         self.clamp_cursor();
         self.cursor = self.line_start(self.cursor);
         self.typing_run = false;
     }
 
     fn cursor_line_end(&mut self) {
+        self.input_sel = None;
         self.clamp_cursor();
         self.cursor = self.line_end(self.cursor);
         self.typing_run = false;
@@ -1428,6 +1525,7 @@ impl App {
     /// Returns false when there is no line to move onto, so the caller can
     /// fall back to history navigation.
     fn move_cursor_line(&mut self, delta: i32) -> bool {
+        self.input_sel = None;
         self.clamp_cursor();
         if !self.input.contains('\n') {
             return false;
@@ -1460,6 +1558,9 @@ impl App {
     }
 
     fn backspace(&mut self) {
+        if self.delete_input_selection() {
+            return;
+        }
         self.clamp_cursor();
         if self.cursor == 0 {
             return;
@@ -1471,6 +1572,9 @@ impl App {
     }
 
     fn delete_forward(&mut self) {
+        if self.delete_input_selection() {
+            return;
+        }
         self.clamp_cursor();
         if self.cursor >= self.input.len() {
             return;
@@ -1481,6 +1585,9 @@ impl App {
     }
 
     fn delete_word_before(&mut self) {
+        if self.delete_input_selection() {
+            return;
+        }
         self.clamp_cursor();
         let start = self.word_start_before(self.cursor);
         if start == self.cursor {
@@ -1492,6 +1599,9 @@ impl App {
     }
 
     fn delete_word_after(&mut self) {
+        if self.delete_input_selection() {
+            return;
+        }
         self.clamp_cursor();
         let end = self.word_end_after(self.cursor);
         if end == self.cursor {
@@ -1502,6 +1612,9 @@ impl App {
     }
 
     fn delete_to_line_start(&mut self) {
+        if self.delete_input_selection() {
+            return;
+        }
         self.clamp_cursor();
         let start = self.line_start(self.cursor);
         if start == self.cursor {
@@ -1513,6 +1626,9 @@ impl App {
     }
 
     fn delete_to_line_end(&mut self) {
+        if self.delete_input_selection() {
+            return;
+        }
         self.clamp_cursor();
         let end = self.line_end(self.cursor);
         if end == self.cursor {
@@ -2264,6 +2380,7 @@ impl App {
                             vision: false,
                             reasoning: false,
                             efforts: Vec::new(),
+                            context_window: None,
                             open: false,
                         });
                         wizard.model_cursor = wizard.models.len() - 1;
@@ -2272,6 +2389,17 @@ impl App {
                     wizard.models_focus = ModelsFocus::List;
                 }
                 ModelsFocus::Detail => wizard_toggle_detail(wizard),
+                ModelsFocus::Window => match parse_window(&wizard.window_draft) {
+                    Ok(value) => {
+                        if let Some(model) = wizard.models.get_mut(wizard.model_cursor) {
+                            model.context_window = value;
+                        }
+                        wizard.window_draft.clear();
+                        wizard.error = None;
+                        wizard.models_focus = ModelsFocus::List;
+                    }
+                    Err(message) => wizard.error = Some(message),
+                },
             },
             ProviderStep::Confirm => {
                 // 自定义路由至少一个模型（宿主 resolveRouteModels 对目录外
@@ -2599,17 +2727,30 @@ impl App {
                         wizard.fetching = false;
                         if ok {
                             let mut added = 0usize;
-                            for id in params
+                            // 桥端 0.1.60+ 发对象 { id, contextWindow? }；兼容旧形态纯 id 字符串。
+                            for (id, context_window) in params
                                 .get("models")
                                 .and_then(Value::as_array)
                                 .map(|list| {
-                                    list.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+                                    list.iter()
+                                        .filter_map(|entry| {
+                                            if let Some(id) = entry.as_str() {
+                                                return Some((id.to_string(), None));
+                                            }
+                                            let id = entry.get("id")?.as_str()?.to_string();
+                                            let window = entry
+                                                .get("contextWindow")
+                                                .and_then(Value::as_u64)
+                                                .filter(|w| *w > 0);
+                                            Some((id, window))
+                                        })
+                                        .collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default()
                             {
                                 if !wizard.models.iter().any(|m| m.id == id) {
                                     wizard.models.push(ModelDraft {
-                                        id: id.to_string(),
+                                        id,
                                         included: true,
                                         vision: false,
                                         reasoning: true,
@@ -2620,6 +2761,7 @@ impl App {
                                             "xhigh".into(),
                                             "max".into(),
                                         ],
+                                        context_window,
                                         open: false,
                                     });
                                     added += 1;
@@ -3310,42 +3452,80 @@ impl App {
                     let changed = self.focus != Focus::Scrollback;
                     self.focus = Focus::Scrollback;
                     self.follow_selection = true;
+                    self.input_sel = None;
                     return changed;
                 }
                 let mut changed = self.focus != Focus::Prompt;
                 self.focus = Focus::Prompt;
-                // 点击文本区内（非边框）时把光标搬到点击处：grok 的
-                // click-to-position，免去长按方向键。
+                // 点击文本区内（非边框）时把光标搬到点击处并下锚：grok 的
+                // click-to-position，也是拖选的起点。
                 if mouse.row > self.composer_top
                     && (self.composer_bottom == 0 || mouse.row + 1 < self.composer_bottom)
                 {
-                    let layout = crate::ui::composer_layout(
-                        &self.input,
-                        self.cursor,
-                        self.composer_inner_width,
-                    );
-                    let visible_start =
-                        crate::ui::composer_visible_start(layout.rows.len(), layout.cursor_row);
-                    let row = visible_start + (mouse.row - self.composer_top - 1) as usize;
-                    // 左边框 1 列 + "› " 前缀 2 列。
-                    let col = (mouse.column as usize).saturating_sub(3);
-                    let offset = crate::ui::composer_offset_at(
-                        &self.input,
-                        self.composer_inner_width,
-                        row,
-                        col,
-                    );
+                    let offset = self.composer_offset_at_mouse(mouse.column, mouse.row);
+                    self.input_sel = Some((offset, offset));
                     if offset != self.cursor {
                         self.cursor = offset;
                         self.typing_run = false;
                         self.leave_history_navigation();
                         changed = true;
                     }
+                } else {
+                    self.input_sel = None;
                 }
                 changed
             }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                // 只有锚点在 composer 里落下的拖动才是文本选择（?1000h 有
+                // Drag 事件，无需 any-event 跟踪）。
+                let Some((anchor, _)) = self.input_sel else {
+                    return false;
+                };
+                let head = self.composer_offset_at_mouse(mouse.column, mouse.row);
+                if head == anchor && self.input_selection_range().is_none() {
+                    return false;
+                }
+                self.input_sel = Some((anchor, head));
+                self.cursor = head;
+                true
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                // 拖选结束：OSC52 写系统剪贴板。终端不支持时选区仍在，
+                // 可直接输入替换或 Backspace 删除。
+                let Some((lo, hi)) = self.input_selection_range() else {
+                    return false;
+                };
+                let text = self.input[lo..hi].to_string();
+                crate::term::osc52_copy(&text, self.in_tmux);
+                self.set_notice(format!(
+                    "copied {} chars · 终端不放行 OSC52 时 /mouse 关捕获后原生选择",
+                    text.chars().count()
+                ));
+                true
+            }
             _ => false,
         }
+    }
+
+    /// 鼠标坐标 → input 字节偏移。越出文本区上沿取可视窗首行起点，越出下沿
+    /// 取可视窗末行末尾（与点击定位同一映射，drag 越界时行为可预期）。
+    fn composer_offset_at_mouse(&self, column: u16, row: u16) -> usize {
+        let width = self.composer_inner_width.max(1);
+        let layout = crate::ui::composer_layout(&self.input, self.cursor, width);
+        let visible_start = crate::ui::composer_visible_start(layout.rows.len(), layout.cursor_row);
+        if row <= self.composer_top {
+            return layout.row_starts[visible_start];
+        }
+        if self.composer_bottom != 0 && row + 1 >= self.composer_bottom {
+            let last = (visible_start + crate::ui::COMPOSER_VIEW_ROWS)
+                .min(layout.rows.len())
+                .saturating_sub(1);
+            return crate::ui::composer_offset_at(&self.input, width, last, usize::MAX / 2);
+        }
+        let row_idx = visible_start + (row - self.composer_top - 1) as usize;
+        // 左边框 1 列 + "› " 前缀 2 列。
+        let col = (column as usize).saturating_sub(3);
+        crate::ui::composer_offset_at(&self.input, width, row_idx, col)
     }
 
     /// 鼠标点击弹窗选项行：把选择光标搬到被点项，再注入一次 Enter，
@@ -4236,6 +4416,14 @@ impl App {
                 if wizard.step == ProviderStep::Models && wizard.models_focus == ModelsFocus::Manual
                 {
                     wizard.manual.push_str(&text);
+                } else if wizard.step == ProviderStep::Models
+                    && wizard.models_focus == ModelsFocus::Window
+                {
+                    let digits: String = text
+                        .chars()
+                        .filter(|c| c.is_ascii_digit() || matches!(c, 'k' | 'K' | 'm' | 'M'))
+                        .collect();
+                    wizard.window_draft.push_str(&digits);
                 } else if wizard.editing_text() {
                     wizard.draft.push_str(&text);
                 }
@@ -4989,37 +5177,58 @@ impl App {
                         }
                     }
                     // ---- 选项光标的上下移动（Type/Known/Api 词表/Models 列表）----
-                    KeyCode::Up | KeyCode::Char('k') => match wizard.step {
-                        ProviderStep::Type => wizard.type_sel = wizard.type_sel.saturating_sub(1),
-                        ProviderStep::Known => {
-                            wizard.catalog_sel = wizard.catalog_sel.saturating_sub(1)
+                    // vim 的 k/j 不能抢文本焦点（手填模型 id / 窗口编辑里的字面 k/j）。
+                    KeyCode::Up | KeyCode::Char('k')
+                        if key.code == KeyCode::Up
+                            || !(wizard.step == ProviderStep::Models
+                                && matches!(
+                                    wizard.models_focus,
+                                    ModelsFocus::Manual | ModelsFocus::Window
+                                )) =>
+                    {
+                        match wizard.step {
+                            ProviderStep::Type => {
+                                wizard.type_sel = wizard.type_sel.saturating_sub(1)
+                            }
+                            ProviderStep::Known => {
+                                wizard.catalog_sel = wizard.catalog_sel.saturating_sub(1)
+                            }
+                            ProviderStep::Api if !wizard.protocols.is_empty() => {
+                                wizard.proto_sel = wizard.proto_sel.saturating_sub(1)
+                            }
+                            ProviderStep::Models => {
+                                wizard.model_cursor = wizard.model_cursor.saturating_sub(1);
+                                wizard.sync_models_focus();
+                            }
+                            _ => {}
                         }
-                        ProviderStep::Api if !wizard.protocols.is_empty() => {
-                            wizard.proto_sel = wizard.proto_sel.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if key.code == KeyCode::Down
+                            || !(wizard.step == ProviderStep::Models
+                                && matches!(
+                                    wizard.models_focus,
+                                    ModelsFocus::Manual | ModelsFocus::Window
+                                )) =>
+                    {
+                        match wizard.step {
+                            ProviderStep::Type => wizard.type_sel = (wizard.type_sel + 1).min(1),
+                            ProviderStep::Known => {
+                                wizard.catalog_sel = (wizard.catalog_sel + 1)
+                                    .min(wizard.catalog.len().saturating_sub(1))
+                            }
+                            ProviderStep::Api if !wizard.protocols.is_empty() => {
+                                wizard.proto_sel = (wizard.proto_sel + 1)
+                                    .min(wizard.protocols.len().saturating_sub(1))
+                            }
+                            ProviderStep::Models => {
+                                wizard.model_cursor = (wizard.model_cursor + 1)
+                                    .min(wizard.models.len().saturating_sub(1));
+                                wizard.sync_models_focus();
+                            }
+                            _ => {}
                         }
-                        ProviderStep::Models => {
-                            wizard.model_cursor = wizard.model_cursor.saturating_sub(1);
-                            wizard.sync_models_focus();
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Down | KeyCode::Char('j') => match wizard.step {
-                        ProviderStep::Type => wizard.type_sel = (wizard.type_sel + 1).min(1),
-                        ProviderStep::Known => {
-                            wizard.catalog_sel =
-                                (wizard.catalog_sel + 1).min(wizard.catalog.len().saturating_sub(1))
-                        }
-                        ProviderStep::Api if !wizard.protocols.is_empty() => {
-                            wizard.proto_sel =
-                                (wizard.proto_sel + 1).min(wizard.protocols.len().saturating_sub(1))
-                        }
-                        ProviderStep::Models => {
-                            wizard.model_cursor = (wizard.model_cursor + 1)
-                                .min(wizard.models.len().saturating_sub(1));
-                            wizard.sync_models_focus();
-                        }
-                        _ => {}
-                    },
+                    }
                     // ---- Models 步的左右与焦点 ----
                     KeyCode::Right if wizard.step == ProviderStep::Models => {
                         match wizard.models_focus {
@@ -5034,7 +5243,7 @@ impl App {
                                 wizard.detail_col =
                                     (wizard.detail_col + 1).min(1 + EFFORT_LEVELS.len())
                             }
-                            ModelsFocus::Manual => {}
+                            _ => {}
                         }
                     }
                     KeyCode::Left if wizard.step == ProviderStep::Models => {
@@ -5052,7 +5261,7 @@ impl App {
                                 }
                             }
                             ModelsFocus::Detail => wizard_toggle_detail(wizard),
-                            ModelsFocus::Manual => wizard.manual.push(' '),
+                            _ => {}
                         }
                     }
                     KeyCode::Char('f')
@@ -5078,6 +5287,21 @@ impl App {
                     {
                         wizard.models_focus = ModelsFocus::Manual;
                     }
+                    // 上下文窗口编辑：预填当前值（裸 tokens），行展开以露出编辑行。
+                    KeyCode::Char('w')
+                        if plain
+                            && wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::List =>
+                    {
+                        if let Some(model) = wizard.models.get_mut(wizard.model_cursor) {
+                            wizard.window_draft = model
+                                .context_window
+                                .map(|w| w.to_string())
+                                .unwrap_or_default();
+                            model.open = true;
+                            wizard.models_focus = ModelsFocus::Window;
+                        }
+                    }
                     KeyCode::Char('o') if plain && wizard.step == ProviderStep::Known => {
                         if let Some(page) = wizard
                             .catalog
@@ -5093,6 +5317,10 @@ impl App {
                             && wizard.models_focus == ModelsFocus::Manual
                         {
                             wizard.manual.pop();
+                        } else if wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::Window
+                        {
+                            wizard.window_draft.pop();
                         } else if wizard.editing_text() {
                             wizard.draft.pop();
                         }
@@ -5102,6 +5330,13 @@ impl App {
                             && wizard.models_focus == ModelsFocus::Manual
                         {
                             wizard.manual.push(c);
+                        } else if wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::Window
+                        {
+                            // 只收数字与 k/m 后缀，其余字符无意义。
+                            if c.is_ascii_digit() || matches!(c, 'k' | 'K' | 'm' | 'M') {
+                                wizard.window_draft.push(c);
+                            }
                         } else if wizard.editing_text() {
                             wizard.draft.push(c);
                         }
@@ -7025,6 +7260,7 @@ mod tests {
                     vision: false,
                     reasoning: false,
                     efforts: vec![],
+                    context_window: None,
                     open: false,
                 },
                 ModelDraft {
@@ -7033,6 +7269,7 @@ mod tests {
                     vision: true,
                     reasoning: true,
                     efforts: vec!["low".into(), "high".into(), "ultra".into()],
+                    context_window: Some(131_072),
                     open: false,
                 },
             ];
@@ -7051,7 +7288,7 @@ mod tests {
             draft["models"],
             json!([
                 { "id": "model-a", "vision": false, "efforts": [] },
-                { "id": "model-b", "vision": true, "efforts": ["low", "high", "ultra"] },
+                { "id": "model-b", "vision": true, "efforts": ["low", "high", "ultra"], "contextWindow": 131072 },
             ])
         );
         // 成功：面板关闭、通知、后台刷新目录。
@@ -7355,5 +7592,196 @@ mod tests {
             panic!("key dialog stays open");
         };
         assert_eq!(dialog.draft, "sk-replaced");
+    }
+
+    #[test]
+    fn parse_window_accepts_plain_and_suffixed_values() {
+        assert_eq!(parse_window("").unwrap(), None);
+        assert_eq!(parse_window("  ").unwrap(), None);
+        assert_eq!(parse_window("131072").unwrap(), Some(131_072));
+        assert_eq!(parse_window("128k").unwrap(), Some(131_072));
+        assert_eq!(parse_window("1M").unwrap(), Some(1_048_576));
+        assert!(parse_window("abc").is_err());
+        assert!(parse_window("0").is_err());
+        assert_eq!(format_window(131_072), "128K");
+        assert_eq!(format_window(1_048_576), "1M");
+        assert_eq!(format_window(200_000), "200000");
+    }
+
+    #[test]
+    fn provider_wizard_window_edit_commits_to_model() {
+        let mut app = test_app();
+        app.run_command("/provider add");
+        let Dialog::Provider(wizard) = &mut app.dialog else {
+            panic!("expected provider wizard");
+        };
+        wizard.step = ProviderStep::Models;
+        wizard.models.push(ModelDraft {
+            id: "model-a".into(),
+            included: true,
+            vision: false,
+            reasoning: false,
+            efforts: vec![],
+            context_window: None,
+            open: false,
+        });
+        // w 打开窗口编辑（行随之展开），输入带后缀的值，Enter 提交。
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::NONE));
+        for c in "256k".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert_eq!(wizard.models[0].context_window, Some(262_144));
+        assert_eq!(wizard.models_focus, ModelsFocus::List);
+        // 再次进入并清空：恢复默认（None）。
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert_eq!(wizard.models[0].context_window, Some(262_144));
+        // 上一步预填了旧值，清空需要退格；这里直接清空缓冲模拟。
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::NONE));
+        let Dialog::Provider(wizard) = &mut app.dialog else {
+            panic!("wizard stays open");
+        };
+        wizard.window_draft.clear();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert_eq!(wizard.models[0].context_window, None);
+        // 非法输入：报错、保持编辑态、不改值。
+        app.handle_key(key(KeyCode::Char('w'), KeyModifiers::NONE));
+        let Dialog::Provider(wizard) = &mut app.dialog else {
+            panic!("wizard stays open");
+        };
+        wizard.window_draft = "abc".into();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert_eq!(wizard.models_focus, ModelsFocus::Window);
+        assert!(wizard.error.as_deref().unwrap().contains("invalid window"));
+    }
+
+    #[test]
+    fn provider_wizard_models_fetched_reads_context_window_objects() {
+        let mut app = test_app();
+        app.run_command("/provider add");
+        let Dialog::Provider(wizard) = &mut app.dialog else {
+            panic!("expected provider wizard");
+        };
+        wizard.step = ProviderStep::Models;
+        wizard.fetching = true;
+        app.handle(AppEvent::Rpc {
+            method: "tui/models-fetched".into(),
+            params: json!({
+                "ok": true,
+                "models": [
+                    { "id": "m-with-window", "contextWindow": 1048576 },
+                    { "id": "m-no-window" },
+                    "m-legacy-string"
+                ]
+            }),
+        });
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert!(!wizard.fetching);
+        assert_eq!(wizard.models.len(), 3);
+        assert_eq!(wizard.models[0].context_window, Some(1_048_576));
+        assert_eq!(wizard.models[1].context_window, None);
+        assert_eq!(wizard.models[2].id, "m-legacy-string");
+        assert_eq!(wizard.models[2].context_window, None);
+    }
+
+    #[test]
+    fn send_shows_prompt_immediately_and_echo_claims_it() {
+        let mut app = test_app();
+        app.set_input("hello world");
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        // 乐观上屏：消息立刻可见，不等运行时回执。
+        assert_eq!(app.transcript.cells.len(), 1);
+        assert_eq!(app.transcript.cells[0].kind, CellKind::User);
+        assert_eq!(app.transcript.cells[0].text, "hello world");
+        // 同文回执到达：认领而不是重复入列；turn marker 记到同一 cell。
+        app.handle(AppEvent::Rpc {
+            method: "session.event".into(),
+            params: json!({
+                "sessionId": "s1",
+                "event": {
+                    "seq": 7,
+                    "type": "user/message",
+                    "data": {
+                        "source": { "kind": "user" },
+                        "content": [ { "type": "text", "text": "hello world" } ]
+                    }
+                }
+            }),
+        });
+        assert_eq!(app.transcript.cells.len(), 1);
+        assert_eq!(app.transcript.turns.len(), 1);
+        assert_eq!(app.transcript.turns[0].cell, 0);
+        // 不同文本的 user/message 正常入列（队列里的陈旧项不抢）。
+        app.handle(AppEvent::Rpc {
+            method: "session.event".into(),
+            params: json!({
+                "sessionId": "s1",
+                "event": {
+                    "seq": 8,
+                    "type": "user/message",
+                    "data": {
+                        "source": { "kind": "user" },
+                        "content": [ { "type": "text", "text": "another prompt" } ]
+                    }
+                }
+            }),
+        });
+        assert_eq!(app.transcript.cells.len(), 2);
+        assert_eq!(app.transcript.cells[1].text, "another prompt");
+    }
+
+    #[test]
+    fn composer_drag_selects_and_edit_keys_replace_the_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.set_input("hello world");
+        // 布局几何：composer 在 30 行起、两行高（边框 + 一行文本）。
+        app.composer_top = 30;
+        app.composer_bottom = 33;
+        app.composer_inner_width = 40;
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 在 "hello" 的 h 前按下，拖到 "world" 的 r 后：选中 "hello wor"。
+        assert!(app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 3, 31)));
+        assert!(app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 12, 31)));
+        assert_eq!(app.input_selection_range(), Some((0, 9)));
+        assert_eq!(app.cursor, 9, "移动端即光标");
+        // 键盘输入替换选区。
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(app.input, "Xld");
+        assert_eq!(app.input_selection_range(), None);
+        // 再选 "Xl"，Backspace 删除选区而不是单字符（重复点击同位置无视觉
+        // 变化，返回 false，但锚点照常落下）。
+        app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 3, 31));
+        assert!(app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 5, 31)));
+        assert_eq!(app.input_selection_range(), Some((0, 2)));
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input, "d");
+        assert_eq!(app.cursor, 0);
+        // 光标移动清除选区（同样是重复位置的点击）。
+        app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 3, 31));
+        assert!(app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 4, 31)));
+        assert_eq!(app.input_selection_range(), Some((0, 1)));
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.input_selection_range(), None);
     }
 }

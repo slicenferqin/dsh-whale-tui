@@ -925,9 +925,17 @@ function apply(ctx) {
       throw new Error(`GET ${url} answered HTTP ${response.status}`)
     }
     const data = await response.json()
+    // OpenAI 兼容端点只保证 id；部分网关（OpenRouter 等）额外给
+    // context_length / context_window，带上可省掉手填。
     const models = (Array.isArray(data?.data) ? data.data : [])
-      .map((entry) => entry?.id)
-      .filter((id) => typeof id === 'string' && id !== '')
+      .map((entry) => {
+        const id = entry?.id
+        if (typeof id !== 'string' || id === '') return null
+        const raw = entry.context_length ?? entry.context_window ?? entry.contextWindow
+        const contextWindow = Number.isInteger(raw) && raw > 0 ? raw : undefined
+        return contextWindow === undefined ? { id } : { id, contextWindow }
+      })
+      .filter((model) => model !== null)
     return { models }
   }
 
@@ -1020,6 +1028,10 @@ function apply(ctx) {
               model.reasoningEfforts = Object.fromEntries(
                 entry.efforts.filter((e) => typeof e === 'string' && e !== '').map((e) => [e, e]),
               )
+            }
+            // 上下文窗口：缺省时由适配器按目录/默认（常见 256K）决定。
+            if (Number.isInteger(entry.contextWindow) && entry.contextWindow > 0) {
+              model.contextWindow = entry.contextWindow
             }
             return model
           })
