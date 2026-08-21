@@ -89,7 +89,10 @@ fn session_file(dir: &Path) -> Option<PathBuf> {
 /// skip_id. Best effort: unreadable files are skipped, never an error.
 pub fn list_sessions(workspace: &str, skip_id: &str) -> Vec<SessionSummary> {
     let slug = workspace_slug(workspace);
-    let mut out: Vec<SessionSummary> = Vec::new();
+    // 先 stat 后解析：候选文件全部读 mtime（便宜），按新到旧排序后只
+    // 全量解析排在前面的。原来对每个会话都解压+解析整个 JSONL（可能
+    // 数 MB），会话一多 /resume 就把 UI 线程卡死。
+    let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
     for root in session_roots() {
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(root.join(&slug)) {
@@ -102,17 +105,29 @@ pub fn list_sessions(workspace: &str, skip_id: &str) -> Vec<SessionSummary> {
             let Some(file) = session_file(&dir) else {
                 continue;
             };
-            let Some(summary) = summarize(&file) else {
-                continue;
-            };
-            if summary.id == skip_id || out.iter().any(|s| s.id == summary.id) {
+            let modified = std::fs::metadata(&file)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if candidates.iter().any(|(f, _)| *f == file) {
                 continue;
             }
-            out.push(summary);
+            candidates.push((file, modified));
         }
     }
-    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
-    out.truncate(50);
+    candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    let mut out: Vec<SessionSummary> = Vec::new();
+    for (file, _) in candidates {
+        if out.len() >= 50 {
+            break;
+        }
+        let Some(summary) = summarize(&file) else {
+            continue;
+        };
+        if summary.id == skip_id || out.iter().any(|s| s.id == summary.id) {
+            continue;
+        }
+        out.push(summary);
+    }
     out
 }
 

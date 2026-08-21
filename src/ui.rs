@@ -8,7 +8,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, Dialog, Focus, RunState, ShortcutSection};
+use crate::app::{App, Dialog, DialogHit, Focus, RunState, ShortcutSection};
 use crate::resume::age_label;
 use crate::transcript::{CellKind, Transcript};
 
@@ -42,6 +42,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
     app.composer_top = chunks[5].y;
+    app.composer_bottom = chunks[5].bottom();
+    app.composer_inner_width = chunks[5].width.saturating_sub(5).max(1);
     draw_status(f, app, chunks[0]);
     draw_stats(f, app, chunks[1], &stats_lines);
     draw_scrollback(f, app, chunks[2]);
@@ -52,7 +54,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_composer(f, app, chunks[5]);
     draw_shortcuts(f, app, chunks[6]);
     if app.has_dialog() {
-        draw_dialog(f, app, area);
+        app.dialog_hits = draw_dialog(f, app, area);
+    } else {
+        app.dialog_hits.clear();
     }
 }
 
@@ -127,21 +131,24 @@ fn composer_height(input: &str, content_width: u16) -> u16 {
 }
 
 /// How many wrapped rows the composer shows at once.
-const COMPOSER_VIEW_ROWS: usize = 5;
+pub(crate) const COMPOSER_VIEW_ROWS: usize = 5;
 
 /// Wrapped composer rows plus where the caret lands in them. `cursor` is a byte
 /// offset into `input`; the caret is placed *before* the character at that
 /// offset, so a caret sitting on a wrap point renders at the start of the next
 /// row rather than off the right edge.
-struct ComposerLayout {
-    rows: Vec<String>,
-    cursor_row: usize,
-    cursor_col: usize,
+pub(crate) struct ComposerLayout {
+    pub(crate) rows: Vec<String>,
+    /// 每个可视行在 input 里的起始字节偏移——鼠标点击反查光标位置用。
+    pub(crate) row_starts: Vec<usize>,
+    pub(crate) cursor_row: usize,
+    pub(crate) cursor_col: usize,
 }
 
-fn composer_layout(input: &str, cursor: usize, content_width: u16) -> ComposerLayout {
+pub(crate) fn composer_layout(input: &str, cursor: usize, content_width: u16) -> ComposerLayout {
     let width = content_width.max(1) as usize;
     let mut rows: Vec<String> = Vec::new();
+    let mut row_starts: Vec<usize> = vec![0];
     let mut row = String::new();
     let mut row_width = 0usize;
     let mut cursor_row = 0usize;
@@ -155,12 +162,14 @@ fn composer_layout(input: &str, cursor: usize, content_width: u16) -> ComposerLa
                 placed = true;
             }
             rows.push(std::mem::take(&mut row));
+            row_starts.push(offset + 1);
             row_width = 0;
             continue;
         }
         let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if char_width > 0 && row_width > 0 && row_width + char_width > width {
             rows.push(std::mem::take(&mut row));
+            row_starts.push(offset);
             row_width = 0;
         }
         if offset == cursor {
@@ -178,9 +187,40 @@ fn composer_layout(input: &str, cursor: usize, content_width: u16) -> ComposerLa
     rows.push(row);
     ComposerLayout {
         rows,
+        row_starts,
         cursor_row,
         cursor_col,
     }
+}
+
+/// 点击坐标反查：可视行 row、显示列 col（去掉边框和 "› " 前缀后的相对值）
+/// 映射回 input 的字节偏移。落在行内某字符上取该字符之前，越过行尾取行尾，
+/// 越过最后一行取文末——与 grok 点击定位的行为一致。
+pub(crate) fn composer_offset_at(input: &str, content_width: u16, row: usize, col: usize) -> usize {
+    let layout = composer_layout(input, 0, content_width);
+    let Some(row_text) = layout.rows.get(row) else {
+        return input.len();
+    };
+    let start = layout.row_starts[row];
+    let mut used = 0usize;
+    for (off, ch) in row_text.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col < used + w {
+            return start + off;
+        }
+        used += w;
+    }
+    start + row_text.len()
+}
+
+/// 与 draw_composer 同一个窗口锚定逻辑：贴尾，光标在窗口上方则上拉。
+pub(crate) fn composer_visible_start(rows: usize, cursor_row: usize) -> usize {
+    let view_rows = rows.min(COMPOSER_VIEW_ROWS);
+    let mut start = rows.saturating_sub(view_rows);
+    if cursor_row < start {
+        start = cursor_row;
+    }
+    start
 }
 
 fn composer_rows(input: &str, content_width: u16) -> Vec<String> {
@@ -237,16 +277,24 @@ fn pretty_outcome(s: &str) -> &str {
     }
 }
 
-fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
+/// 记录一行可点击选项的鼠标命中区：line_idx 是其在 Paragraph `lines` 里的
+/// 下标（弹窗块边框占 1 行，屏幕行 = rect.y + 1 + line_idx），整行宽可点。
+fn push_select_hit(hits: &mut Vec<DialogHit>, rect: Rect, line_idx: usize, index: usize) {
+    hits.push(DialogHit::Select {
+        row: rect.y + 1 + line_idx as u16,
+        col_start: rect.x,
+        col_end: rect.x + rect.width,
+        index,
+    });
+}
+
+fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
+    let mut hits: Vec<DialogHit> = Vec::new();
     match &app.dialog {
         Dialog::None => {}
         Dialog::Approval(d) => {
             let w = area.width.min(72).saturating_sub(4).max(30);
-            let h = (d.options.len() as u16 + 6)
-                .min(area.height.saturating_sub(4))
-                .max(8);
-            let rect = centered_rect(w, h, area);
-            f.render_widget(Clear, rect);
+            let mut pending: Vec<(usize, usize)> = Vec::new();
             let mut lines: Vec<Line> = vec![
                 Line::from(Span::styled(
                     format!(" 工具请求 · {}", d.tool_name),
@@ -294,11 +342,24 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                         .fg(app.theme.text_secondary)
                         .bg(app.theme.bg_light)
                 };
+                // rect 依赖总行数、循环后才能定，先记 (line_idx, index) 待换算。
+                pending.push((lines.len(), i));
                 lines.push(Line::from(Span::styled(
                     format!(" {mark} {}. {}", i + 1, pretty_outcome(opt)),
                     style,
                 )));
             }
+            // Height follows the real content: title + reason/input + options
+            // can exceed the old `options + 6` estimate and clip the last
+            // option, so measure the built lines instead.
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(8);
+            let rect = centered_rect(w, h, area);
+            for (line_idx, index) in pending {
+                push_select_hit(&mut hits, rect, line_idx, index);
+            }
+            f.render_widget(Clear, rect);
             let block = popup_block(
                 Line::from(Span::styled(
                     " ⚑ permission ",
@@ -323,11 +384,6 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 .filter(|item| item.placement == "queued")
                 .collect::<Vec<_>>();
             let w = area.width.min(88).saturating_sub(4).max(40);
-            let h = (queued.len() as u16 + 5)
-                .min(area.height.saturating_sub(4))
-                .max(7);
-            let rect = centered_rect(w, h, area);
-            f.render_widget(Clear, rect);
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -363,6 +419,11 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 " Enter send now · s steer · e edit · d remove",
                 Style::default().fg(app.theme.gray),
             )));
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(7);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
             let block = popup_block(" ⇥ prompt queue ", app.theme.accent_plan)
                 .style(Style::default().bg(app.theme.bg_light));
             f.render_widget(
@@ -374,11 +435,6 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Tasks(t) => {
             let w = area.width.min(90).saturating_sub(4).max(40);
-            let h = (t.rows.len() as u16 + 3)
-                .min(area.height.saturating_sub(4))
-                .max(6);
-            let rect = centered_rect(w, h, area);
-            f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 " tasks — r 刷新 · q/Esc 关闭",
                 Style::default().fg(app.theme.gray),
@@ -408,6 +464,11 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                     style,
                 )));
             }
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
             let block = popup_block(" ◈ tasks ", app.theme.accent_plan)
                 .style(Style::default().bg(app.theme.bg_light));
             f.render_widget(
@@ -592,6 +653,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                     } else {
                         Style::default().fg(app.theme.text_secondary)
                     };
+                    push_select_hit(&mut hits, rect, lines.len(), position);
                     lines.push(Line::from(Span::styled(
                         format!(
                             "{mark}{}",
@@ -668,9 +730,510 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                push_select_hit(&mut hits, rect, lines.len(), i);
                 lines.push(Line::from(Span::styled(format!("{}{}", mark, name), style)));
             }
             let block = popup_block(" ◐ theme ", app.theme.accent_thinking)
+                .style(Style::default().bg(app.theme.bg_light));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_light)),
+                rect,
+            );
+        }
+        Dialog::Provider(wizard) => {
+            use crate::app::{ModelsFocus, ProviderStep as PS, WizardKind, EFFORT_LEVELS};
+            let w = area.width.min(66).saturating_sub(4).max(46);
+            let mut lines: Vec<Line> = Vec::new();
+            let sel_style = Style::default()
+                .fg(app.theme.text_primary)
+                .bg(app.theme.bg_highlight);
+            let dim = Style::default().fg(app.theme.gray);
+            // rect 依赖总行数、step 分支结束后才定，先记 (line_idx, index) 待换算。
+            let mut pending: Vec<(usize, usize)> = Vec::new();
+            match wizard.step {
+                PS::Type => {
+                    let options = [
+                        (
+                            "内置目录服务商",
+                            "只需 API key（deepseek / openai / anthropic …）",
+                            true,
+                        ),
+                        (
+                            "自定义服务商",
+                            "OpenAI/Anthropic 兼容端点 · 协议 + baseURL + 模型",
+                            true,
+                        ),
+                        (
+                            "OAuth 登录",
+                            "此构建不支持 — 适配器无 OAuth 凭据存储",
+                            false,
+                        ),
+                    ];
+                    for (i, (name, desc, enabled)) in options.iter().enumerate() {
+                        let selected = i == wizard.type_sel;
+                        let style = if !enabled {
+                            Style::default().fg(app.theme.gray)
+                        } else if selected {
+                            sel_style
+                        } else {
+                            Style::default().fg(app.theme.text_secondary)
+                        };
+                        // 灰置项（OAuth）不可点。
+                        if *enabled {
+                            pending.push((lines.len(), i));
+                        }
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                " {} {:<14} {}",
+                                if selected { "›" } else { " " },
+                                name,
+                                desc
+                            ),
+                            style,
+                        )));
+                    }
+                    if wizard.catalog.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "   catalog loading…",
+                            Style::default().fg(app.theme.accent_running),
+                        )));
+                    }
+                }
+                PS::Known => {
+                    let max_rows = 12usize;
+                    let start = wizard.catalog_sel.saturating_sub(max_rows / 2);
+                    for (i, preset) in wizard.catalog.iter().enumerate().skip(start).take(max_rows)
+                    {
+                        let selected = i == wizard.catalog_sel;
+                        let page = if preset.key_page.is_some() {
+                            " ↗"
+                        } else {
+                            ""
+                        };
+                        let style = if selected {
+                            sel_style
+                        } else {
+                            Style::default().fg(app.theme.text_secondary)
+                        };
+                        pending.push((lines.len(), i));
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                " {} {:<18} {}{}",
+                                if selected { "›" } else { " " },
+                                truncated(&preset.id, 18),
+                                truncated(&preset.name, 20),
+                                page
+                            ),
+                            style,
+                        )));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        "   o 打开取 key 页 · 目录路由免填协议/URL/模型",
+                        dim,
+                    )));
+                }
+                PS::Models => {
+                    for (i, model) in wizard.models.iter().enumerate() {
+                        let current = i == wizard.model_cursor;
+                        let checkbox = if model.included { "[x]" } else { "[ ]" };
+                        let mut summary = String::new();
+                        if model.vision {
+                            summary.push_str("img · ");
+                        }
+                        if model.reasoning {
+                            summary.push_str(&format!("思考 {} 级", model.efforts.len()));
+                        }
+                        let style = if current {
+                            sel_style
+                        } else {
+                            Style::default().fg(app.theme.text_secondary)
+                        };
+                        pending.push((lines.len(), i));
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                " {} {} {:<28} {}",
+                                if current { "›" } else { " " },
+                                checkbox,
+                                truncated(&model.id, 28),
+                                summary
+                            ),
+                            style,
+                        )));
+                        if model.open {
+                            // 展开行：开关区（col 0/1）+ chips 区（col 2..）。
+                            let toggle = |on: bool, col: usize| {
+                                let label = if on { "● on " } else { "○ off" };
+                                if wizard.models_focus == ModelsFocus::Detail
+                                    && current
+                                    && wizard.detail_col == col
+                                {
+                                    Span::styled(label, sel_style)
+                                } else {
+                                    Span::styled(
+                                        label,
+                                        Style::default().fg(if on {
+                                            app.theme.accent_success
+                                        } else {
+                                            app.theme.gray
+                                        }),
+                                    )
+                                }
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled("      多模态 ", dim),
+                                toggle(model.vision, 0),
+                                Span::styled("   思考 ", dim),
+                                toggle(model.reasoning, 1),
+                            ]));
+                            if model.reasoning {
+                                let mut chips = vec![Span::styled("      ", dim)];
+                                for (ci, (level, zh)) in EFFORT_LEVELS.iter().enumerate() {
+                                    let on = model.efforts.iter().any(|e| e == level);
+                                    let cursor = wizard.models_focus == ModelsFocus::Detail
+                                        && current
+                                        && wizard.detail_col == ci + 2;
+                                    let style = if cursor {
+                                        sel_style
+                                    } else if on {
+                                        Style::default()
+                                            .fg(app.theme.accent_thinking)
+                                            .add_modifier(Modifier::BOLD)
+                                    } else {
+                                        dim
+                                    };
+                                    chips.push(Span::styled(format!(" {} ", zh), style));
+                                    chips.push(Span::styled(" ", dim));
+                                }
+                                lines.push(Line::from(chips));
+                            }
+                        }
+                    }
+                    if wizard.models.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "   还没有模型 — f 拉取 · i 手填",
+                            dim,
+                        )));
+                    }
+                    // 手填行 + 拉取状态。
+                    let manual_style = if wizard.models_focus == ModelsFocus::Manual {
+                        Style::default().fg(app.theme.text_primary)
+                    } else {
+                        dim
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if wizard.models_focus == ModelsFocus::Manual {
+                                " › add: "
+                            } else {
+                                "   add: "
+                            },
+                            manual_style,
+                        ),
+                        Span::styled(
+                            if wizard.models_focus == ModelsFocus::Manual {
+                                format!("{}▌", wizard.manual)
+                            } else {
+                                "i 手填".to_string()
+                            },
+                            manual_style,
+                        ),
+                    ]));
+                    if wizard.fetching {
+                        lines.push(Line::from(Span::styled(
+                            "   fetching models…",
+                            Style::default().fg(app.theme.accent_running),
+                        )));
+                    }
+                }
+                PS::Confirm => {
+                    let row = |k: &str, v: String| {
+                        Line::from(vec![
+                            Span::styled(format!("   {:<9} ", k), dim),
+                            Span::styled(v, Style::default().fg(app.theme.text_primary)),
+                        ])
+                    };
+                    let known = wizard.kind == Some(WizardKind::Known);
+                    lines.push(row(
+                        "type",
+                        if known {
+                            "内置目录".into()
+                        } else {
+                            "自定义".into()
+                        },
+                    ));
+                    lines.push(row("provider", wizard.id.clone()));
+                    lines.push(row(
+                        "protocol",
+                        if known {
+                            "目录默认".into()
+                        } else {
+                            wizard.api.clone()
+                        },
+                    ));
+                    if !known && !wizard.base_url.is_empty() {
+                        lines.push(row("base URL", wizard.base_url.clone()));
+                    }
+                    lines.push(row(
+                        "key",
+                        if wizard.api_key.is_empty() {
+                            "未设置".into()
+                        } else {
+                            format!(
+                                "{}（存 credentials）",
+                                "•".repeat(wizard.api_key.chars().count().min(16))
+                            )
+                        },
+                    ));
+                    let models_text = if known {
+                        "目录默认".to_string()
+                    } else {
+                        wizard
+                            .models
+                            .iter()
+                            .filter(|m| m.included)
+                            .map(|m| {
+                                if m.reasoning && !m.efforts.is_empty() {
+                                    let levels = m
+                                        .efforts
+                                        .iter()
+                                        .filter_map(|e| {
+                                            EFFORT_LEVELS
+                                                .iter()
+                                                .find(|(l, _)| l == e)
+                                                .map(|(_, z)| *z)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("/");
+                                    format!("{} [{}]", m.id, levels)
+                                } else {
+                                    m.id.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    lines.push(row(
+                        "models",
+                        truncated(&models_text, w.saturating_sub(16) as usize),
+                    ));
+                }
+                // ---- 文本步（Id/Api/BaseUrl/ApiKey）：字段一览 + 当前草稿 ----
+                step => {
+                    for &field in wizard.visible_fields() {
+                        let current = field == step;
+                        let mark = if current { " › " } else { "   " };
+                        let label = format!("{:<9}", field.label());
+                        let label_style = if current {
+                            Style::default()
+                                .fg(app.theme.accent_user)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            dim
+                        };
+                        let mut row = vec![
+                            Span::styled(mark, Style::default().fg(app.theme.accent_user)),
+                            Span::styled(label, label_style),
+                        ];
+                        if current && wizard.editing_text() {
+                            row.push(Span::styled(
+                                format!("{}▌", wizard.draft),
+                                Style::default().fg(app.theme.text_primary),
+                            ));
+                        } else {
+                            let value = wizard.value(field);
+                            if value.is_empty() {
+                                row.push(Span::styled(field.empty_hint(), dim));
+                            } else if field == PS::ApiKey {
+                                row.push(Span::styled(
+                                    "•".repeat(value.chars().count().min(20)),
+                                    Style::default().fg(app.theme.text_primary),
+                                ));
+                            } else {
+                                row.push(Span::styled(
+                                    truncated(value, w.saturating_sub(18) as usize),
+                                    Style::default().fg(app.theme.text_primary),
+                                ));
+                            }
+                        }
+                        lines.push(Line::from(row));
+                        if current && field == PS::Api && !wizard.protocols.is_empty() {
+                            for (i, proto) in wizard.protocols.iter().enumerate() {
+                                let selected = i == wizard.proto_sel;
+                                let style = if selected {
+                                    sel_style
+                                } else {
+                                    Style::default().fg(app.theme.text_secondary)
+                                };
+                                pending.push((lines.len(), i));
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "       {} {}",
+                                        if selected { "›" } else { " " },
+                                        proto
+                                    ),
+                                    style,
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            if wizard.saving {
+                lines.push(Line::from(Span::styled(
+                    "   saving…",
+                    Style::default().fg(app.theme.accent_running),
+                )));
+            }
+            if let Some(error) = &wizard.error {
+                lines.push(Line::from(Span::styled(
+                    truncated(&format!("   {error}"), w.saturating_sub(2) as usize),
+                    Style::default().fg(app.theme.accent_error),
+                )));
+            }
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(2))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            for (line_idx, index) in pending {
+                push_select_hit(&mut hits, rect, line_idx, index);
+            }
+            f.render_widget(Clear, rect);
+            let block = popup_block(
+                format!(" ⚡ add provider · {} ", wizard.step.label()),
+                app.theme.accent_user,
+            )
+            .style(Style::default().bg(app.theme.bg_light));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_light)),
+                rect,
+            );
+        }
+        Dialog::ProviderKey(dialog) => {
+            let w = area.width.min(52).saturating_sub(4).max(32);
+            let extra = if dialog.error.is_some() { 1 } else { 0 };
+            let h = 5 + extra;
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(vec![
+                Span::styled(" key: ", Style::default().fg(app.theme.gray)),
+                Span::styled(
+                    format!("{}▌", "•".repeat(dialog.draft.chars().count())),
+                    Style::default().fg(app.theme.text_primary),
+                ),
+            ])];
+            if dialog.saving {
+                lines.push(Line::from(Span::styled(
+                    " saving…",
+                    Style::default().fg(app.theme.accent_running),
+                )));
+            }
+            if let Some(error) = &dialog.error {
+                lines.push(Line::from(Span::styled(
+                    truncated(&format!(" {error}"), w.saturating_sub(2) as usize),
+                    Style::default().fg(app.theme.accent_error),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                " Enter 保存 · Esc 返回列表",
+                Style::default().fg(app.theme.gray),
+            )));
+            let block = popup_block(format!(" ⚡ key · {} ", dialog.id), app.theme.accent_user)
+                .style(Style::default().bg(app.theme.bg_light));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_light)),
+                rect,
+            );
+        }
+        Dialog::ProviderRemove(id) => {
+            let w = area.width.min(48).saturating_sub(4).max(28);
+            let h = 5u16;
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let lines: Vec<Line> = vec![
+                Line::from(Span::styled(
+                    format!(" 删除服务商 {id}？"),
+                    Style::default().fg(app.theme.text_primary),
+                )),
+                Line::from(Span::styled(
+                    " settings 块 + credentials 引用将移除",
+                    Style::default().fg(app.theme.gray),
+                )),
+                Line::from(Span::styled(
+                    " y 删除 · n/Esc 返回",
+                    Style::default().fg(app.theme.accent_error),
+                )),
+            ];
+            // 提示行（lines 下标 2）左右两半分别等价于按 y / n。
+            let hint_row = rect.y + 3;
+            let mid = rect.x + rect.width / 2;
+            hits.push(DialogHit::Key {
+                row: hint_row,
+                col_start: rect.x,
+                col_end: mid,
+                ch: 'y',
+            });
+            hits.push(DialogHit::Key {
+                row: hint_row,
+                col_start: mid,
+                col_end: rect.x + rect.width,
+                ch: 'n',
+            });
+            let block = popup_block(" ⚠ remove provider ", app.theme.accent_error)
+                .style(Style::default().bg(app.theme.bg_light));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .style(Style::default().bg(app.theme.bg_light)),
+                rect,
+            );
+        }
+        Dialog::ProviderList(view) => {
+            let w = area.width.min(52).saturating_sub(4).max(32);
+            let h = (view.items.len() as u16 + 4)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                " configured providers — Enter/q/Esc close",
+                Style::default().fg(app.theme.gray),
+            ))];
+            lines.push(Line::from(""));
+            for (i, item) in view.items.iter().enumerate() {
+                let selected = i == view.selected;
+                let mark = if selected { "› " } else { "  " };
+                let key_note = if item.key == "none" {
+                    "no key".to_string()
+                } else {
+                    format!("key: {}", item.key)
+                };
+                let style = if selected {
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.bg_highlight)
+                } else {
+                    Style::default().fg(app.theme.text_secondary)
+                };
+                let budget = w.saturating_sub(6) as usize;
+                let id = truncated(&item.id, budget.saturating_sub(key_note.len() + 2).max(8));
+                let gap = budget.saturating_sub(
+                    unicode_width::UnicodeWidthStr::width(id.as_str())
+                        + unicode_width::UnicodeWidthStr::width(key_note.as_str()),
+                );
+                push_select_hit(&mut hits, rect, lines.len(), i);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}{}", mark, id), style),
+                    Span::styled(" ".repeat(gap), style),
+                    Span::styled(key_note, Style::default().fg(app.theme.gray)),
+                ]));
+            }
+            let block = popup_block(" ◈ providers ", app.theme.accent_tool)
                 .style(Style::default().bg(app.theme.bg_light));
             f.render_widget(
                 Paragraph::new(lines)
@@ -691,6 +1254,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(app.theme.border),
             )));
             let mut previous_section = None;
+            let mut pending: Vec<(usize, usize)> = Vec::new();
             for (row_idx, item_idx) in p.visible.iter().take(max_rows).enumerate() {
                 let row = &p.rows[*item_idx];
                 if previous_section != Some(row.section) {
@@ -720,6 +1284,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                pending.push((lines.len(), row_idx));
                 lines.push(Line::from(Span::styled(
                     format!("  {mark} {label}{}{shortcut}", " ".repeat(gap)),
                     style,
@@ -735,6 +1300,9 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 .min(area.height.saturating_sub(2))
                 .max(7);
             let rect = centered_rect(w, h, area);
+            for (line_idx, index) in pending {
+                push_select_hit(&mut hits, rect, line_idx, index);
+            }
             f.render_widget(Clear, rect);
             let block = popup_block(" Commands ", app.theme.border)
                 .style(Style::default().bg(app.theme.bg_light));
@@ -819,16 +1387,12 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Rewind(r) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
-            let h = (r.items.len() as u16 + 3)
-                .min(area.height.saturating_sub(4))
-                .max(6);
-            let rect = centered_rect(w, h, area);
-            f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 " rewind — Enter 回滚到该消息之前 · Esc 关闭",
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
+            let mut pending: Vec<(usize, usize)> = Vec::new();
             for (i, item) in r.items.iter().enumerate() {
                 let selected = i == r.selected;
                 let mark = if selected { "› " } else { "  " };
@@ -839,11 +1403,20 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                pending.push((lines.len(), i));
                 lines.push(Line::from(Span::styled(
                     format!("{}{} (#{})", mark, item.preview, item.seq),
                     style,
                 )));
             }
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            for (line_idx, index) in pending {
+                push_select_hit(&mut hits, rect, line_idx, index);
+            }
+            f.render_widget(Clear, rect);
             let block = popup_block(" ⟲ rewind ", app.theme.accent_plan)
                 .style(Style::default().bg(app.theme.bg_light));
             f.render_widget(
@@ -855,14 +1428,12 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::FilePicker(fp) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
-            let h = (fp.visible.len().min(12) as u16 + 3).max(5);
-            let rect = centered_rect(w, h, area);
-            f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 format!(" @{} — Tab/Enter 插入 · Esc 关闭", fp.query),
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
+            let mut pending: Vec<(usize, usize)> = Vec::new();
             for (row_idx, item_idx) in fp.visible.iter().take(12).enumerate() {
                 let row = &fp.files[*item_idx];
                 let selected = row_idx == fp.selected;
@@ -874,6 +1445,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                pending.push((lines.len(), row_idx));
                 lines.push(Line::from(Span::styled(format!("{}{}", mark, row), style)));
             }
             if fp.visible.is_empty() {
@@ -882,6 +1454,14 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(app.theme.gray_dim),
                 )));
             }
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(5);
+            let rect = centered_rect(w, h, area);
+            for (line_idx, index) in pending {
+                push_select_hit(&mut hits, rect, line_idx, index);
+            }
+            f.render_widget(Clear, rect);
             let block = popup_block(" @ file ", app.theme.accent_user)
                 .style(Style::default().bg(app.theme.bg_light));
             f.render_widget(
@@ -925,6 +1505,8 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                // selected 是 rows 下标而非可见行号，命中区记 rows 下标。
+                push_select_hit(&mut hits, rect, lines.len(), *item_idx);
                 lines.push(Line::from(Span::styled(
                     format!(
                         "{mark}{}/{} — {}{context}{description}",
@@ -987,6 +1569,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                push_select_hit(&mut hits, rect, lines.len(), index);
                 lines.push(Line::from(Span::styled(
                     format!("{mark}{}{}", row.name, description),
                     style,
@@ -1003,16 +1586,12 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
         Dialog::Resume(p) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
-            let h = (p.items.len() as u16 + 2)
-                .min(area.height.saturating_sub(4))
-                .max(6);
-            let rect = centered_rect(w, h, area);
-            f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 " /resume — Enter 恢复 · Esc 关闭",
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
+            let mut pending: Vec<(usize, usize)> = Vec::new();
             for (i, item) in p.items.iter().enumerate() {
                 let selected = i == p.selected;
                 let mark = if selected { "› " } else { "  " };
@@ -1027,6 +1606,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 if label.is_empty() {
                     label = item.id.clone();
                 }
+                pending.push((lines.len(), i));
                 lines.push(Line::from(Span::styled(
                     format!(
                         "{}{} · {} turns · {} · {}",
@@ -1039,6 +1619,14 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                     style,
                 )));
             }
+            let h = (lines.len() as u16 + 2)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            for (line_idx, index) in pending {
+                push_select_hit(&mut hits, rect, line_idx, index);
+            }
+            f.render_widget(Clear, rect);
             let block = popup_block(" ↺ resume ", app.theme.accent_success)
                 .style(Style::default().bg(app.theme.bg_light));
             f.render_widget(
@@ -1152,6 +1740,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
+                push_select_hit(&mut hits, rect, lines.len(), i);
                 lines.push(Line::from(Span::styled(
                     format!("{}{}{}. {}", cursor, box_mark, i + 1, opt),
                     style,
@@ -1181,6 +1770,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
             );
         }
     }
+    hits
 }
 
 fn running_spinner() -> &'static str {
@@ -1919,10 +2509,7 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
     // Anchor on the tail, then pull the window up if the caret sits above it —
     // a long draft has to stay editable at the top, not just at the end.
     let view_rows = all_rows.len().min(COMPOSER_VIEW_ROWS);
-    let mut visible_start = all_rows.len().saturating_sub(view_rows);
-    if layout.cursor_row < visible_start {
-        visible_start = layout.cursor_row;
-    }
+    let visible_start = composer_visible_start(all_rows.len(), layout.cursor_row);
     let visible_rows = &all_rows[visible_start..(visible_start + view_rows).min(all_rows.len())];
     let mut lines = Vec::with_capacity(visible_rows.len());
     for (index, raw) in visible_rows.iter().enumerate() {
@@ -1978,6 +2565,29 @@ fn prefix_width(prefix: &str) -> usize {
 
 fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.dialog {
+        Dialog::Provider(wizard) => {
+            if wizard.saving {
+                "saving provider… · Esc cancel"
+            } else {
+                use crate::app::{ModelsFocus, ProviderStep as PS};
+                match wizard.step {
+                    PS::Type => "↑/↓ select · Enter choose · Esc cancel",
+                    PS::Known => "↑/↓ select · Enter choose · o key page · Shift+Tab back · Esc",
+                    PS::Models => match wizard.models_focus {
+                        ModelsFocus::List => {
+                            "↑/↓ · Space include · → configure · f fetch · i add · Tab next · Esc"
+                        }
+                        ModelsFocus::Manual => "type model id · Enter add · Esc back",
+                        ModelsFocus::Detail => "←/→ move · Space toggle · ↑/↓ row · Esc back",
+                    },
+                    PS::Confirm => "Enter create · Shift+Tab back · Esc cancel",
+                    _ => "type value · Enter next · Shift+Tab back · Esc cancel",
+                }
+            }
+        }
+        Dialog::ProviderList(_) => "↑/↓ select · a add · e edit key · d remove · q close",
+        Dialog::ProviderKey(_) => "type key · Enter save · Esc back",
+        Dialog::ProviderRemove(_) => "y remove · n/Esc back",
         Dialog::Approval(d) => {
             if d.parked {
                 "↑/↓ select · h/l fold · Tab permission card · Ctrl+Q quit"
@@ -2031,7 +2641,9 @@ fn draw_shortcuts(f: &mut Frame, app: &App, area: Rect) {
             Focus::Prompt => {
                 "Enter:send  │  Shift+↑↓:scroll  │  Ctrl+Enter:send-now  │  Ctrl+P:commands"
             }
-            Focus::Scrollback => "↑/↓:select  │  Shift+↑↓:scroll  │  h/l/e:fold  │  Enter:view  │  y:copy",
+            Focus::Scrollback => {
+                "↑/↓:select  │  Shift+↑↓:scroll  │  h/l/e:fold  │  Enter:view  │  y:copy"
+            }
         },
     };
     let hint = if unicode_width::UnicodeWidthStr::width(hint) > area.width as usize {
@@ -2104,6 +2716,35 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn dialog_option_rows_record_mouse_hits() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        app.dialog = Dialog::Theme(crate::app::ThemePicker {
+            original: app.theme,
+            selected: 0,
+        });
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let hits = &app.dialog_hits;
+        assert_eq!(hits.len(), 2, "theme 两个选项各一条命中区");
+        let (rows, indices): (Vec<u16>, Vec<usize>) = hits
+            .iter()
+            .map(|hit| match hit {
+                DialogHit::Select { row, index, .. } => (*row, *index),
+                other => panic!("theme 选项应是 Select 命中，得到 {other:?}"),
+            })
+            .unzip();
+        assert_eq!(indices, [0, 1]);
+        assert_eq!(rows[1], rows[0] + 1, "两个选项渲染在相邻两行");
+
+        // 关掉弹窗后命中表清空，避免陈旧命中误触。
+        app.dialog = Dialog::None;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.dialog_hits.is_empty());
     }
 
     #[test]
@@ -2690,6 +3331,21 @@ mod tests {
     fn composer_rows_preserve_wrapped_input_instead_of_truncating_it() {
         assert_eq!(composer_rows("abcdefghijk", 5), vec!["abcde", "fghij", "k"]);
         assert_eq!(composer_rows("你好世界", 4), vec!["你好", "世界"]);
+    }
+
+    #[test]
+    fn composer_offset_at_maps_clicks_back_to_byte_offsets() {
+        // 纯 ASCII：列号即字节偏移；越过行尾取行尾。
+        assert_eq!(composer_offset_at("hello world", 80, 0, 4), 4);
+        assert_eq!(composer_offset_at("hello", 80, 0, 40), 5);
+        // 折行后第二行的行首是字节 5；点击该行第 2 列 = 偏移 7。
+        assert_eq!(composer_offset_at("abcdefghijk", 5, 1, 2), 7);
+        // CJK：你(2 列) 好(2 列) 世(2 列) 界(2 列)，点击第 3 列落在「好」上。
+        assert_eq!(composer_offset_at("你好世界", 80, 0, 3), 3);
+        // 越过最后一行取文末。
+        assert_eq!(composer_offset_at("abc", 80, 9, 0), 3);
+        // 显式换行：第二行行首是 '\n' 之后。
+        assert_eq!(composer_offset_at("ab\ncd", 80, 1, 1), 4);
     }
 
     #[test]

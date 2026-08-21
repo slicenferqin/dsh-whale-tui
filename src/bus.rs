@@ -89,6 +89,27 @@ pub enum Cmd {
         session_id: String,
         line: String,
     },
+    /// /provider: list configured providers with credential status.
+    ListProviders,
+    /// /provider add: persist a new provider profile plus an optional API key.
+    SaveProvider {
+        draft: Value,
+    },
+    /// 向导模型步的拉取：桥端 GET {baseURL}/models（openai 系协议）。
+    FetchModels {
+        api: String,
+        base_url: String,
+        api_key: String,
+    },
+    /// 列表里按 d：unset provider 块并清掉 credentials 里的 key 引用。
+    RemoveProvider {
+        id: String,
+    },
+    /// 列表里按 e：给已配置的 provider 写入/更新 API key。
+    SetProviderKey {
+        id: String,
+        api_key: String,
+    },
     /// Answer a server-initiated request (approval / ask_user dialog).
     Respond {
         id: String,

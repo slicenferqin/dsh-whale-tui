@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::{json, Value};
 
 use crate::bus::{AppEvent, Cmd};
@@ -18,6 +18,10 @@ use crate::theme::Theme;
 use crate::transcript::{content_text, CellKind, Transcript};
 
 pub const DOUBLE_ESC_MS: u128 = 800;
+
+/// Transient notices ("copied", "mode: Plan", …) fade after this long; without
+/// a TTL they would pin the activity line for the rest of the session.
+pub const NOTICE_TTL_MS: u128 = 5000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -351,6 +355,46 @@ impl ModelPicker {
     }
 }
 
+/// 渲染期记录的弹窗可点击行（ui 每帧重填，handle_mouse 命中测试用）。
+/// 点击等价于"方向键移到该项 + 回车"，与键盘行为完全一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogHit {
+    /// 选中第 index 项并确认（语义随弹窗：执行/选择/展开）。
+    Select {
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+        index: usize,
+    },
+    /// 点击等价于按下字符键（y/n 确认框）。
+    Key {
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+        ch: char,
+    },
+}
+
+impl DialogHit {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        let (hit_row, start, end) = match self {
+            DialogHit::Select {
+                row,
+                col_start,
+                col_end,
+                ..
+            }
+            | DialogHit::Key {
+                row,
+                col_start,
+                col_end,
+                ..
+            } => (*row, *col_start, *col_end),
+        };
+        row == hit_row && column >= start && column < end
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Dialog {
     None,
@@ -371,6 +415,383 @@ pub enum Dialog {
     Block(BlockView),
     History(HistoryView),
     Queue(QueueView),
+    Provider(ProviderWizard),
+    ProviderList(ProviderListView),
+    ProviderKey(ProviderKeyDialog),
+    ProviderRemove(String),
+}
+
+/// /provider add 的分支向导（Dialog::Provider）。交互原型见
+/// docs/prototypes/provider-setup.html：类型（内置目录/自定义，OAuth 此
+/// 构建不支持故灰置）→ 连接（自定义要协议+baseURL）→ 凭据 → 模型（拉取
+/// 或手填，逐模型配多模态/思考强度）→ 确认。
+///
+/// 协议词表与内置目录列表都来自桥端（llm-pi-ai schema 的 providers.*.api
+/// 并集 / pi-ai builtinProviders），与本端校验和安装目录同源，不漂移。
+#[derive(Debug, Clone)]
+pub struct ProviderWizard {
+    pub(crate) step: ProviderStep,
+    pub(crate) kind: Option<WizardKind>,
+    /// Type 步的选项光标：0 = 内置目录，1 = 自定义。
+    pub(crate) type_sel: usize,
+    /// 桥端下发的内置目录 provider 列表（Known 步的选项）。
+    pub(crate) catalog: Vec<CatalogProvider>,
+    pub(crate) catalog_sel: usize,
+    pub(crate) protocols: Vec<String>,
+    pub(crate) proto_sel: usize,
+    /// 当前文本步骤的编辑缓冲（步进时与字段互换）。
+    pub(crate) draft: String,
+    pub(crate) id: String,
+    pub(crate) api: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
+    pub(crate) models: Vec<ModelDraft>,
+    pub(crate) model_cursor: usize,
+    pub(crate) models_focus: ModelsFocus,
+    /// 展开行内的列光标：0 = 多模态开关，1 = 思考开关，2.. = 级别 chips。
+    pub(crate) detail_col: usize,
+    /// 手填模型 id 的输入缓冲（Manual 焦点）。
+    pub(crate) manual: String,
+    /// 模型拉取请求在飞（桥端 GET {baseURL}/models）。
+    pub fetching: bool,
+    pub saving: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WizardKind {
+    Known,
+    Custom,
+}
+
+/// Models 步内部的焦点：列表导航 / 手填输入 / 展开行详情。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ModelsFocus {
+    List,
+    Manual,
+    Detail,
+}
+
+/// 思考强度级别：(配置 id, 中文标签)。写入 reasoningEfforts 的 identity map。
+pub(crate) const EFFORT_LEVELS: [(&str, &str); 6] = [
+    ("low", "低"),
+    ("medium", "中"),
+    ("high", "高"),
+    ("xhigh", "超高"),
+    ("max", "最高"),
+    ("ultra", "极致"),
+];
+
+#[derive(Debug, Clone)]
+pub struct ModelDraft {
+    pub id: String,
+    pub included: bool,
+    pub vision: bool,
+    pub reasoning: bool,
+    pub efforts: Vec<String>,
+    pub open: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogProvider {
+    pub id: String,
+    pub name: String,
+    pub key_page: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProviderStep {
+    Type,
+    Known,
+    Id,
+    Api,
+    BaseUrl,
+    ApiKey,
+    Models,
+    Confirm,
+}
+
+/// /provider 的服务商管理面板（Dialog::ProviderList）。
+#[derive(Debug, Clone)]
+pub struct ProviderListView {
+    pub items: Vec<ProviderItem>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderItem {
+    pub id: String,
+    /// "stored"（凭据文件）| "env"（环境变量）| "none"。
+    pub key: String,
+}
+
+/// /provider 列表里按 e 弹出的单行 key 输入（Dialog::ProviderKey）。
+#[derive(Debug, Clone)]
+pub struct ProviderKeyDialog {
+    pub id: String,
+    pub draft: String,
+    pub saving: bool,
+    pub error: Option<String>,
+}
+
+/// 与桥端 PROVIDER_ROUTE_PATTERN 同一规则：^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$。
+fn valid_provider_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    let mut segment_filled = true;
+    for c in chars {
+        match c {
+            'a'..='z' | '0'..='9' => segment_filled = true,
+            '-' if segment_filled => segment_filled = false,
+            _ => return false,
+        }
+    }
+    segment_filled
+}
+
+impl ProviderStep {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ProviderStep::Type => "type",
+            ProviderStep::Known => "catalog",
+            ProviderStep::Id => "id",
+            ProviderStep::Api => "protocol",
+            ProviderStep::BaseUrl => "base URL",
+            ProviderStep::ApiKey => "API key",
+            ProviderStep::Models => "models",
+            ProviderStep::Confirm => "confirm",
+        }
+    }
+
+    /// 当前文本步骤的空值提示（渲染在值为空时）。
+    pub(crate) fn empty_hint(self) -> &'static str {
+        match self {
+            ProviderStep::Id => "required, e.g. my-provider",
+            ProviderStep::Api => "required",
+            ProviderStep::BaseUrl => "required for custom routes",
+            ProviderStep::ApiKey => "empty = skip",
+            _ => "",
+        }
+    }
+}
+
+impl ProviderWizard {
+    pub(crate) fn new(protocols: Vec<String>, catalog: Vec<CatalogProvider>) -> Self {
+        Self {
+            step: ProviderStep::Type,
+            kind: None,
+            type_sel: 0,
+            catalog,
+            catalog_sel: 0,
+            protocols,
+            proto_sel: 0,
+            draft: String::new(),
+            id: String::new(),
+            api: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            models: Vec::new(),
+            model_cursor: 0,
+            models_focus: ModelsFocus::List,
+            detail_col: 0,
+            manual: String::new(),
+            fetching: false,
+            saving: false,
+            error: None,
+        }
+    }
+
+    /// kind 决定的步骤序列（Type 之后分叉；known 免连接与模型步——
+    /// 协议/baseURL/models 全由安装目录供给）。
+    pub(crate) fn sequence(&self) -> &'static [ProviderStep] {
+        match self.kind {
+            Some(WizardKind::Known) => &[
+                ProviderStep::Type,
+                ProviderStep::Known,
+                ProviderStep::ApiKey,
+                ProviderStep::Confirm,
+            ],
+            _ => &[
+                ProviderStep::Type,
+                ProviderStep::Id,
+                ProviderStep::Api,
+                ProviderStep::BaseUrl,
+                ProviderStep::ApiKey,
+                ProviderStep::Models,
+                ProviderStep::Confirm,
+            ],
+        }
+    }
+
+    /// 字段一览里要回显的文本字段（known 只显示 key）。
+    pub(crate) fn visible_fields(&self) -> &'static [ProviderStep] {
+        match self.kind {
+            Some(WizardKind::Known) => &[ProviderStep::ApiKey],
+            _ => &[
+                ProviderStep::Id,
+                ProviderStep::Api,
+                ProviderStep::BaseUrl,
+                ProviderStep::ApiKey,
+            ],
+        }
+    }
+
+    pub(crate) fn value(&self, step: ProviderStep) -> &str {
+        match step {
+            ProviderStep::Id => &self.id,
+            ProviderStep::Api => &self.api,
+            ProviderStep::BaseUrl => &self.base_url,
+            ProviderStep::ApiKey => &self.api_key,
+            _ => "",
+        }
+    }
+
+    /// 当前步骤是否吃文本输入（Models 步由 models_focus 另行裁决）。
+    pub(crate) fn editing_text(&self) -> bool {
+        match self.step {
+            ProviderStep::Id | ProviderStep::BaseUrl | ProviderStep::ApiKey => true,
+            ProviderStep::Api => self.protocols.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// 校验草稿并提交进当前字段；Err 是展示在面板里的校验信息。
+    pub(crate) fn commit_draft(&mut self) -> Result<(), String> {
+        let text = self.draft.trim().to_string();
+        match self.step {
+            ProviderStep::Id => {
+                if !valid_provider_id(&text) {
+                    return Err("id must be lowercase segments, e.g. my-provider".to_string());
+                }
+                self.id = text;
+            }
+            ProviderStep::Api => {
+                if text.is_empty() {
+                    return Err("protocol required".to_string());
+                }
+                self.api = text;
+            }
+            ProviderStep::BaseUrl => {
+                if !text.starts_with("https://") && !text.starts_with("http://") {
+                    return Err("base URL must start with https:// or http://".to_string());
+                }
+                self.base_url = text;
+            }
+            ProviderStep::ApiKey => self.api_key = text,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 步进到序列下一步；文本步把已有值装入草稿。
+    pub(crate) fn advance(&mut self) {
+        let seq = self.sequence();
+        let Some(pos) = seq.iter().position(|s| *s == self.step) else {
+            return;
+        };
+        let Some(next) = seq.get(pos + 1) else { return };
+        self.step = *next;
+        self.draft = self.value(*next).to_string();
+        self.error = None;
+    }
+
+    /// 回退序列上一步。
+    pub(crate) fn back(&mut self) {
+        if self.step == ProviderStep::Models && self.models_focus != ModelsFocus::List {
+            self.models_focus = ModelsFocus::List;
+            return;
+        }
+        let seq = self.sequence();
+        let Some(pos) = seq.iter().position(|s| *s == self.step) else {
+            return;
+        };
+        if pos == 0 {
+            return;
+        }
+        let prev = seq[pos - 1];
+        self.step = prev;
+        self.draft = self.value(prev).to_string();
+        self.error = None;
+    }
+
+    /// 保存用 draft JSON：known 只给 key（桥端 known 形态），custom 给全量。
+    pub(crate) fn save_payload(&self) -> Value {
+        match self.kind {
+            Some(WizardKind::Known) => json!({
+                "id": self.id,
+                "apiKey": self.api_key,
+                "known": true,
+            }),
+            _ => json!({
+                "id": self.id,
+                "api": self.api,
+                "baseURL": self.base_url,
+                "apiKey": self.api_key,
+                "models": self.models.iter()
+                    .filter(|m| m.included)
+                    .map(|m| json!({
+                        "id": m.id,
+                        "vision": m.vision,
+                        "efforts": if m.reasoning { m.efforts.clone() } else { Vec::new() },
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        }
+    }
+
+    /// ↑/↓ 移动模型光标后保持焦点一致：Detail 跟随到新行（未展开则回 List）。
+    pub(crate) fn sync_models_focus(&mut self) {
+        if self.models_focus == ModelsFocus::Detail {
+            match self.models.get(self.model_cursor) {
+                Some(model) if model.open => self.detail_col = 0,
+                _ => self.models_focus = ModelsFocus::List,
+            }
+        }
+    }
+}
+
+/// Models 步展开行里的列切换：0 = 多模态开关，1 = 思考开关（开启时默认
+/// 低/中/高三档），2.. = 级别 chips 多选。
+fn wizard_toggle_detail(wizard: &mut ProviderWizard) {
+    let Some(model) = wizard.models.get_mut(wizard.model_cursor) else {
+        return;
+    };
+    match wizard.detail_col {
+        0 => model.vision = !model.vision,
+        1 => {
+            model.reasoning = !model.reasoning;
+            if model.reasoning && model.efforts.is_empty() {
+                model.efforts = vec!["medium".into(), "high".into()];
+            }
+        }
+        col => {
+            let Some((level, _)) = EFFORT_LEVELS.get(col - 2) else {
+                return;
+            };
+            if model.efforts.iter().any(|e| e == level) {
+                model.efforts.retain(|e| e != level);
+            } else {
+                model.efforts.push((*level).to_string());
+            }
+            model.reasoning = !model.efforts.is_empty();
+        }
+    }
+}
+
+/// 在系统浏览器打开 URL（macOS open / 其他 xdg-open），失败静默——
+/// 面板里仍显示着地址，用户可手开。
+fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener).arg(url).spawn();
 }
 
 pub struct App {
@@ -406,18 +827,25 @@ pub struct App {
     pub reasoning_effort_name: Option<String>,
     pub status: String,
     pub notice: Option<String>,
+    /// When the current notice was posted; `tick` clears it past NOTICE_TTL_MS.
+    notice_at: Option<Instant>,
     pub scroll: usize,
+    /// 视口是否跟随选中块（draw_scrollback 用它决定滚动画窗）。
     pub follow_selection: bool,
     pub composer_top: u16,
+    /// 绘制时记录的 composer 盒几何，鼠标点击定位光标用（ui.rs draw 每帧刷新）。
+    pub composer_bottom: u16,
+    pub composer_inner_width: u16,
+    /// 本帧弹窗的可点击行（ui::draw_dialog 每帧重填；无弹窗时清空）。
+    pub dialog_hits: Vec<DialogHit>,
     pub needs_redraw: bool,
-    /// Is mouse reporting on? Defaults to OFF.
+    /// Is mouse reporting on? Defaults to ON.
     ///
-    /// Any tracking mode makes the terminal hand mouse input to us and stop
-    /// doing its own text selection. We do not implement drag-selection, so
-    /// capturing the mouse would buy only wheel-scroll and click-to-focus while
-    /// costing native select-and-copy — a bad trade, and Shift-to-override is
-    /// not universal. Keyboard scrolling covers navigation (PageUp/PageDown,
-    /// Ctrl+U/D, Ctrl+J/K, j/k, g/G); `/mouse` opts into the wheel.
+    /// Mouse reporting (`?1000h` + `?1006h`) is on by default so the wheel
+    /// scrolls the transcript (docs/01 section 2.7). With reporting off the
+    /// terminal turns the wheel into arrow keys, which the composer reads as
+    /// prompt-history recall — history text landing in the draft. `/mouse`
+    /// opts out for terminals where Shift+drag selection does not work.
     pub mouse_capture: bool,
     /// Set when `mouse_capture` changed and the event loop must re-issue the
     /// escape sequence.
@@ -433,6 +861,16 @@ pub struct App {
     preset_index: usize,
     pub permission_mode: PermissionMode,
     catalog_for_presets: bool,
+    /// 只有 /model、Ctrl+M 这类用户主动发起的 FetchCatalog 才应在结果到达时
+    /// 弹出模型选择器；启动（tui/ready）和 capabilities-changed 的后台拉取
+    /// 只更新数据，否则每次启动都会强制弹一次模型选择。
+    catalog_for_picker: bool,
+    /// 桥端 initialize/list-providers 下发的协议词表（llm-pi-ai schema 的
+    /// providers.*.api 并集）；空 = 桥未下发，向导协议步骤退化为自由文本。
+    provider_protocols: Vec<String>,
+    /// 桥端 list-providers 下发的内置目录 provider 预设（pi-ai
+    /// builtinProviders）；空 = 未拉取，/provider add 会触发一次拉取。
+    catalog_providers: Vec<CatalogProvider>,
     live_ids: HashSet<String>,
     capabilities: HarnessCapabilities,
     harness_commands: Vec<HarnessCommand>,
@@ -479,11 +917,15 @@ impl App {
             reasoning_effort_name: None,
             status: String::new(),
             notice: None,
+            notice_at: None,
             scroll: 0,
             follow_selection: true,
             composer_top: 0,
+            composer_bottom: 0,
+            composer_inner_width: 1,
+            dialog_hits: Vec::new(),
             needs_redraw: true,
-            mouse_capture: false,
+            mouse_capture: true,
             // Applied on the first loop pass, so the default holds whatever it is.
             mouse_capture_dirty: true,
             quit: false,
@@ -497,6 +939,9 @@ impl App {
             preset_index: 0,
             permission_mode: PermissionMode::Normal,
             catalog_for_presets: false,
+            catalog_for_picker: false,
+            provider_protocols: Vec::new(),
+            catalog_providers: Vec::new(),
             capabilities: HarnessCapabilities::default(),
             harness_commands: Vec::new(),
             catalog_loaded: false,
@@ -526,7 +971,7 @@ impl App {
 
     fn open_queue(&mut self) {
         if self.queued_count() == 0 {
-            self.notice = Some("queue empty".into());
+            self.set_notice("queue empty");
             return;
         }
         self.dialog = Dialog::Queue(QueueView {
@@ -551,7 +996,7 @@ impl App {
             if self.transcript.todos.is_empty() {
                 if let Dialog::Todos(_) = self.dialog {
                     self.dialog = Dialog::None;
-                    self.notice = Some("task list cleared".into());
+                    self.set_notice("task list cleared");
                 }
             }
         }
@@ -651,7 +1096,7 @@ impl App {
 
     fn open_todos(&mut self) {
         if self.transcript.todos.is_empty() {
-            self.notice = Some("no task list yet".into());
+            self.set_notice("no task list yet");
             return;
         }
         // Land on whatever the agent is working on right now.
@@ -776,7 +1221,7 @@ impl App {
 
     fn open_history(&mut self) {
         if self.history.is_empty() {
-            self.notice = Some("prompt history empty".into());
+            self.set_notice("prompt history empty");
             return;
         }
         let visible = self.history_matches("");
@@ -819,7 +1264,7 @@ impl App {
 
     fn undo_input(&mut self) {
         let Some((text, cursor)) = self.undo.pop() else {
-            self.notice = Some("nothing to undo".into());
+            self.set_notice("nothing to undo");
             return;
         };
         self.input = text;
@@ -1134,6 +1579,12 @@ impl App {
         self.confirm_notice = true;
     }
 
+    /// Post a transient notice with its timestamp; `tick` fades it.
+    fn set_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some(text.into());
+        self.notice_at = Some(Instant::now());
+    }
+
     /// Called from the event loop's idle tick. Drops an expired confirm arm and
     /// the prompt that went with it — leaving "press again to quit" on screen
     /// after the window closed would be a lie.
@@ -1146,6 +1597,17 @@ impl App {
                 self.confirm_notice = false;
                 self.needs_redraw = true;
             }
+        }
+        // Fade transient notices. Confirm prompts manage their own lifecycle
+        // above (they die with the arm, not the clock).
+        if !self.confirm_notice
+            && self
+                .notice_at
+                .is_some_and(|t| t.elapsed().as_millis() > NOTICE_TTL_MS)
+        {
+            self.notice = None;
+            self.notice_at = None;
+            self.needs_redraw = true;
         }
     }
 
@@ -1160,10 +1622,10 @@ impl App {
     }
     fn toggle_multiline(&mut self) {
         self.multiline = !self.multiline;
-        self.notice = Some(if self.multiline {
-            "multiline on · Enter newline · Alt+Enter send".into()
+        self.set_notice(if self.multiline {
+            "multiline on · Enter newline · Alt+Enter send"
         } else {
-            "multiline off · Enter send".into()
+            "multiline off · Enter send"
         });
     }
     fn open_palette(&mut self) {
@@ -1199,8 +1661,15 @@ impl App {
                 Some("Ctrl+R"),
             ),
             row("Appearance", "Switch Theme", "/theme", None),
-            row("Appearance", "Mouse Reporting (off to select text)", "/mouse", None),
+            row(
+                "Appearance",
+                "Mouse Reporting (off to select text)",
+                "/mouse",
+                None,
+            ),
             row("Appearance", "Keyboard Shortcuts", "/help", Some("Ctrl+X")),
+            row("Connection", "List Providers", "/provider", None),
+            row("Connection", "Add Provider", "/provider add", None),
             row("Panels", "Prompt Queue", "/queue", Some("Ctrl+;")),
             row("Panels", "Todos", "/todos", Some("Ctrl+T")),
         ];
@@ -1295,7 +1764,7 @@ impl App {
             },
             ShortcutRow {
                 label: "Quit",
-                keys: "Ctrl+Q ×2 (Ctrl+D in composer)",
+                keys: "Ctrl+Q / Ctrl+C ×2 (Ctrl+D in composer)",
                 section: Essentials,
             },
             ShortcutRow {
@@ -1503,7 +1972,7 @@ impl App {
             PermissionMode::Plan => PermissionMode::AlwaysApprove,
             PermissionMode::AlwaysApprove => PermissionMode::Normal,
         };
-        self.notice = Some(format!("mode: {}", self.permission_mode.label()));
+        self.set_notice(format!("mode: {}", self.permission_mode.label()));
         self.apply_permission_mode();
     }
 
@@ -1570,7 +2039,7 @@ impl App {
             })
             .collect();
         if entries.is_empty() {
-            self.notice = Some("no turns to rewind".into());
+            self.set_notice("no turns to rewind");
         } else {
             self.dialog = Dialog::Rewind(RewindPicker {
                 items: entries,
@@ -1581,14 +2050,14 @@ impl App {
 
     fn copy_text(&mut self, text: String) {
         if text.is_empty() {
-            self.notice = Some("nothing to copy".into());
+            self.set_notice("nothing to copy");
             return;
         }
         let out = clipboard::copy(&text);
         if out.delivered {
-            self.notice = Some("copied".into());
+            self.set_notice("copied");
         } else {
-            self.notice = Some(format!(
+            self.set_notice(format!(
                 "clipboard unreachable; saved to {}",
                 out.backup.display()
             ));
@@ -1604,7 +2073,7 @@ impl App {
                 let mut items = list_sessions(&self.workspace, &self.session_id);
                 items.retain(|it| !self.live_ids.contains(&it.id));
                 if items.is_empty() {
-                    self.notice = Some("no sessions found".into());
+                    self.set_notice("no sessions found");
                 } else {
                     self.dialog = Dialog::Resume(ResumePicker { items, selected: 0 });
                 }
@@ -1655,10 +2124,10 @@ impl App {
             "/mouse" => {
                 self.mouse_capture = !self.mouse_capture;
                 self.mouse_capture_dirty = true;
-                self.notice = Some(if self.mouse_capture {
-                    "mouse on · wheel scrolls · text selection needs Shift now".into()
+                self.set_notice(if self.mouse_capture {
+                    "mouse on · wheel scrolls · text selection needs Shift now"
                 } else {
-                    "mouse off · select and copy text normally".into()
+                    "mouse off · select text natively · wheel falls back to arrow keys"
                 });
             }
             "/theme" => {
@@ -1672,7 +2141,7 @@ impl App {
             }
             "/help" | "/shortcuts" => self.open_shortcuts(),
             "/model" | "/m" => {
-                self.catalog_for_presets = false;
+                self.catalog_for_picker = true;
                 self.status = "loading models".into();
                 let _ = self.cmd_tx.send(Cmd::FetchCatalog {
                     session_id: self.session_id.clone(),
@@ -1695,7 +2164,7 @@ impl App {
             }
             "/plan" => {
                 self.permission_mode = PermissionMode::Plan;
-                self.notice = Some("mode: Plan".into());
+                self.set_notice("mode: Plan");
                 self.apply_permission_mode();
             }
             "/always-approve" => {
@@ -1704,9 +2173,31 @@ impl App {
                 } else {
                     PermissionMode::AlwaysApprove
                 };
-                self.notice = Some(format!("mode: {}", self.permission_mode.label()));
                 self.apply_permission_mode();
             }
+            "/provider" | "/providers" => match parts.next() {
+                Some("add") => {
+                    self.dialog = Dialog::Provider(ProviderWizard::new(
+                        self.provider_protocols.clone(),
+                        self.catalog_providers.clone(),
+                    ));
+                    // 目录预设还没拉过时后台补一次（tui/providers 会回填）。
+                    if self.catalog_providers.is_empty() && !self.demo {
+                        let _ = self.cmd_tx.send(Cmd::ListProviders);
+                    }
+                }
+                Some(other) => {
+                    self.set_notice(format!("unknown /provider subcommand: {other} (try add)"));
+                }
+                None => {
+                    if self.demo {
+                        self.set_notice("demo: providers come from the live bridge");
+                    } else {
+                        self.status = "loading providers".into();
+                        let _ = self.cmd_tx.send(Cmd::ListProviders);
+                    }
+                }
+            },
             other if other.starts_with('/') => {
                 let _ = self.cmd_tx.send(Cmd::ExecuteCommand {
                     session_id: self.session_id.clone(),
@@ -1714,7 +2205,109 @@ impl App {
                 });
                 self.status = format!("running Harness command {other}");
             }
-            _ => self.notice = Some(format!("unknown command: {name}")),
+            _ => self.set_notice(format!("unknown command: {name}")),
+        }
+    }
+
+    /// Dialog::Provider 的 Enter：按步骤分发——Type 定分支、Known 选目录
+    /// 项、文本步校验步进、Models 展开行、Confirm 发桥端保存（面板保持
+    /// 打开，结果回填 error 或关闭）。
+    fn provider_wizard_enter(&mut self) {
+        let Dialog::Provider(wizard) = &mut self.dialog else {
+            return;
+        };
+        if wizard.saving {
+            return;
+        }
+        match wizard.step {
+            ProviderStep::Type => {
+                wizard.kind = if wizard.type_sel == 0 {
+                    Some(WizardKind::Known)
+                } else {
+                    Some(WizardKind::Custom)
+                };
+                if wizard.kind == Some(WizardKind::Known) && wizard.catalog.is_empty() {
+                    wizard.error = Some("catalog not loaded yet — retry in a moment".into());
+                    return;
+                }
+                wizard.advance();
+            }
+            ProviderStep::Known => {
+                let Some(preset) = wizard.catalog.get(wizard.catalog_sel) else {
+                    return;
+                };
+                wizard.id = preset.id.clone();
+                wizard.advance();
+            }
+            ProviderStep::Api if !wizard.protocols.is_empty() => {
+                wizard.api = wizard.protocols[wizard.proto_sel].clone();
+                wizard.advance();
+            }
+            ProviderStep::Models => match wizard.models_focus {
+                ModelsFocus::List => {
+                    if let Some(model) = wizard.models.get_mut(wizard.model_cursor) {
+                        model.open = !model.open;
+                        wizard.models_focus = if model.open {
+                            wizard.detail_col = 0;
+                            ModelsFocus::Detail
+                        } else {
+                            ModelsFocus::List
+                        };
+                    }
+                }
+                ModelsFocus::Manual => {
+                    let id = wizard.manual.trim().to_string();
+                    if !id.is_empty() && !wizard.models.iter().any(|m| m.id == id) {
+                        wizard.models.push(ModelDraft {
+                            id,
+                            included: true,
+                            vision: false,
+                            reasoning: false,
+                            efforts: Vec::new(),
+                            open: false,
+                        });
+                        wizard.model_cursor = wizard.models.len() - 1;
+                    }
+                    wizard.manual.clear();
+                    wizard.models_focus = ModelsFocus::List;
+                }
+                ModelsFocus::Detail => wizard_toggle_detail(wizard),
+            },
+            ProviderStep::Confirm => {
+                // 自定义路由至少一个模型（宿主 resolveRouteModels 对目录外
+                // 路由无 models 直接 invalid，提前拦截友好于吃 schema 错误）。
+                if wizard.kind == Some(WizardKind::Custom)
+                    && !wizard.models.iter().any(|m| m.included)
+                {
+                    wizard.error =
+                        Some("custom routes must declare at least one model".to_string());
+                    return;
+                }
+                if self.demo {
+                    wizard.error = Some("demo: provider writes need the live bridge".into());
+                    return;
+                }
+                wizard.saving = true;
+                wizard.error = None;
+                let draft = wizard.save_payload();
+                let _ = self.cmd_tx.send(Cmd::SaveProvider { draft });
+            }
+            _ => {
+                if let Err(message) = wizard.commit_draft() {
+                    wizard.error = Some(message);
+                    return;
+                }
+                wizard.advance();
+            }
+        }
+    }
+
+    /// key/删除子面板取消或完成后回到列表：重发请求，tui/providers 会重开面板。
+    fn reopen_provider_list(&mut self) {
+        self.dialog = Dialog::None;
+        if !self.demo {
+            self.status = "loading providers".into();
+            let _ = self.cmd_tx.send(Cmd::ListProviders);
         }
     }
 
@@ -1854,12 +2447,247 @@ impl App {
                             .map(String::from);
                         self.reasoning_effort_name = self.reasoning_effort.clone();
                     }
+                    if let Some(protocols) = params
+                        .get("server")
+                        .and_then(|server| server.get("protocols"))
+                        .and_then(Value::as_array)
+                    {
+                        self.provider_protocols = protocols
+                            .iter()
+                            .filter_map(|value| value.as_str().map(String::from))
+                            .collect();
+                        // 向导开着时同步词表（/provider add 先于 ready 完成时）。
+                        if let Dialog::Provider(wizard) = &mut self.dialog {
+                            wizard.protocols = self.provider_protocols.clone();
+                        }
+                    }
                     self.status = "runtime ready".into();
                     self.state = RunState::Idle;
                     if !self.demo {
                         let _ = self.cmd_tx.send(Cmd::FetchCatalog {
                             session_id: self.session_id.clone(),
                         });
+                    }
+                }
+                "tui/provider-saved" => {
+                    self.status = if self.is_running() {
+                        "running".into()
+                    } else {
+                        "idle".into()
+                    };
+                    let ok = params.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let error = params
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+                    let mut close_dialog = false;
+                    if let Dialog::Provider(wizard) = &mut self.dialog {
+                        wizard.saving = false;
+                        if ok {
+                            close_dialog = true;
+                        } else {
+                            // 失败留在面板里：字段还在，改完 Enter 重试。
+                            wizard.error = Some(error.to_string());
+                        }
+                    }
+                    if ok {
+                        if close_dialog {
+                            self.dialog = Dialog::None;
+                        }
+                        let id = params.get("id").and_then(Value::as_str).unwrap_or("?");
+                        let key_note =
+                            if params.get("keyStored").and_then(Value::as_bool) == Some(true) {
+                                "key stored".to_string()
+                            } else if let Some(key_error) =
+                                params.get("keyError").and_then(Value::as_str)
+                            {
+                                format!("key not stored: {key_error}")
+                            } else {
+                                "no key given".to_string()
+                            };
+                        self.set_notice(format!(
+                            "provider {id} added · {key_note} · pick it via /model"
+                        ));
+                        // 目录缓存里还没有新服务商，后台刷新让 /model 立即可选。
+                        if !self.demo {
+                            let _ = self.cmd_tx.send(Cmd::FetchCatalog {
+                                session_id: self.session_id.clone(),
+                            });
+                        }
+                    } else if !matches!(self.dialog, Dialog::Provider(_)) {
+                        self.set_notice(format!("add provider failed: {error}"));
+                    }
+                }
+                "tui/providers" => {
+                    if let Some(protocols) = params.get("protocols").and_then(Value::as_array) {
+                        self.provider_protocols = protocols
+                            .iter()
+                            .filter_map(|value| value.as_str().map(String::from))
+                            .collect();
+                    }
+                    self.status = if self.is_running() {
+                        "running".into()
+                    } else {
+                        "idle".into()
+                    };
+                    let items: Vec<ProviderItem> = params
+                        .get("providers")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .map(|p| {
+                                    let id = p
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("?")
+                                        .to_string();
+                                    let key = p
+                                        .get("key")
+                                        .and_then(|k| {
+                                            k.get("configured")
+                                                .and_then(Value::as_bool)
+                                                .filter(|configured| *configured)
+                                        })
+                                        .and_then(|_| {
+                                            p.get("key")
+                                                .and_then(|k| k.get("source"))
+                                                .and_then(Value::as_str)
+                                        })
+                                        .unwrap_or("none")
+                                        .to_string();
+                                    ProviderItem { id, key }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(catalog) = params.get("catalogProviders").and_then(Value::as_array)
+                    {
+                        self.catalog_providers = catalog
+                            .iter()
+                            .filter_map(|p| {
+                                Some(CatalogProvider {
+                                    id: p.get("id").and_then(Value::as_str)?.to_string(),
+                                    name: p
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("?")
+                                        .to_string(),
+                                    key_page: p
+                                        .get("keyPage")
+                                        .and_then(Value::as_str)
+                                        .map(String::from),
+                                })
+                            })
+                            .collect();
+                        // 向导开着时回填它的目录选项，不要切走面板。
+                        if let Dialog::Provider(wizard) = &mut self.dialog {
+                            wizard.catalog = self.catalog_providers.clone();
+                        }
+                    }
+                    if items.is_empty() {
+                        if !matches!(self.dialog, Dialog::Provider(_)) {
+                            self.set_notice("no providers configured · /provider add");
+                        }
+                    } else if !matches!(self.dialog, Dialog::Provider(_)) {
+                        // 向导/子面板开着时不抢面板（add 流程里的后台刷新）。
+                        self.dialog = Dialog::ProviderList(ProviderListView { items, selected: 0 });
+                    }
+                }
+                "tui/models-fetched" => {
+                    let ok = params.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    if let Dialog::Provider(wizard) = &mut self.dialog {
+                        wizard.fetching = false;
+                        if ok {
+                            let mut added = 0usize;
+                            for id in params
+                                .get("models")
+                                .and_then(Value::as_array)
+                                .map(|list| {
+                                    list.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                            {
+                                if !wizard.models.iter().any(|m| m.id == id) {
+                                    wizard.models.push(ModelDraft {
+                                        id: id.to_string(),
+                                        included: true,
+                                        vision: false,
+                                        reasoning: true,
+                                        efforts: vec![
+                                            "low".into(),
+                                            "medium".into(),
+                                            "high".into(),
+                                            "xhigh".into(),
+                                            "max".into(),
+                                        ],
+                                        open: false,
+                                    });
+                                    added += 1;
+                                }
+                            }
+                            if added == 0 {
+                                wizard.error = Some("endpoint listed no new models".into());
+                            }
+                        } else {
+                            wizard.error = Some(
+                                params
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("fetch failed")
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                "tui/provider-removed" => {
+                    self.status = if self.is_running() {
+                        "running".into()
+                    } else {
+                        "idle".into()
+                    };
+                    let ok = params.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let id = params.get("id").and_then(Value::as_str).unwrap_or("?");
+                    if ok {
+                        self.set_notice(format!("provider {id} removed"));
+                        if !self.demo {
+                            let _ = self.cmd_tx.send(Cmd::FetchCatalog {
+                                session_id: self.session_id.clone(),
+                            });
+                        }
+                    } else {
+                        let error = params
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error");
+                        self.set_notice(format!("remove {id} failed: {error}"));
+                    }
+                    self.reopen_provider_list();
+                }
+                "tui/key-saved" => {
+                    let ok = params.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    if let Dialog::ProviderKey(dialog) = &mut self.dialog {
+                        dialog.saving = false;
+                        if !ok {
+                            dialog.error = Some(
+                                params
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown error")
+                                    .to_string(),
+                            );
+                            return;
+                        }
+                    }
+                    if ok {
+                        let id = params.get("id").and_then(Value::as_str).unwrap_or("?");
+                        self.set_notice(format!("key stored for {id}"));
+                        self.reopen_provider_list();
+                    } else if !matches!(self.dialog, Dialog::ProviderKey(_)) {
+                        let error = params
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error");
+                        self.set_notice(format!("set key failed: {error}"));
                     }
                 }
                 "tui/catalog-result" => {
@@ -2020,20 +2848,28 @@ impl App {
                         self.context_window = row.context_window;
                     }
                     let for_presets = self.catalog_for_presets;
+                    let for_picker = self.catalog_for_picker;
                     self.catalog_for_presets = false;
+                    self.catalog_for_picker = false;
                     if for_presets {
-                        self.notice =
-                            Some(format!("{} presets loaded", self.permission_presets.len()));
+                        self.set_notice(format!(
+                            "{} presets loaded",
+                            self.permission_presets.len()
+                        ));
                         self.apply_permission_mode();
-                    } else if rows.is_empty() {
-                        self.notice = Some("catalog empty".into());
-                    } else {
-                        self.dialog = Dialog::Model(ModelPicker {
-                            rows,
-                            filter: String::new(),
-                            selected,
-                        });
+                    } else if for_picker {
+                        if rows.is_empty() {
+                            self.set_notice("catalog empty");
+                        } else {
+                            self.dialog = Dialog::Model(ModelPicker {
+                                rows,
+                                filter: String::new(),
+                                selected,
+                            });
+                        }
                     }
+                    // 其余来源（tui/ready 启动拉取、capabilities-changed 后台
+                    // 刷新）只更新 capabilities/presets，不弹任何对话框。
                 }
                 "tui/model-set" => {
                     if let Some(current) = params.get("current") {
@@ -2050,6 +2886,12 @@ impl App {
                             .map(String::from);
                         self.reasoning_effort_name = self.reasoning_effort.clone();
                         self.status = format!("model: {provider}/{model}");
+                        // 记住选择：下次启动 local defaults 直接命中（settings.rs）。
+                        if let Err(e) =
+                            crate::settings::update(&[("provider", provider), ("model", model)])
+                        {
+                            self.set_notice(format!("settings save failed: {e}"));
+                        }
                     }
                 }
                 "tui.capabilities-changed" => {
@@ -2063,7 +2905,7 @@ impl App {
                         .and_then(Value::as_str)
                         .unwrap_or("success");
                     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-                    self.notice = Some(if text.is_empty() {
+                    self.set_notice(if text.is_empty() {
                         format!("Harness command {kind}")
                     } else {
                         format!("{kind}: {text}")
@@ -2196,11 +3038,11 @@ impl App {
                     self.queue.clear();
                     self.scroll = 0;
                     self.status = "rewound".into();
-                    self.notice = Some("rewound (new session continues here)".into());
+                    self.set_notice("rewound (new session continues here)");
                 }
                 "tui/compacted" => {
                     self.status = "compacted".into();
-                    self.notice = Some("history compacted".into());
+                    self.set_notice("history compacted");
                 }
                 "tui/mode-set" => {
                     if let Some(preset) = params.get("applied").and_then(Value::as_str) {
@@ -2245,7 +3087,7 @@ impl App {
                                 self.transcript.apply(ev);
                             }
                             self.scroll = 0;
-                            self.notice = Some(format!("replayed {} events", events.len()));
+                            self.set_notice(format!("replayed {} events", events.len()));
                         }
                     }
                 }
@@ -2266,11 +3108,11 @@ impl App {
                 self.handle_key(ev);
             }
             AppEvent::RuntimeStderr(line) => {
-                self.notice = Some(line);
+                self.set_notice(line);
             }
             AppEvent::RuntimeExited(code) => {
                 if !self.quit {
-                    self.notice = Some(format!("runtime exited: {:?}", code));
+                    self.set_notice(format!("runtime exited: {:?}", code));
                     self.state = RunState::Idle;
                 }
             }
@@ -2376,6 +3218,12 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
+                // 空 questions 的畸形请求会让绘制和按键路径都索引越界；
+                // 与 busy 一样 fail-closed，直接回错误而不是打开空卡。
+                if questions.is_empty() {
+                    self.respond(id, json!({ "error": "no questions" }));
+                    return;
+                }
                 if self.has_dialog() {
                     self.respond(id, json!({ "error": "busy" }));
                     return;
@@ -2407,9 +3255,35 @@ impl App {
     /// that alone made the screen judder under a moving pointer.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         use crossterm::event::MouseEventKind;
-
         if self.has_dialog() {
-            return false;
+            match mouse.kind {
+                // 滚轮 = 方向键：所有弹窗复用各自的 ↑/↓ 处理（移动选择或滚动）。
+                MouseEventKind::ScrollUp => {
+                    self.dialog_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.dialog_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    return true;
+                }
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    let hit = self
+                        .dialog_hits
+                        .iter()
+                        .find(|hit| hit.contains(mouse.column, mouse.row))
+                        .copied();
+                    return match hit {
+                        Some(DialogHit::Select { index, .. }) => self.dialog_click_select(index),
+                        Some(DialogHit::Key { ch, .. }) => {
+                            self.dialog_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                            true
+                        }
+                        // 未命中选项行时忽略（不抢焦点、不关弹窗），与旧行为一致。
+                        None => false,
+                    };
+                }
+                _ => return false,
+            }
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -2425,23 +3299,139 @@ impl App {
                 true
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                // Only move focus. This used to also slam `scroll` to 0, so a
-                // click near the composer yanked the viewport to the bottom —
-                // which read as the UI jumping while trying to select text.
-                let next = if mouse.row >= self.composer_top {
-                    Focus::Prompt
-                } else {
-                    Focus::Scrollback
-                };
-                if next == Focus::Scrollback {
+                // composer_bottom 为 0 说明还没画过第一帧，退回旧的"顶部以下
+                // 皆 composer"启发式，行为与引入几何字段前一致。
+                let in_box = mouse.row >= self.composer_top
+                    && (self.composer_bottom == 0 || mouse.row < self.composer_bottom);
+                if !in_box {
+                    // Only move focus. This used to also slam `scroll` to 0, so a
+                    // click near the composer yanked the viewport to the bottom —
+                    // which read as the UI jumping while trying to select text.
+                    let changed = self.focus != Focus::Scrollback;
+                    self.focus = Focus::Scrollback;
                     self.follow_selection = true;
+                    return changed;
                 }
-                let changed = self.focus != next;
-                self.focus = next;
+                let mut changed = self.focus != Focus::Prompt;
+                self.focus = Focus::Prompt;
+                // 点击文本区内（非边框）时把光标搬到点击处：grok 的
+                // click-to-position，免去长按方向键。
+                if mouse.row > self.composer_top
+                    && (self.composer_bottom == 0 || mouse.row + 1 < self.composer_bottom)
+                {
+                    let layout = crate::ui::composer_layout(
+                        &self.input,
+                        self.cursor,
+                        self.composer_inner_width,
+                    );
+                    let visible_start =
+                        crate::ui::composer_visible_start(layout.rows.len(), layout.cursor_row);
+                    let row = visible_start + (mouse.row - self.composer_top - 1) as usize;
+                    // 左边框 1 列 + "› " 前缀 2 列。
+                    let col = (mouse.column as usize).saturating_sub(3);
+                    let offset = crate::ui::composer_offset_at(
+                        &self.input,
+                        self.composer_inner_width,
+                        row,
+                        col,
+                    );
+                    if offset != self.cursor {
+                        self.cursor = offset;
+                        self.typing_run = false;
+                        self.leave_history_navigation();
+                        changed = true;
+                    }
+                }
                 changed
             }
             _ => false,
         }
+    }
+
+    /// 鼠标点击弹窗选项行：把选择光标搬到被点项，再注入一次 Enter，
+    /// 与"方向键移动 + 回车"的键盘路径完全同码。个别弹窗语义不同：
+    /// Ask 多选只切换不跳题，ProviderList 只移动选择（Enter 本无操作），
+    /// Theme 点击即预览（方向键本来就实时换肤，点击不能跳过预览直接保存）。
+    fn dialog_click_select(&mut self, index: usize) -> bool {
+        let mut confirm = true;
+        match &mut self.dialog {
+            Dialog::Approval(d) => {
+                d.selected = index.min(d.options.len().saturating_sub(1));
+            }
+            Dialog::Ask(d) => {
+                let cur = d.current.min(d.questions.len().saturating_sub(1));
+                let opts = d.questions[cur].options.len();
+                if index >= opts {
+                    return false;
+                }
+                d.cursors[cur] = index;
+                if d.questions[cur].multi_select {
+                    if d.answers[cur].contains(&index) {
+                        d.answers[cur].retain(|i| *i != index);
+                    } else {
+                        d.answers[cur].push(index);
+                    }
+                    confirm = false;
+                } else {
+                    d.answers[cur] = vec![index];
+                }
+            }
+            Dialog::Theme(t) => {
+                t.selected = index.min(1);
+                self.theme = if t.selected == 0 {
+                    crate::theme::theme_for("dark")
+                } else {
+                    crate::theme::theme_for("light")
+                };
+            }
+            Dialog::Palette(p) => {
+                p.selected = index.min(p.visible.len().saturating_sub(1));
+            }
+            Dialog::Model(m) => {
+                // Model 的 selected 是 rows 下标（渲染期已换算）。
+                if index < m.rows.len() {
+                    m.selected = index;
+                }
+            }
+            Dialog::Effort(e) => {
+                e.selected = index.min(e.rows.len().saturating_sub(1));
+            }
+            Dialog::Resume(p) => {
+                p.selected = index.min(p.items.len().saturating_sub(1));
+            }
+            Dialog::Rewind(r) => {
+                r.selected = index.min(r.items.len().saturating_sub(1));
+            }
+            Dialog::FilePicker(f) => {
+                f.selected = index.min(f.visible.len().saturating_sub(1));
+            }
+            Dialog::History(v) => {
+                v.selected = index.min(v.visible.len().saturating_sub(1));
+            }
+            Dialog::ProviderList(v) => {
+                v.selected = index.min(v.items.len().saturating_sub(1));
+                confirm = false;
+            }
+            Dialog::Provider(w) => match w.step {
+                ProviderStep::Type => w.type_sel = index.min(1),
+                ProviderStep::Known => {
+                    w.catalog_sel = index.min(w.catalog.len().saturating_sub(1));
+                }
+                ProviderStep::Api if !w.protocols.is_empty() => {
+                    w.proto_sel = index.min(w.protocols.len().saturating_sub(1));
+                }
+                ProviderStep::Models => {
+                    w.model_cursor = index.min(w.models.len().saturating_sub(1));
+                    w.sync_models_focus();
+                }
+                _ => confirm = false,
+            },
+            _ => confirm = false,
+        }
+        if confirm {
+            self.dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        true
     }
 
     fn handle_key(&mut self, ev: Event) {
@@ -2470,7 +3460,7 @@ impl App {
                 self.quit = true;
             } else {
                 self.arm(Confirm::Quit);
-                self.notice = Some("press again to quit".into());
+                self.set_notice("press again to quit");
             }
             return;
         }
@@ -2579,16 +3569,23 @@ impl App {
             return;
         }
 
-        // ---- Ctrl+C: clear draft first, then cancel (docs/01 section 2.5) ----
+        // ---- Ctrl+C: clear draft → cancel turn → quit (docs/01 section 2.5) ----
+        // 对齐常见 harness 手感：空闲且输入框为空时 Ctrl+C 是退出（双按
+        // 确认，与 Ctrl+Q 同一条确认臂）；有草稿先清草稿，运行中先清再取消。
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.is_running() && !self.input.is_empty() {
                 self.clear_input();
                 self.leave_history_navigation();
             } else if self.is_running() {
                 self.cancel_now();
-            } else {
+            } else if !self.input.is_empty() {
                 self.clear_input();
                 self.leave_history_navigation();
+            } else if self.armed(Confirm::Quit) {
+                self.quit = true;
+            } else {
+                self.arm(Confirm::Quit);
+                self.set_notice("press again to quit");
             }
             return;
         }
@@ -2609,7 +3606,7 @@ impl App {
                 self.run_command("/new");
             } else {
                 self.arm(Confirm::NewSession);
-                self.notice = Some("press again for a new session".into());
+                self.set_notice("press again for a new session");
             }
             return;
         }
@@ -2673,7 +3670,7 @@ impl App {
             if self.focus == Focus::Prompt {
                 self.toggle_multiline();
             } else {
-                self.catalog_for_presets = false;
+                self.catalog_for_picker = true;
                 self.status = "loading models".into();
                 let _ = self.cmd_tx.send(Cmd::FetchCatalog {
                     session_id: self.session_id.clone(),
@@ -2724,10 +3721,10 @@ impl App {
                     c.folded = !target;
                 }
             }
-            self.notice = Some(if target {
-                "thinking expanded".into()
+            self.set_notice(if target {
+                "thinking expanded"
             } else {
-                "thinking collapsed".into()
+                "thinking collapsed"
             });
             return;
         }
@@ -2870,10 +3867,10 @@ impl App {
                 }
                 KeyCode::Char('E') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     let expanded = self.transcript.toggle_all_folds();
-                    self.notice = Some(if expanded {
-                        "all expanded".into()
+                    self.set_notice(if expanded {
+                        "all expanded"
                     } else {
-                        "all collapsed".into()
+                        "all collapsed"
                     });
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -3082,7 +4079,8 @@ impl App {
 
     /// plan-review intent (docs/01 section 3.4): the plan markdown renders
     /// in a scrolled window; a approves, s requests changes with typed
-    /// feedback, q abandons, c/y are TODO, arrows scroll the plan.
+    /// feedback, c comments on the line under the cursor, y copies the plan,
+    /// q abandons, arrows scroll the plan.
     fn plan_review_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
         let (request_id, qid, approve, other, taking, fb, scroll) = {
@@ -3701,13 +4699,18 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
                     t.selected = 1 - t.selected;
                     self.theme = if t.selected == 0 {
-                        crate::theme::DARK
+                        // theme_for 重新走终端能力量化，保持与启动主题同一管道，
+                        // 而不是把未量化的 DARK/LIGHT 常量直接拍上屏。
+                        crate::theme::theme_for("dark")
                     } else {
-                        crate::theme::LIGHT
+                        crate::theme::theme_for("light")
                     };
                 }
                 KeyCode::Enter => {
                     self.dialog = Dialog::None;
+                    if let Err(e) = crate::settings::update(&[("theme", self.theme.name)]) {
+                        self.set_notice(format!("settings save failed: {e}"));
+                    }
                 }
                 KeyCode::Esc => {
                     self.theme = t.original;
@@ -3949,6 +4952,229 @@ impl App {
                 }
                 _ => {}
             },
+            Dialog::Provider(wizard) => {
+                let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Esc => match (wizard.step, wizard.models_focus) {
+                        // Models 步内先退焦点，再退面板。
+                        (ProviderStep::Models, ModelsFocus::List) => self.dialog = Dialog::None,
+                        (ProviderStep::Models, _) => wizard.models_focus = ModelsFocus::List,
+                        _ => self.dialog = Dialog::None,
+                    },
+                    // 等待桥端结果时屏蔽编辑，只许 Esc。
+                    _ if wizard.saving => {}
+                    KeyCode::Enter => self.provider_wizard_enter(),
+                    KeyCode::BackTab => wizard.back(),
+                    // Models 步 Enter 被行展开占用，Tab 承担步进。
+                    KeyCode::Tab if wizard.step == ProviderStep::Models => {
+                        match wizard.models_focus {
+                            ModelsFocus::List => wizard.advance(),
+                            _ => wizard.models_focus = ModelsFocus::List,
+                        }
+                    }
+                    // ---- 选项光标的上下移动（Type/Known/Api 词表/Models 列表）----
+                    KeyCode::Up | KeyCode::Char('k') => match wizard.step {
+                        ProviderStep::Type => wizard.type_sel = wizard.type_sel.saturating_sub(1),
+                        ProviderStep::Known => {
+                            wizard.catalog_sel = wizard.catalog_sel.saturating_sub(1)
+                        }
+                        ProviderStep::Api if !wizard.protocols.is_empty() => {
+                            wizard.proto_sel = wizard.proto_sel.saturating_sub(1)
+                        }
+                        ProviderStep::Models => {
+                            wizard.model_cursor = wizard.model_cursor.saturating_sub(1);
+                            wizard.sync_models_focus();
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Down | KeyCode::Char('j') => match wizard.step {
+                        ProviderStep::Type => wizard.type_sel = (wizard.type_sel + 1).min(1),
+                        ProviderStep::Known => {
+                            wizard.catalog_sel =
+                                (wizard.catalog_sel + 1).min(wizard.catalog.len().saturating_sub(1))
+                        }
+                        ProviderStep::Api if !wizard.protocols.is_empty() => {
+                            wizard.proto_sel =
+                                (wizard.proto_sel + 1).min(wizard.protocols.len().saturating_sub(1))
+                        }
+                        ProviderStep::Models => {
+                            wizard.model_cursor = (wizard.model_cursor + 1)
+                                .min(wizard.models.len().saturating_sub(1));
+                            wizard.sync_models_focus();
+                        }
+                        _ => {}
+                    },
+                    // ---- Models 步的左右与焦点 ----
+                    KeyCode::Right if wizard.step == ProviderStep::Models => {
+                        match wizard.models_focus {
+                            ModelsFocus::List => {
+                                if let Some(m) = wizard.models.get_mut(wizard.model_cursor) {
+                                    m.open = true;
+                                    wizard.detail_col = 0;
+                                    wizard.models_focus = ModelsFocus::Detail;
+                                }
+                            }
+                            ModelsFocus::Detail => {
+                                wizard.detail_col =
+                                    (wizard.detail_col + 1).min(1 + EFFORT_LEVELS.len())
+                            }
+                            ModelsFocus::Manual => {}
+                        }
+                    }
+                    KeyCode::Left if wizard.step == ProviderStep::Models => {
+                        match wizard.models_focus {
+                            ModelsFocus::Detail if wizard.detail_col > 0 => wizard.detail_col -= 1,
+                            ModelsFocus::Detail => wizard.models_focus = ModelsFocus::List,
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Char(' ') if wizard.step == ProviderStep::Models => {
+                        match wizard.models_focus {
+                            ModelsFocus::List => {
+                                if let Some(m) = wizard.models.get_mut(wizard.model_cursor) {
+                                    m.included = !m.included;
+                                }
+                            }
+                            ModelsFocus::Detail => wizard_toggle_detail(wizard),
+                            ModelsFocus::Manual => wizard.manual.push(' '),
+                        }
+                    }
+                    KeyCode::Char('f')
+                        if plain
+                            && wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::List
+                            && !wizard.fetching =>
+                    {
+                        // 拉取走桥端（GET {baseURL}/models），anthropic 协议无
+                        // 可读列表时桥端会报错，回填到面板。
+                        wizard.fetching = true;
+                        wizard.error = None;
+                        let _ = self.cmd_tx.send(Cmd::FetchModels {
+                            api: wizard.api.clone(),
+                            base_url: wizard.base_url.clone(),
+                            api_key: wizard.api_key.clone(),
+                        });
+                    }
+                    KeyCode::Char('i')
+                        if plain
+                            && wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::List =>
+                    {
+                        wizard.models_focus = ModelsFocus::Manual;
+                    }
+                    KeyCode::Char('o') if plain && wizard.step == ProviderStep::Known => {
+                        if let Some(page) = wizard
+                            .catalog
+                            .get(wizard.catalog_sel)
+                            .and_then(|p| p.key_page.clone())
+                        {
+                            open_url(&page);
+                        }
+                    }
+                    // ---- 文本输入 ----
+                    KeyCode::Backspace => {
+                        if wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::Manual
+                        {
+                            wizard.manual.pop();
+                        } else if wizard.editing_text() {
+                            wizard.draft.pop();
+                        }
+                    }
+                    KeyCode::Char(c) if plain => {
+                        if wizard.step == ProviderStep::Models
+                            && wizard.models_focus == ModelsFocus::Manual
+                        {
+                            wizard.manual.push(c);
+                        } else if wizard.editing_text() {
+                            wizard.draft.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Dialog::ProviderList(view) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.dialog = Dialog::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    view.selected = view.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    view.selected = (view.selected + 1).min(view.items.len().saturating_sub(1));
+                }
+                KeyCode::Char('a') => {
+                    self.dialog = Dialog::Provider(ProviderWizard::new(
+                        self.provider_protocols.clone(),
+                        self.catalog_providers.clone(),
+                    ));
+                }
+                KeyCode::Char('e') => {
+                    if let Some(item) = view.items.get(view.selected) {
+                        self.dialog = Dialog::ProviderKey(ProviderKeyDialog {
+                            id: item.id.clone(),
+                            draft: String::new(),
+                            saving: false,
+                            error: None,
+                        });
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(item) = view.items.get(view.selected) {
+                        self.dialog = Dialog::ProviderRemove(item.id.clone());
+                    }
+                }
+                _ => {}
+            },
+            Dialog::ProviderKey(dialog) => match key.code {
+                KeyCode::Esc => self.reopen_provider_list(),
+                _ if dialog.saving => {}
+                KeyCode::Enter => {
+                    let key = dialog.draft.trim().to_string();
+                    if key.is_empty() {
+                        dialog.error = Some("key must not be empty".into());
+                    } else if self.demo {
+                        dialog.error = Some("demo: provider writes need the live bridge".into());
+                    } else {
+                        dialog.saving = true;
+                        dialog.error = None;
+                        let _ = self.cmd_tx.send(Cmd::SetProviderKey {
+                            id: dialog.id.clone(),
+                            api_key: key,
+                        });
+                    }
+                }
+                KeyCode::Backspace => {
+                    dialog.draft.pop();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    dialog.draft.push(c);
+                }
+                _ => {}
+            },
+            Dialog::ProviderRemove(raw_id) => {
+                let id = raw_id.clone();
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if self.demo {
+                            self.dialog = Dialog::None;
+                            self.set_notice("demo: provider writes need the live bridge");
+                        } else {
+                            self.dialog = Dialog::None;
+                            self.status = format!("removing {id}");
+                            let _ = self.cmd_tx.send(Cmd::RemoveProvider { id: id.clone() });
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.reopen_provider_list();
+                    }
+                    _ => {}
+                }
+            }
             Dialog::None => {}
         }
     }
@@ -4293,6 +5519,243 @@ mod tests {
     }
 
     #[test]
+    fn dialog_clicks_move_selection_and_confirm_like_the_keyboard() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let click = |row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // ProviderList：点击只移动选择（Enter 在列表里本无操作），弹窗不关。
+        let mut app = test_app();
+        app.dialog = Dialog::ProviderList(ProviderListView {
+            items: vec![
+                ProviderItem {
+                    id: "a".into(),
+                    key: "none".into(),
+                },
+                ProviderItem {
+                    id: "b".into(),
+                    key: "none".into(),
+                },
+            ],
+            selected: 0,
+        });
+        app.dialog_hits = vec![
+            DialogHit::Select {
+                row: 5,
+                col_start: 10,
+                col_end: 30,
+                index: 0,
+            },
+            DialogHit::Select {
+                row: 6,
+                col_start: 10,
+                col_end: 30,
+                index: 1,
+            },
+        ];
+        assert!(app.handle_mouse(click(6)));
+        let Dialog::ProviderList(view) = &app.dialog else {
+            panic!("click on a row must not close the list")
+        };
+        assert_eq!(view.selected, 1);
+        // 未命中任何选项行：忽略，选择不变。
+        assert!(!app.handle_mouse(click(9)));
+        let Dialog::ProviderList(view) = &app.dialog else {
+            panic!("missed click must not close the list")
+        };
+        assert_eq!(view.selected, 1);
+        // 滚轮 = 方向键。
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..click(0)
+        }));
+        let Dialog::ProviderList(view) = &app.dialog else {
+            panic!("list stays open")
+        };
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn dialog_click_ask_single_select_answers_and_advances() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let question = |id: &str, options: &[&str], multi_select: bool| Question {
+            id: id.into(),
+            question: "q?".into(),
+            header: String::new(),
+            detail: String::new(),
+            plan_approve: None,
+            options: options.iter().map(|s| s.to_string()).collect(),
+            multi_select,
+        };
+        let mut app = test_app();
+        app.dialog = Dialog::Ask(AskDialog {
+            request_id: "r".into(),
+            questions: vec![
+                question("q1", &["x", "y"], false),
+                question("q2", &["m"], false),
+            ],
+            current: 0,
+            answers: vec![Vec::new(), Vec::new()],
+            cursors: vec![0, 0],
+            feedback: String::new(),
+            taking_feedback: false,
+            detail_scroll: 0,
+            custom_text: String::new(),
+            taking_text: false,
+            parked: false,
+        });
+        app.dialog_hits = vec![
+            DialogHit::Select {
+                row: 5,
+                col_start: 10,
+                col_end: 30,
+                index: 0,
+            },
+            DialogHit::Select {
+                row: 6,
+                col_start: 10,
+                col_end: 30,
+                index: 1,
+            },
+        ];
+        let click = |row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 单选：点第 2 项 = 数字键选中 + Enter 跳到下一题。
+        assert!(app.handle_mouse(click(6)));
+        let Dialog::Ask(d) = &app.dialog else {
+            panic!("single-select click advances to the next question")
+        };
+        assert_eq!(d.answers[0], vec![1]);
+        assert_eq!(d.current, 1);
+    }
+
+    #[test]
+    fn dialog_click_ask_multi_select_toggles_without_advancing() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.dialog = Dialog::Ask(AskDialog {
+            request_id: "r".into(),
+            questions: vec![Question {
+                id: "q1".into(),
+                question: "q?".into(),
+                header: String::new(),
+                detail: String::new(),
+                plan_approve: None,
+                options: vec!["x".into(), "y".into()],
+                multi_select: true,
+            }],
+            current: 0,
+            answers: vec![Vec::new()],
+            cursors: vec![0],
+            feedback: String::new(),
+            taking_feedback: false,
+            detail_scroll: 0,
+            custom_text: String::new(),
+            taking_text: false,
+            parked: false,
+        });
+        app.dialog_hits = vec![DialogHit::Select {
+            row: 5,
+            col_start: 10,
+            col_end: 30,
+            index: 0,
+        }];
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click()));
+        let Dialog::Ask(d) = &app.dialog else {
+            panic!("multi-select click must not submit")
+        };
+        assert_eq!(d.answers[0], vec![0]);
+        assert_eq!(d.current, 0);
+        // 再点一次取消勾选。
+        assert!(app.handle_mouse(click()));
+        let Dialog::Ask(d) = &app.dialog else {
+            panic!("still open")
+        };
+        assert!(d.answers[0].is_empty());
+    }
+
+    #[test]
+    fn dialog_click_remove_confirm_maps_halves_to_y_and_n() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.dialog = Dialog::ProviderRemove("deepseek".into());
+        app.dialog_hits = vec![
+            DialogHit::Key {
+                row: 5,
+                col_start: 10,
+                col_end: 20,
+                ch: 'y',
+            },
+            DialogHit::Key {
+                row: 5,
+                col_start: 20,
+                col_end: 30,
+                ch: 'n',
+            },
+        ];
+        let click = |column: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 右半 = n：取消（reopen 走 dummy channel，面板关闭）。
+        assert!(app.handle_mouse(click(25)));
+        assert!(matches!(app.dialog, Dialog::None));
+        // 左半 = y：发出 RemoveProvider 并关闭。
+        app.dialog = Dialog::ProviderRemove("deepseek".into());
+        assert!(app.handle_mouse(click(15)));
+        assert!(matches!(app.dialog, Dialog::None));
+    }
+
+    #[test]
+    fn clicking_composer_text_moves_the_caret_there() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.set_input("hello world");
+        app.cursor = 0;
+        // 画过一帧的几何：盒子 30..35，文本区宽 115。
+        app.composer_top = 30;
+        app.composer_bottom = 35;
+        app.composer_inner_width = 115;
+        app.focus = Focus::Scrollback;
+
+        // 文本区第一行：x = 边框 1 + 前缀 2 + 第 6 列 → "hello| world"。
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3 + 6,
+            row: 31,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click));
+        assert_eq!(app.focus, Focus::Prompt);
+        assert_eq!(app.cursor, 6);
+        assert_eq!(
+            app.input, "hello world",
+            "click moves the caret, never edits"
+        );
+
+        // 点边框行只聚焦、不动光标。
+        let border = MouseEvent { row: 30, ..click };
+        assert!(!app.handle_mouse(border));
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[test]
     fn clicking_the_composer_does_not_yank_the_viewport() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = test_app();
@@ -4345,7 +5808,10 @@ mod tests {
         app.focus = Focus::Scrollback;
         app.scroll = 5;
         app.handle_key(key(KeyCode::Left, KeyModifiers::SHIFT));
-        assert_eq!(app.scroll, 5, "turn navigation must not scroll the viewport");
+        assert_eq!(
+            app.scroll, 5,
+            "turn navigation must not scroll the viewport"
+        );
     }
 
     #[test]
@@ -4409,19 +5875,20 @@ mod tests {
     #[test]
     fn mouse_toggle_flags_the_event_loop_to_reissue_the_sequence() {
         let mut app = test_app();
-        // Off by default so native select-and-copy works without a ceremony;
+        // On by default so the wheel scrolls instead of the terminal turning
+        // it into arrow keys (which the composer reads as history recall);
         // dirty at construction so the loop applies whatever the default is.
-        assert!(!app.mouse_capture);
+        assert!(app.mouse_capture);
         assert!(app.mouse_capture_dirty);
         app.mouse_capture_dirty = false;
 
         app.run_command("/mouse");
-        assert!(app.mouse_capture, "opting into the wheel");
+        assert!(!app.mouse_capture, "opting out for native selection");
         assert!(app.mouse_capture_dirty);
 
         app.mouse_capture_dirty = false;
         app.run_command("/mouse");
-        assert!(!app.mouse_capture);
+        assert!(app.mouse_capture);
         assert!(app.mouse_capture_dirty);
     }
 
@@ -4436,7 +5903,10 @@ mod tests {
         let mut app = test_app();
         app.dialog = Dialog::Info(InfoDialog { rows: rows.clone() });
         app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
-        assert!(matches!(app.dialog, Dialog::None), "copying closes the card");
+        assert!(
+            matches!(app.dialog, Dialog::None),
+            "copying closes the card"
+        );
         assert!(
             app.notice.as_deref().is_some_and(|n| n.contains("copied")),
             "expected a copy confirmation, got {:?}",
@@ -4662,6 +6132,65 @@ mod tests {
         app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
         app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert!(!app.quit, "Ctrl+N's arm must not authorise a quit");
+    }
+
+    #[test]
+    fn ctrl_c_quits_only_when_idle_and_the_composer_is_empty() {
+        // 空闲 + 空输入：双按退出（与 Ctrl+Q 共用一条确认臂）。
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit, "a single Ctrl+C only arms the quit");
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+
+        // 有草稿时先清草稿，不退出、不占用确认臂。
+        let mut app = test_app();
+        app.input = "draft".into();
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit);
+        assert!(app.input.is_empty(), "the first Ctrl+C clears the draft");
+        app.input = "again".into();
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            !app.quit,
+            "clearing a draft must not double as the second press"
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn transient_notices_fade_but_confirm_prompts_survive_the_ttl() {
+        let mut app = test_app();
+        app.set_notice("copied");
+        app.tick();
+        assert_eq!(app.notice.as_deref(), Some("copied"), "fresh notice stays");
+        app.notice_at =
+            Some(Instant::now() - std::time::Duration::from_millis(NOTICE_TTL_MS as u64 + 100));
+        app.tick();
+        assert_eq!(app.notice, None, "stale notice fades");
+
+        // Confirm prompts die with their arm, not the clock.
+        let mut app = test_app();
+        app.arm(Confirm::Quit);
+        app.set_notice("press again to quit");
+        app.notice_at =
+            Some(Instant::now() - std::time::Duration::from_millis(NOTICE_TTL_MS as u64 + 100));
+        app.tick();
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("press again to quit"),
+            "confirm prompt is not eaten by the TTL"
+        );
+    }
+
+    #[test]
+    fn empty_ask_user_request_fails_closed_instead_of_panicking() {
+        let mut app = test_app();
+        app.open_dialog("req-1".into(), "ui/ask-user", &json!({ "questions": [] }));
+        assert!(
+            matches!(app.dialog, Dialog::None),
+            "an empty questions array must not open a card"
+        );
     }
 
     #[test]
@@ -5102,6 +6631,8 @@ mod tests {
             tx,
             "/tmp".into(),
         );
+        // 模拟 /model 路径：用户主动拉目录，结果到达才弹选择器。
+        app.catalog_for_picker = true;
         app.handle(AppEvent::Rpc {
             method: "tui/catalog-result".into(),
             params: json!({
@@ -5162,6 +6693,33 @@ mod tests {
         assert_eq!(reasoning_effort.as_deref(), Some("high"));
         assert_eq!(app.reasoning_effort_name.as_deref(), Some("High"));
         assert_eq!(app.context_window, Some(400000));
+    }
+
+    #[test]
+    fn startup_catalog_fetch_updates_state_without_opening_the_picker() {
+        let (tx, _rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::DARK,
+            "session".into(),
+            "old-provider".into(),
+            "old-model".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.handle(AppEvent::Rpc {
+            method: "tui/catalog-result".into(),
+            params: json!({
+                "permissionPresets": [],
+                "current": { "provider": "asxs", "model": "gpt-5.6-sol" },
+                "models": [{ "provider": "asxs", "id": "gpt-5.6-sol", "name": "GPT 5.6 Sol" }]
+            }),
+        });
+        assert!(
+            matches!(app.dialog, Dialog::None),
+            "启动时的目录拉取（tui/ready）不得弹模型选择器"
+        );
+        assert!(app.catalog_loaded, "但 capabilities/presets 数据要照常更新");
     }
     #[test]
     fn plan_review_scrolls_forward_and_feedback_captures_navigation_keys() {
@@ -5373,5 +6931,375 @@ mod tests {
         assert!(matches!(rx.recv().unwrap(), Cmd::FetchCatalog { .. }));
         assert!(matches!(rx.recv().unwrap(), Cmd::FetchJobs));
         assert!(matches!(app.dialog, Dialog::None));
+    }
+
+    #[test]
+    fn provider_id_validation_matches_the_bridge_pattern() {
+        for valid in ["a", "openrouter", "my-provider", "a1-b2", "x-y-z"] {
+            assert!(valid_provider_id(valid), "{valid} should be valid");
+        }
+        for invalid in ["", "A", "1a", "-a", "a-", "a--b", "a_b", "a b", "OPENCODE"] {
+            assert!(!valid_provider_id(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    /// 测试辅助：构造带命令通道的 App 并打开 add 向导（含目录预设）。
+    fn wizard_app() -> (App, std::sync::mpsc::Receiver<Cmd>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::DARK,
+            "s1".into(),
+            "p".into(),
+            "m".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.catalog_providers = vec![
+            CatalogProvider {
+                id: "deepseek".into(),
+                name: "DeepSeek".into(),
+                key_page: Some("https://platform.deepseek.com/api-keys".into()),
+            },
+            CatalogProvider {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                key_page: None,
+            },
+        ];
+        app.run_command("/provider add");
+        (app, rx)
+    }
+
+    fn set_draft(app: &mut App, text: &str) {
+        if let Dialog::Provider(w) = &mut app.dialog {
+            w.draft = text.to_string();
+        }
+    }
+
+    /// 走完 custom 分支的连接段，停在 Models 步。
+    fn walk_custom_to_models(app: &mut App) {
+        // Type：光标移到"自定义"（type_sel = 1）。
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        app.provider_wizard_enter();
+        set_draft(app, "my-api");
+        app.provider_wizard_enter();
+        set_draft(app, "openai-responses");
+        app.provider_wizard_enter();
+        set_draft(app, "https://api.example.com/v1");
+        app.provider_wizard_enter();
+        set_draft(app, "sk-test");
+        app.provider_wizard_enter();
+    }
+
+    #[test]
+    fn provider_wizard_custom_walks_and_emits_rich_save() {
+        let (mut app, rx) = wizard_app();
+        walk_custom_to_models(&mut app);
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert_eq!(w.step, ProviderStep::Models);
+
+        // 手填两个模型，给第二个配多模态 + 思考级别。
+        if let Dialog::Provider(w) = &mut app.dialog {
+            w.models = vec![
+                ModelDraft {
+                    id: "model-a".into(),
+                    included: true,
+                    vision: false,
+                    reasoning: false,
+                    efforts: vec![],
+                    open: false,
+                },
+                ModelDraft {
+                    id: "model-b".into(),
+                    included: true,
+                    vision: true,
+                    reasoning: true,
+                    efforts: vec!["low".into(), "high".into(), "ultra".into()],
+                    open: false,
+                },
+            ];
+        }
+        // Tab 步进到 Confirm，Enter 保存。
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.provider_wizard_enter();
+        let Cmd::SaveProvider { draft } = rx.recv().unwrap() else {
+            panic!("expected SaveProvider");
+        };
+        assert_eq!(draft["id"], "my-api");
+        assert_eq!(draft["api"], "openai-responses");
+        assert_eq!(draft["baseURL"], "https://api.example.com/v1");
+        assert_eq!(draft["apiKey"], "sk-test");
+        assert_eq!(
+            draft["models"],
+            json!([
+                { "id": "model-a", "vision": false, "efforts": [] },
+                { "id": "model-b", "vision": true, "efforts": ["low", "high", "ultra"] },
+            ])
+        );
+        // 成功：面板关闭、通知、后台刷新目录。
+        app.handle(AppEvent::Rpc {
+            method: "tui/provider-saved".into(),
+            params: json!({ "ok": true, "id": "my-api", "keyRef": "MY_API_API_KEY", "keyStored": true, "keyError": null }),
+        });
+        assert!(matches!(app.dialog, Dialog::None));
+        assert!(app.notice.as_deref().unwrap().contains("my-api added"));
+        assert!(matches!(rx.recv().unwrap(), Cmd::FetchCatalog { .. }));
+    }
+
+    #[test]
+    fn provider_wizard_known_flow_writes_key_only() {
+        let (mut app, rx) = wizard_app();
+        // Type 默认光标就在"内置目录"，直接 Enter。
+        app.provider_wizard_enter();
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert_eq!(w.step, ProviderStep::Known);
+        // 光标下移到 openai，Enter 选定 → 跳到 ApiKey。
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        app.provider_wizard_enter();
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert_eq!(w.step, ProviderStep::ApiKey);
+        assert_eq!(w.id, "openai");
+        set_draft(&mut app, "sk-openai");
+        app.provider_wizard_enter(); // → Confirm
+        app.provider_wizard_enter(); // 保存
+        let Cmd::SaveProvider { draft } = rx.recv().unwrap() else {
+            panic!("expected SaveProvider");
+        };
+        // known 形态：只带 key 与 known 标记，协议/URL/模型由目录供给。
+        assert_eq!(
+            draft,
+            json!({ "id": "openai", "apiKey": "sk-openai", "known": true })
+        );
+    }
+
+    #[test]
+    fn provider_wizard_save_failure_stays_in_panel_for_retry() {
+        let (mut app, rx) = wizard_app();
+        app.provider_wizard_enter(); // Type → Known
+        app.provider_wizard_enter(); // Known → ApiKey（deepseek）
+        app.provider_wizard_enter(); // ApiKey（空）→ Confirm
+        app.provider_wizard_enter(); // 保存
+        let _ = rx.recv().unwrap();
+        app.handle(AppEvent::Rpc {
+            method: "tui/provider-saved".into(),
+            params: json!({ "ok": false, "error": "provider already exists: deepseek" }),
+        });
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("failure must keep the panel open");
+        };
+        assert!(!w.saving);
+        assert_eq!(
+            w.error.as_deref(),
+            Some("provider already exists: deepseek")
+        );
+        assert_eq!(w.id, "deepseek");
+    }
+
+    #[test]
+    fn provider_wizard_custom_requires_a_model() {
+        let (mut app, _rx) = wizard_app();
+        walk_custom_to_models(&mut app);
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE)); // → Confirm
+        app.provider_wizard_enter();
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert_eq!(w.step, ProviderStep::Confirm);
+        assert!(w.error.as_deref().unwrap().contains("at least one model"));
+    }
+
+    #[test]
+    fn provider_wizard_models_step_fetch_manual_and_detail() {
+        let (mut app, rx) = wizard_app();
+        walk_custom_to_models(&mut app);
+        // f 拉取：发出 FetchModels，事件回填列表。
+        app.handle_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        let Cmd::FetchModels {
+            api,
+            base_url,
+            api_key,
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected FetchModels");
+        };
+        assert_eq!(api, "openai-responses");
+        assert_eq!(base_url, "https://api.example.com/v1");
+        assert_eq!(api_key, "sk-test");
+        app.handle(AppEvent::Rpc {
+            method: "tui/models-fetched".into(),
+            params: json!({ "ok": true, "models": ["gpt-a", "gpt-b"] }),
+        });
+        // i 手填一个，Enter 提交。
+        app.handle_key(key(KeyCode::Char('i'), KeyModifiers::NONE));
+        if let Dialog::Provider(w) = &mut app.dialog {
+            w.manual = "manual-c".into();
+        }
+        app.provider_wizard_enter();
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert_eq!(w.models.len(), 3);
+        assert_eq!(w.models[2].id, "manual-c");
+        // 拉到的模型默认 included + reasoning 5 级。
+        assert!(w.models[0].included);
+        assert_eq!(w.models[0].efforts.len(), 5);
+        // 手填后光标在 manual-c（models[2]）；先回到 models[0] 再展开。
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        // → 展开第一行进 Detail，Space 切多模态，→→ Space 切 chips。
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // vision on
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE)); // col 1 = 思考开关
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE)); // col 2 = low chip
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE)); // low off
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert!(w.models[0].vision);
+        assert!(!w.models[0].efforts.iter().any(|e| e == "low"));
+        assert!(w.models[0].reasoning, "还有其它级别，思考保持开启");
+        // Esc 从 Detail 回 List，再 Esc 关面板。
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("still open");
+        };
+        assert_eq!(w.models_focus, ModelsFocus::List);
+    }
+
+    #[test]
+    fn provider_wizard_esc_closes_panel_without_side_effects() {
+        let (mut app, rx) = wizard_app();
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.dialog, Dialog::None));
+        // catalog 已预置（wizard_app），add 不会再补拉；无任何命令发出。
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn provider_wizard_selects_protocol_from_bridge_vocabulary() {
+        let (mut app, _rx) = wizard_app();
+        app.handle(AppEvent::Rpc {
+            method: "tui/ready".into(),
+            params: json!({ "server": { "protocols": ["openai-completions", "openai-responses", "anthropic-messages"] } }),
+        });
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE)); // custom
+        app.provider_wizard_enter();
+        set_draft(&mut app, "my-api");
+        app.provider_wizard_enter();
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard open");
+        };
+        assert_eq!(w.step, ProviderStep::Api);
+        assert!(!w.editing_text());
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        app.provider_wizard_enter();
+        let Dialog::Provider(w) = &app.dialog else {
+            panic!("wizard advanced");
+        };
+        assert_eq!(w.api, "openai-responses");
+        assert_eq!(w.step, ProviderStep::BaseUrl);
+    }
+
+    #[test]
+    fn provider_list_opens_dialog_with_key_status_and_catalog() {
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::DARK,
+            "s1".into(),
+            "p".into(),
+            "m".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.run_command("/provider");
+        assert!(matches!(rx.recv().unwrap(), Cmd::ListProviders));
+        app.handle(AppEvent::Rpc {
+            method: "tui/providers".into(),
+            params: json!({
+                "providers": [
+                    { "id": "opencode-go", "name": "opencode-go", "keyRef": "OPENCODE_GO_API_KEY", "key": { "configured": true, "source": "file", "writable": true } },
+                    { "id": "deepseek-official", "name": "deepseek-official", "keyRef": "DEEPSEEK_OFFICIAL_API_KEY", "key": { "configured": false, "writable": true } },
+                ],
+                "protocols": ["openai-responses"],
+                "catalogProviders": [ { "id": "deepseek", "name": "DeepSeek", "keyPage": "https://platform.deepseek.com/api-keys" } ],
+            }),
+        });
+        let Dialog::ProviderList(view) = &app.dialog else {
+            panic!("expected provider list dialog");
+        };
+        assert_eq!(view.items.len(), 2);
+        assert_eq!(view.items[0].id, "opencode-go");
+        assert_eq!(view.items[0].key, "file");
+        assert_eq!(view.items[1].key, "none");
+        assert_eq!(app.provider_protocols, vec!["openai-responses".to_string()]);
+        assert_eq!(app.catalog_providers.len(), 1);
+        assert_eq!(app.catalog_providers[0].id, "deepseek");
+    }
+
+    #[test]
+    fn provider_list_actions_open_sub_dialogs_and_flow() {
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::DARK,
+            "s1".into(),
+            "p".into(),
+            "m".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.dialog = Dialog::ProviderList(ProviderListView {
+            items: vec![ProviderItem {
+                id: "asxs".into(),
+                key: "file".into(),
+            }],
+            selected: 0,
+        });
+        // e → key 输入面板，Enter 发 SetProviderKey。
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+        let Dialog::ProviderKey(dialog) = &mut app.dialog else {
+            panic!("expected key dialog");
+        };
+        dialog.draft = "sk-new".into();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let Cmd::SetProviderKey { id, api_key } = rx.recv().unwrap() else {
+            panic!("expected SetProviderKey");
+        };
+        assert_eq!(id, "asxs");
+        assert_eq!(api_key, "sk-new");
+        // 成功：回列表（重发 ListProviders）。
+        app.handle(AppEvent::Rpc {
+            method: "tui/key-saved".into(),
+            params: json!({ "ok": true, "id": "asxs" }),
+        });
+        assert!(matches!(rx.recv().unwrap(), Cmd::ListProviders));
+        // d → 删除确认，y 发 RemoveProvider。
+        app.dialog = Dialog::ProviderList(ProviderListView {
+            items: vec![ProviderItem {
+                id: "asxs".into(),
+                key: "file".into(),
+            }],
+            selected: 0,
+        });
+        app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(app.dialog, Dialog::ProviderRemove(_)));
+        app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        let Cmd::RemoveProvider { id } = rx.recv().unwrap() else {
+            panic!("expected RemoveProvider");
+        };
+        assert_eq!(id, "asxs");
+        app.handle(AppEvent::Rpc {
+            method: "tui/provider-removed".into(),
+            params: json!({ "ok": true, "id": "asxs" }),
+        });
+        assert!(app.notice.as_deref().unwrap().contains("asxs removed"));
     }
 }

@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Provider Setup — 交互原型</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg-card: #161b22; --bg-hover: #1c2129; --bg-inset: #0d1117;
+    --border: #30363d; --border-strong: #444c56;
+    --text: #e6edf3; --text-dim: #9198a1; --text-faint: #6e7681;
+    --accent: #58a6ff; --accent-dim: #1f3a5f;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149; --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+    min-height: 100vh; display: flex; justify-content: center; padding: 40px 20px;
+  }
+  .app { width: 760px; max-width: 100%; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+  .sub { color: var(--text-dim); font-size: 13px; margin-bottom: 24px; }
+
+  /* ---------- 列表页 ---------- */
+  .provider-list { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .provider-row {
+    display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+    background: var(--bg-card); border-bottom: 1px solid var(--border);
+    cursor: pointer; transition: background .12s;
+  }
+  .provider-row:last-child { border-bottom: none; }
+  .provider-row:hover { background: var(--bg-hover); }
+  .provider-row .glyph {
+    width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center;
+    background: var(--accent-dim); color: var(--accent); font-weight: 700; font-size: 13px;
+    flex-shrink: 0;
+  }
+  .provider-row .name { font-weight: 600; }
+  .provider-row .meta { color: var(--text-dim); font-size: 12px; margin-top: 1px; }
+  .provider-row .grow { flex: 1; min-width: 0; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 500;
+    border: 1px solid transparent; white-space: nowrap;
+  }
+  .badge-key   { color: var(--green);  border-color: rgba(63,185,80,.4);  background: rgba(63,185,80,.1); }
+  .badge-env   { color: var(--accent); border-color: rgba(88,166,255,.4); background: rgba(88,166,255,.1); }
+  .badge-nokey { color: var(--yellow); border-color: rgba(210,153,34,.4); background: rgba(210,153,34,.1); }
+  .badge-oauth { color: var(--text-faint); border-color: var(--border); background: transparent; text-decoration: line-through; }
+  .row-actions { display: flex; gap: 6px; opacity: 0; transition: opacity .12s; }
+  .provider-row:hover .row-actions { opacity: 1; }
+  .icon-btn {
+    border: 1px solid var(--border); background: var(--bg-card); color: var(--text-dim);
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--border-strong); }
+  .icon-btn.danger:hover { color: var(--red); border-color: var(--red); }
+  .add-btn {
+    width: 100%; margin-top: 12px; padding: 12px; border: 1px dashed var(--border-strong);
+    border-radius: 10px; background: transparent; color: var(--text-dim); font-size: 14px;
+    cursor: pointer; transition: all .12s;
+  }
+  .add-btn:hover { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,.05); }
+
+  /* ---------- 向导页 ---------- */
+  .wizard { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-card); overflow: hidden; }
+  .stepper { display: flex; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--border); gap: 8px; }
+  .step-dot {
+    width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
+    font-size: 12px; font-weight: 600; background: var(--bg-inset); color: var(--text-faint);
+    border: 1px solid var(--border); flex-shrink: 0;
+  }
+  .step-dot.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .step-dot.done { background: var(--green); border-color: var(--green); color: #fff; }
+  .step-label { font-size: 12px; color: var(--text-faint); white-space: nowrap; }
+  .step-label.active { color: var(--text); font-weight: 600; }
+  .step-line { flex: 1; height: 1px; background: var(--border); min-width: 12px; }
+  .wizard-body { padding: 24px; min-height: 340px; }
+  .wizard-foot {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 24px; border-top: 1px solid var(--border);
+  }
+  .step-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .step-desc { color: var(--text-dim); font-size: 13px; margin-bottom: 18px; }
+
+  .btn {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px;
+    font-size: 13px; cursor: pointer; background: var(--bg-card); color: var(--text);
+    transition: all .12s;
+  }
+  .btn:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn-primary:hover { background: #4c96e8; border-color: #4c96e8; }
+  .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-ghost { border-color: transparent; color: var(--text-dim); }
+  .btn-ghost:hover { color: var(--text); }
+  .btn-link { border: none; background: none; color: var(--accent); padding: 8px 4px; }
+  .btn-link:hover { text-decoration: underline; }
+
+  .type-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .type-card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+    cursor: pointer; transition: all .12s; background: var(--bg-inset);
+  }
+  .type-card:hover { border-color: var(--border-strong); }
+  .type-card.selected { border-color: var(--accent); background: rgba(88,166,255,.06); }
+  .type-card .tc-name { font-weight: 600; margin-bottom: 2px; }
+  .type-card .tc-desc { font-size: 12px; color: var(--text-dim); }
+
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+  .field .hint { font-size: 12px; color: var(--text-faint); margin-top: 4px; }
+  .field input[type=text], .field input[type=password], .field select {
+    width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg-inset); color: var(--text); font-size: 13px; outline: none;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(88,166,255,.15); }
+  .field input.invalid { border-color: var(--red); }
+  .field-error { color: var(--red); font-size: 12px; margin-top: 5px; display: none; }
+  .field-error.show { display: block; }
+  .key-row { display: flex; gap: 8px; align-items: flex-start; }
+  .key-row input { flex: 1; }
+  .oauth-note {
+    display: flex; gap: 10px; padding: 12px; border: 1px solid rgba(210,153,34,.3);
+    border-radius: 8px; background: rgba(210,153,34,.06); font-size: 12px;
+    color: var(--text-dim); margin-top: 14px;
+  }
+  .oauth-note .ico { color: var(--yellow); flex-shrink: 0; }
+
+  .fetch-bar {
+    display: flex; gap: 10px; align-items: center; padding: 12px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg-inset);
+    margin-bottom: 14px;
+  }
+  .fetch-bar .url { flex: 1; color: var(--text-dim); font-size: 12px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .spinner {
+    width: 14px; height: 14px; border: 2px solid var(--border-strong);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite;
+    display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .model-list { display: flex; flex-direction: column; gap: 8px; }
+  .model-row {
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg-inset);
+    overflow: hidden;
+  }
+  .model-head {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer;
+  }
+  .model-head:hover { background: var(--bg-hover); }
+  .model-head .mid { font-family: ui-monospace, monospace; font-size: 13px; font-weight: 500; }
+  .model-head .mname { color: var(--text-faint); font-size: 12px; }
+  .model-detail { border-top: 1px solid var(--border); padding: 12px; display: none; }
+  .model-row.expanded .model-detail { display: block; }
+  .model-detail .toggle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .model-detail .toggle-row:last-child { margin-bottom: 0; }
+  .toggle-label { font-size: 13px; width: 72px; color: var(--text-dim); }
+  .switch {
+    width: 34px; height: 20px; border-radius: 99px; background: var(--border);
+    position: relative; cursor: pointer; transition: background .15s; flex-shrink: 0;
+  }
+  .switch::after {
+    content: ""; position: absolute; width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; top: 3px; left: 3px; transition: left .15s;
+  }
+  .switch.on { background: var(--green); }
+  .switch.on::after { left: 17px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    padding: 4px 12px; border-radius: 99px; border: 1px solid var(--border);
+    font-size: 12px; cursor: pointer; color: var(--text-dim); user-select: none;
+    transition: all .1s; background: var(--bg-card);
+  }
+  .chip:hover { border-color: var(--border-strong); color: var(--text); }
+  .chip.on { background: var(--purple); border-color: var(--purple); color: #fff; font-weight: 600; }
+  .chip .lv { opacity: .65; font-size: 10px; margin-left: 3px; }
+  .manual-add { display: flex; gap: 8px; margin-top: 12px; }
+  .manual-add input {
+    flex: 1; padding: 8px 12px; border: 1px dashed var(--border-strong); border-radius: 8px;
+    background: transparent; color: var(--text); font-size: 13px; outline: none;
+    font-family: ui-monospace, monospace;
+  }
+  .manual-add input:focus { border-color: var(--accent); border-style: solid; }
+  .check {
+    width: 16px; height: 16px; border: 1px solid var(--border-strong); border-radius: 4px;
+    display: grid; place-items: center; flex-shrink: 0; font-size: 11px; color: transparent;
+  }
+  .check.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .summary { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-inset); padding: 16px; }
+  .summary .s-row { display: flex; padding: 5px 0; font-size: 13px; }
+  .summary .s-key { width: 90px; color: var(--text-dim); flex-shrink: 0; }
+  .summary .s-val { font-family: ui-monospace, monospace; word-break: break-all; }
+  .summary .s-val .chip { pointer-events: none; padding: 1px 8px; font-size: 11px; }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px);
+    background: var(--green); color: #fff; padding: 10px 20px; border-radius: 8px;
+    font-size: 13px; font-weight: 500; opacity: 0; transition: all .25s;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ 列表页 ============ -->
+  <div id="screen-list">
+    <h1>Providers</h1>
+    <div class="sub">服务商与凭据管理 · 写入 ~/.dsh/settings.yaml (llm-pi-ai) + .credentials.yaml</div>
+    <div class="provider-list" id="providerList"></div>
+    <button class="add-btn" onclick="openWizard()">＋ Add Provider</button>
+  </div>
+
+  <!-- ============ 向导页 ============ -->
+  <div id="screen-add" class="hidden">
+    <h1>Add Provider</h1>
+    <div class="sub" id="wizardCrumb">新服务商</div>
+    <div class="wizard">
+      <div class="stepper" id="stepper"></div>
+      <div class="wizard-body" id="wizardBody"></div>
+      <div class="wizard-foot">
+        <button class="btn btn-ghost" id="btnBack">← 返回</button>
+        <div>
+          <button class="btn btn-ghost" onclick="closeWizard()">取消</button>
+          <button class="btn btn-primary" id="btnNext">下一步 →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+// ================= 数据 =================
+const KNOWN = [
+  { id: "deepseek-official", name: "DeepSeek 官方", desc: "内置目录 · 只需 API key", keyPage: "https://platform.deepseek.com/api-keys" },
+  { id: "openai", name: "OpenAI", desc: "内置目录 · 只需 API key", keyPage: "https://platform.openai.com/api-keys" },
+  { id: "anthropic", name: "Anthropic", desc: "内置目录 · API key 或 setup-token", keyPage: "https://console.anthropic.com/settings/keys" },
+  { id: "openrouter", name: "OpenRouter", desc: "内置目录 · 只需 API key", keyPage: "https://openrouter.ai/keys" },
+];
+const LEVELS = [
+  { id: "low", zh: "低" }, { id: "medium", zh: "中" }, { id: "high", zh: "高" },
+  { id: "xhigh", zh: "超高" }, { id: "max", zh: "最高" }, { id: "ultra", zh: "极致" },
+];
+const FAKE_MODELS = {
+  "openai-completions": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5"],
+  "openai-responses": ["gpt-5.6-luna", "gpt-5.6-sol", "o4-mini"],
+  "anthropic-messages": ["claude-opus-4.8", "claude-sonnet-4.6"],
+};
+
+let providers = [
+  { id: "opencode-go", proto: "openai-responses", auth: { kind: "key", src: "env", ref: "OPENCODE_GO_API_KEY" }, models: [{ id: "mimo-v2.5", efforts: ["high"] }] },
+  { id: "asxs", proto: "openai-responses", auth: { kind: "key", src: "file", ref: "ASXS_API_KEY" }, baseURL: "https://api.asxs.top/v1", models: [
+    { id: "gpt-5.5", efforts: ["low","medium","high","xhigh","max"] },
+    { id: "gpt-5.6-sol", vision: true, efforts: ["low","medium","high","xhigh","max"] },
+  ]},
+  { id: "deepseek-official", proto: "openai-completions", auth: { kind: "none" }, models: [] },
+  { id: "openai-codex", proto: "oauth", auth: { kind: "oauth" }, models: [] },
+];
+
+// 向导状态
+const W = {
+  step: 0, kind: null, known: null, id: "", proto: "openai-responses",
+  baseURL: "", key: "", models: [], fetched: false, fetching: false,
+};
+const steps = () => W.kind === "known"
+  ? ["类型", "凭据", "确认"]
+  : ["类型", "连接", "凭据", "模型", "确认"];
+
+// ================= 列表页 =================
+function authBadge(p) {
+  if (p.auth.kind === "oauth") return `<span class="badge badge-oauth">OAuth 此构建不支持</span>`;
+  if (p.auth.kind === "none") return `<span class="badge badge-nokey">no key</span>`;
+  if (p.auth.src === "env") return `<span class="badge badge-env">key · env</span>`;
+  return `<span class="badge badge-key">key · 已存</span>`;
+}
+function renderList() {
+  document.getElementById("providerList").innerHTML = providers.map((p, i) => `
+    <div class="provider-row">
+      <div class="glyph">${p.id.slice(0,1).toUpperCase()}</div>
+      <div class="grow">
+        <div class="name">${p.id}</div>
+        <div class="meta">${p.proto}${p.baseURL ? " · " + p.baseURL : ""} · ${p.models.length} models</div>
+      </div>
+      ${authBadge(p)}
+      <div class="row-actions">
+        <button class="icon-btn" onclick="event.stopPropagation();editKey(${i})">编辑 key</button>
+        <button class="icon-btn danger" onclick="event.stopPropagation();removeProvider(${i})">删除</button>
+      </div>
+    </div>`).join("");
+}
+function editKey(i) {
+  const p = providers[i];
+  const v = prompt(`更新 ${p.id} 的 API key（写入 credentials，env 来源的 key 需在 shell 里改）:`);
+  if (v) { p.auth = { kind: "key", src: "file", ref: p.id.toUpperCase().replace(/[^A-Z0-9]+/g,"_") + "_API_KEY" }; renderList(); toast("key 已更新"); }
+}
+function removeProvider(i) {
+  if (confirm(`删除 ${providers[i].id}？（settings.mutate unset + credentials.unset）`)) {
+    providers.splice(i, 1); renderList(); toast("已删除");
+  }
+}
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+// ================= 向导 =================
+function openWizard() {
+  Object.assign(W, { step: 0, kind: null, known: null, id: "", proto: "openai-responses", baseURL: "", key: "", models: [], fetched: false, fetching: false });
+  document.getElementById("screen-list").classList.add("hidden");
+  document.getElementById("screen-add").classList.remove("hidden");
+  renderWizard();
+}
+function closeWizard() {
+  document.getElementById("screen-add").classList.add("hidden");
+  document.getElementById("screen-list").classList.remove("hidden");
+  renderList();
+}
+function renderWizard() {
+  const ss = steps();
+  document.getElementById("stepper").innerHTML = ss.map((s, i) => `
+    ${i ? '<div class="step-line"></div>' : ""}
+    <div class="step-dot ${i === W.step ? "active" : i < W.step ? "done" : ""}">${i < W.step ? "✓" : i + 1}</div>
+    <div class="step-label ${i === W.step ? "active" : ""}">${s}</div>`).join("");
+  document.getElementById("btnBack").style.visibility = W.step === 0 ? "hidden" : "visible";
+  document.getElementById("btnNext").textContent = W.step === ss.length - 1 ? "✓ 保存" : "下一步 →";
+  const body = document.getElementById("wizardBody");
+  const name = ss[W.step];
+  if (name === "类型") body.innerHTML = viewType();
+  else if (name === "连接") body.innerHTML = viewConnect();
+  else if (name === "凭据") body.innerHTML = viewAuth();
+  else if (name === "模型") body.innerHTML = viewModels();
+  else body.innerHTML = viewConfirm();
+  bindBody();
+}
+function viewType() {
+  return `
+    <div class="step-title">选择服务商类型</div>
+    <div class="step-desc">内置目录的服务商只需 API key；自定义服务商需要协议和 baseURL</div>
+    <div class="type-cards">
+      ${KNOWN.map(k => `
+        <div class="type-card ${W.kind === "known" && W.known === k.id ? "selected" : ""}" data-kind="known" data-id="${k.id}">
+          <div class="tc-name">${k.name}</div>
+          <div class="tc-desc">${k.desc}</div>
+        </div>`).join("")}
+      <div class="type-card ${W.kind === "custom" ? "selected" : ""}" data-kind="custom">
+        <div class="tc-name">自定义服务商</div>
+        <div class="tc-desc">OpenAI / Anthropic 兼容端点 · 需要 baseURL</div>
+      </div>
+      <div class="type-card" style="opacity:.45;cursor:not-allowed" title="此构建无 OAuth credential store，不能跑登录流">
+        <div class="tc-name">OAuth 登录（如 openai-codex）</div>
+        <div class="tc-desc">此构建不支持 — 适配器无 OAuth 凭据存储</div>
+      </div>
+    </div>`;
+}
+function viewConnect() {
+  return `
+    <div class="step-title">连接</div>
+    <div class="step-desc">协议与端点地址</div>
+    <div class="field">
+      <label>Provider ID</label>
+      <input type="text" id="f-id" placeholder="my-provider" value="${W.id}">
+      <div class="hint">小写字母/数字/连字符 · 与 settings.yaml 的路由键一致</div>
+      <div class="field-error" id="e-id">格式：^[a-z][a-z0-9-]*$，且不能与已有服务商重名</div>
+    </div>
+    <div class="field">
+      <label>协议</label>
+      <select id="f-proto">
+        ${["openai-responses","openai-completions","anthropic-messages"].map(p =>
+          `<option ${W.proto === p ? "selected" : ""}>${p}</option>`).join("")}
+      </select>
+      <div class="hint">词表与 llm-pi-ai schema 的 providers.*.api 并集同源，不会漂移</div>
+    </div>
+    <div class="field">
+      <label>Base URL</label>
+      <input type="text" id="f-url" placeholder="https://api.example.com/v1" value="${W.baseURL}">
+      <div class="field-error" id="e-url">需要 https:// 或 http:// 开头</div>
+    </div>`;
+}
+function viewAuth() {
+  const k = KNOWN.find(x => x.id === W.known);
+  return `
+    <div class="step-title">凭据</div>
+    <div class="step-desc">${k ? `${k.name} 的 API key` : "API key — 写入 ~/.dsh/.credentials.yaml，settings 里只存引用名"}</div>
+    <div class="field">
+      <label>API Key</label>
+      <div class="key-row">
+        <input type="password" id="f-key" placeholder="sk-..." value="${W.key}">
+        ${k ? `<button class="btn" onclick="window.open('${k.keyPage}')">打开 key 页面 ↗</button>` : ""}
+      </div>
+      <div class="hint">引用名自动派生：<code>${(W.kind === "known" ? W.known : W.id || "MY_PROVIDER").toUpperCase().replace(/[^A-Z0-9]+/g,"_")}_API_KEY</code> · shell 里已导出同名环境变量时 env 优先</div>
+    </div>
+    <div class="oauth-note">
+      <span class="ico">⚠</span>
+      <span>OAuth 登录（浏览器授权）在此构建不可用：适配器没有 OAuth 凭据存储，也不跑登录流。OAuth-only 服务商（如 openai-codex）配置后请求会以 Provider is not configured 失败。上方「打开 key 页面」只是帮你到服务商网站取 key。</span>
+    </div>`;
+}
+function viewModels() {
+  return `
+    <div class="step-title">模型</div>
+    <div class="step-desc">自定义路由必须显式声明模型（宿主校验：目录外的路由无 models 直接拒绝）</div>
+    <div class="fetch-bar">
+      <span class="url">GET ${W.baseURL || "{baseURL}"}/models · Bearer ***</span>
+      <div class="spinner" id="spin"></div>
+      <button class="btn" id="btnFetch" ${W.proto === "anthropic-messages" ? "disabled title='anthropic 协议无可读列表，手填'" : ""}>${W.fetched ? "重新拉取" : "拉取模型"}</button>
+    </div>
+    <div class="model-list" id="modelList"></div>
+    <div class="manual-add">
+      <input type="text" id="f-manual" placeholder="手填模型 id，回车添加">
+      <button class="btn" id="btnAddModel">添加</button>
+    </div>`;
+}
+function modelRow(m, i) {
+  const on = m.included !== false;
+  return `
+    <div class="model-row ${m._open ? "expanded" : ""}" data-i="${i}">
+      <div class="model-head" data-act="toggle-open">
+        <div class="check ${on ? "on" : ""}" data-act="toggle-inc">✓</div>
+        <span class="mid">${m.id}</span>
+        <span class="mname">${m.vision ? "多模态 · " : ""}${m.reasoning ? "思考 " + m.efforts.length + " 级" : ""}</span>
+        <span style="flex:1"></span>
+        <span class="mname">${m._open ? "▾" : "▸"}</span>
+      </div>
+      <div class="model-detail">
+        <div class="toggle-row">
+          <span class="toggle-label">多模态</span>
+          <div class="switch ${m.vision ? "on" : ""}" data-act="toggle-vision"></div>
+          <span class="hint">image 输入（写入 input: [text, image]）</span>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">思考强度</span>
+          <div class="switch ${m.reasoning ? "on" : ""}" data-act="toggle-reasoning"></div>
+        </div>
+        ${m.reasoning ? `
+        <div class="toggle-row">
+          <span class="toggle-label"></span>
+          <div class="chips">
+            ${LEVELS.map(l => `
+              <div class="chip ${m.efforts.includes(l.id) ? "on" : ""}" data-act="toggle-effort" data-lv="${l.id}">${l.zh}<span class="lv">${l.id}</span></div>`).join("")}
+          </div>
+        </div>` : ""}
+      </div>
+    </div>`;
+}
+function renderModelList() {
+  document.getElementById("modelList").innerHTML =
+    W.models.map((m, i) => modelRow(m, i)).join("") ||
+    `<div style="color:var(--text-faint);font-size:13px;padding:8px 0">还没有模型 — 拉取或手填</div>`;
+}
+function viewConfirm() {
+  const inc = W.models.filter(m => m.included !== false);
+  const id = W.kind === "known" ? W.known : W.id;
+  return `
+    <div class="step-title">确认</div>
+    <div class="step-desc">settings.mutate 写入 llm-pi-ai.providers.${id} · credentials.set 存 key · 宿主热加载</div>
+    <div class="summary">
+      <div class="s-row"><span class="s-key">provider</span><span class="s-val">${id}</span></div>
+      <div class="s-row"><span class="s-key">协议</span><span class="s-val">${W.kind === "known" ? "目录默认" : W.proto}</span></div>
+      ${W.baseURL ? `<div class="s-row"><span class="s-key">baseURL</span><span class="s-val">${W.baseURL}</span></div>` : ""}
+      <div class="s-row"><span class="s-key">key</span><span class="s-val">${W.key ? "•".repeat(Math.min(W.key.length, 16)) + "（存 credentials）" : "未设置"}</span></div>
+      <div class="s-row"><span class="s-key">models</span><span class="s-val">${inc.length ? inc.map(m =>
+        `${m.id}${m.reasoning && m.efforts.length ? " [" + m.efforts.map(e => LEVELS.find(l=>l.id===e).zh).join("/") + "]" : ""}`).join("，") : "目录默认"}</span></div>
+    </div>`;
+}
+
+// ================= 向导交互 =================
+function bindBody() {
+  const body = document.getElementById("wizardBody");
+  body.querySelectorAll(".type-card[data-kind]").forEach(c => c.onclick = () => {
+    W.kind = c.dataset.kind;
+    if (W.kind === "known") { W.known = c.dataset.id; W.id = c.dataset.id; }
+    renderWizard();
+  });
+  const fid = body.querySelector("#f-id"); if (fid) fid.oninput = e => W.id = e.target.value;
+  const fp = body.querySelector("#f-proto"); if (fp) fp.onchange = e => { W.proto = e.target.value; W.fetched = false; };
+  const fu = body.querySelector("#f-url"); if (fu) fu.oninput = e => { W.baseURL = e.target.value; W.fetched = false; };
+  const fk = body.querySelector("#f-key"); if (fk) fk.oninput = e => W.key = e.target.value;
+  const bf = body.querySelector("#btnFetch"); if (bf) bf.onclick = fetchModels;
+  const fm = body.querySelector("#f-manual");
+  if (fm) fm.onkeydown = e => { if (e.key === "Enter") addManual(); };
+  const ba = body.querySelector("#btnAddModel"); if (ba) ba.onclick = addManual;
+  const ml = body.querySelector("#modelList");
+  if (ml) { renderModelList(); bindModelList(); return; }
+  document.getElementById("modelList")?.replaceChildren();
+  if (false) document.querySelectorAll("[data-act]").forEach(el => el.onclick = e => {
+    e.stopPropagation();
+    const row = el.closest(".model-row"); const m = W.models[+row.dataset.i];
+    const act = el.dataset.act;
+    if (act === "toggle-open") { m._open = !m._open; }
+    else if (act === "toggle-inc") { m.included = m.included === false ? true : false; }
+    else if (act === "toggle-vision") { m.vision = !m.vision; m._open = true; }
+    else if (act === "toggle-reasoning") { m.reasoning = !m.reasoning; if (m.reasoning && !m.efforts.length) m.efforts = ["medium","high"]; m._open = true; }
+    else if (act === "toggle-effort") {
+      const lv = el.dataset.lv;
+      m.efforts = m.efforts.includes(lv) ? m.efforts.filter(x => x !== lv) : [...m.efforts, lv];
+      m._open = true;
+    }
+    renderModelList(); bindModelList();
+  });
+  bindModelList();
+}
+function bindModelList() {
+  const ml = document.getElementById("modelList");
+  if (!ml) return;
+  ml.querySelectorAll("[data-act]").forEach(el => el.onclick = e => {
+    e.stopPropagation();
+    const row = el.closest(".model-row"); const m = W.models[+row.dataset.i];
+    const act = el.dataset.act;
+    if (act === "toggle-open") { m._open = !m._open; }
+    else if (act === "toggle-inc") { m.included = m.included === false ? true : false; }
+    else if (act === "toggle-vision") { m.vision = !m.vision; m._open = true; }
+    else if (act === "toggle-reasoning") { m.reasoning = !m.reasoning; if (m.reasoning && !m.efforts.length) m.efforts = ["medium","high"]; m._open = true; }
+    else if (act === "toggle-effort") {
+      const lv = el.dataset.lv;
+      m.efforts = m.efforts.includes(lv) ? m.efforts.filter(x => x !== lv) : [...m.efforts, lv];
+      m._open = true;
+    }
+    renderModelList(); bindModelList();
+  });
+}
+function fetchModels() {
+  if (W.fetching) return;
+  W.fetching = true;
+  document.getElementById("spin").style.display = "block";
+  document.getElementById("btnFetch").textContent = "拉取中…";
+  setTimeout(() => {
+    W.fetching = false; W.fetched = true;
+    const ids = FAKE_MODELS[W.proto] || [];
+    for (const id of ids) {
+      if (!W.models.some(m => m.id === id)) {
+        W.models.push({ id, included: true, vision: false, reasoning: true, efforts: ["low","medium","high","xhigh","max"] });
+      }
+    }
+    renderWizard();
+    toast(`拉到 ${ids.length} 个模型`);
+  }, 900);
+}
+function addManual() {
+  const inp = document.getElementById("f-manual");
+  const v = inp.value.trim();
+  if (!v) return;
+  if (!W.models.some(m => m.id === v)) {
+    W.models.push({ id: v, included: true, vision: false, reasoning: false, efforts: [], _open: true });
+  }
+  inp.value = "";
+  renderWizard();
+}
+function validate() {
+  const name = steps()[W.step];
+  if (name === "类型") return !!W.kind;
+  if (name === "连接") {
+    const idOk = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(W.id) && !providers.some(p => p.id === W.id);
+    const urlOk = /^https?:\/\//.test(W.baseURL);
+    document.getElementById("e-id").classList.toggle("show", !idOk);
+    document.getElementById("f-id").classList.toggle("invalid", !idOk);
+    document.getElementById("e-url").classList.toggle("show", !urlOk);
+    document.getElementById("f-url").classList.toggle("invalid", !urlOk);
+    return idOk && urlOk;
+  }
+  if (name === "模型") {
+    const n = W.models.filter(m => m.included !== false).length;
+    if (W.kind === "custom" && n === 0) { toast("自定义路由至少声明一个模型"); return false; }
+    return true;
+  }
+  return true;
+}
+document.getElementById("btnNext").onclick = () => {
+  if (!validate()) return;
+  const ss = steps();
+  if (W.step < ss.length - 1) { W.step++; renderWizard(); return; }
+  // 保存
+  const id = W.kind === "known" ? W.known : W.id;
+  providers.push({
+    id,
+    proto: W.kind === "known" ? "目录默认" : W.proto,
+    baseURL: W.kind === "custom" ? W.baseURL : undefined,
+    auth: W.key ? { kind: "key", src: "file", ref: id.toUpperCase().replace(/[^A-Z0-9]+/g,"_") + "_API_KEY" } : { kind: "none" },
+    models: W.models.filter(m => m.included !== false).map(m => ({ id: m.id, vision: m.vision, efforts: m.reasoning ? m.efforts : [] })),
+  });
+  closeWizard();
+  toast(`provider ${id} 已保存 · 宿主热加载，/model 立即可选`);
+};
+document.getElementById("btnBack").onclick = () => { if (W.step > 0) { W.step--; renderWizard(); } };
+
+renderList();
+</script>
+</body>
+</html>

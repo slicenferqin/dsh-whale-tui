@@ -13,6 +13,7 @@ mod markdown;
 mod projection;
 mod proto;
 mod resume;
+mod settings;
 mod term;
 mod theme;
 mod toolcard;
@@ -58,7 +59,7 @@ struct Args {
     dump_frame: Option<(u16, u16)>,
     attach_fds: bool,
     workspace: Option<String>,
-    theme: String,
+    theme: Option<String>,
     session_id: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -70,7 +71,7 @@ fn parse_args() -> Result<Args> {
         dump_frame: None,
         attach_fds: false,
         workspace: None,
-        theme: "dark".into(),
+        theme: None,
         session_id: None,
         provider: None,
         model: None,
@@ -85,7 +86,7 @@ fn parse_args() -> Result<Args> {
             "--dump-frame" => args.dump_frame = Some(parse_frame_size(&take("--dump-frame")?)?),
             "--attach-fds" => args.attach_fds = true,
             "-w" | "--workspace" => args.workspace = Some(take("--workspace")?),
-            "--theme" => args.theme = take("--theme")?,
+            "--theme" => args.theme = Some(take("--theme")?),
             "--session-id" => args.session_id = Some(take("--session-id")?),
             "--provider" => args.provider = Some(take("--provider")?),
             "--model" => args.model = Some(take("--model")?),
@@ -122,8 +123,11 @@ fn parse_frame_size(raw: &str) -> Result<(u16, u16)> {
 
 struct RuntimeCfg {
     cwd: String,
-    provider: String,
-    model: String,
+    /// 仅命令行显式传入的 --provider/--model 会发给桥的 initialize；
+    /// 不传时桥用 agentDefaultModel 里持久化的选择（README 的优先级约定：
+    /// 命令行 > dsh-whale-tui 块 > agent-default-model > stock）。
+    cli_provider: Option<String>,
+    cli_model: Option<String>,
 }
 
 fn controller_loop(
@@ -143,7 +147,13 @@ fn controller_loop(
         }
         return;
     };
-    let init = json!({ "cwd": cfg.cwd, "provider": cfg.provider, "model": cfg.model });
+    let mut init = json!({ "cwd": cfg.cwd });
+    if let Some(provider) = &cfg.cli_provider {
+        init["provider"] = json!(provider);
+    }
+    if let Some(model) = &cfg.cli_model {
+        init["model"] = json!(model);
+    }
     match rt.request("initialize", Some(init), Duration::from_secs(60)) {
         Ok(res) => {
             let _ = bus.send(AppEvent::Rpc {
@@ -246,6 +256,88 @@ fn controller_loop(
                         let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
                     }
                 }
+            }
+            Cmd::ListProviders => {
+                match rt.request("tui/list-providers", None, Duration::from_secs(30)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/providers".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = bus.send(AppEvent::RuntimeStderr(format!(
+                            "list-providers failed: {e}"
+                        )));
+                    }
+                }
+            }
+            Cmd::SaveProvider { draft } => {
+                match rt.request("tui/save-provider", Some(draft), Duration::from_secs(30)) {
+                    Ok(res) => {
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/provider-saved".to_string(),
+                            params: res,
+                        });
+                    }
+                    Err(e) => {
+                        // 桥端校验失败（id 重复、schema 拒绝等）也走同一事件，
+                        // 由 app 侧统一以通知呈现。
+                        let _ = bus.send(AppEvent::Rpc {
+                            method: "tui/provider-saved".to_string(),
+                            params: json!({ "ok": false, "error": e.to_string() }),
+                        });
+                    }
+                }
+            }
+            Cmd::FetchModels {
+                api,
+                base_url,
+                api_key,
+            } => {
+                let params = json!({ "api": api, "baseURL": base_url, "apiKey": api_key });
+                let event = match rt.request(
+                    "tui/fetch-models",
+                    Some(params),
+                    Duration::from_secs(30),
+                ) {
+                    Ok(res) => {
+                        json!({ "ok": true, "models": res.get("models").cloned().unwrap_or(json!([])) })
+                    }
+                    Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                };
+                let _ = bus.send(AppEvent::Rpc {
+                    method: "tui/models-fetched".to_string(),
+                    params: event,
+                });
+            }
+            Cmd::RemoveProvider { id } => {
+                let event = match rt.request(
+                    "tui/remove-provider",
+                    Some(json!({ "id": id })),
+                    Duration::from_secs(30),
+                ) {
+                    Ok(_) => json!({ "ok": true, "id": id }),
+                    Err(e) => json!({ "ok": false, "id": id, "error": e.to_string() }),
+                };
+                let _ = bus.send(AppEvent::Rpc {
+                    method: "tui/provider-removed".to_string(),
+                    params: event,
+                });
+            }
+            Cmd::SetProviderKey { id, api_key } => {
+                let event = match rt.request(
+                    "tui/set-provider-key",
+                    Some(json!({ "id": id, "apiKey": api_key })),
+                    Duration::from_secs(30),
+                ) {
+                    Ok(_) => json!({ "ok": true, "id": id }),
+                    Err(e) => json!({ "ok": false, "id": id, "error": e.to_string() }),
+                };
+                let _ = bus.send(AppEvent::Rpc {
+                    method: "tui/key-saved".to_string(),
+                    params: event,
+                });
             }
             Cmd::SelectModel {
                 session_id,
@@ -371,59 +463,6 @@ fn controller_loop(
     }
 }
 
-/// Read provider/model defaults from the local dsh install's settings.yaml
-/// (agent-default-model block). Best effort; returns None when absent.
-/// Read provider/model defaults from the local dsh install's settings.yaml.
-/// Priority: the dsh-whale-tui block (this TUI's own default), then the
-/// shared agent-default-model block. Best effort; None when absent.
-fn local_defaults() -> (Option<String>, Option<String>) {
-    let root = std::env::var("DSH_HOME")
-        .ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.dsh")));
-    let Some(root) = root else {
-        return (None, None);
-    };
-    let path = std::path::Path::new(&root).join("settings.yaml");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let mut block: Option<&str> = None;
-    let mut whale = (None, None);
-    let mut agent = (None, None);
-    for line in text.lines() {
-        if !line.starts_with([' ', '\t']) {
-            let head = line.trim_end();
-            if head == "dsh-whale-tui:" {
-                block = Some("whale");
-            } else if head == "agent-default-model:" {
-                block = Some("agent");
-            } else {
-                block = None;
-            }
-            continue;
-        }
-        let Some(b) = block else { continue };
-        let Some((k, v)) = line.trim().split_once(':') else {
-            continue;
-        };
-        let v = v.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-        if v.is_empty() {
-            continue;
-        }
-        let slot = if b == "whale" { &mut whale } else { &mut agent };
-        match k.trim() {
-            "provider" => slot.0 = Some(v.to_string()),
-            "model" => slot.1 = Some(v.to_string()),
-            _ => {}
-        }
-    }
-    if whale.0.is_some() || whale.1.is_some() {
-        whale
-    } else {
-        agent
-    }
-}
-
 fn dump_demo_frame(
     size: (u16, u16),
     theme: theme::Theme,
@@ -508,27 +547,32 @@ fn main() -> Result<()> {
         bail!("standalone mode is not implemented — use --demo or --attach-fds")
     };
 
-    let (provider, model) = {
-        let local = if args.dump_frame.is_some() {
-            (None, None)
-        } else {
-            local_defaults()
-        };
-        (
-            args.provider
-                .clone()
-                .or(local.0)
-                .unwrap_or_else(|| "deepseek-official".into()),
-            args.model
-                .clone()
-                .or(local.1)
-                .unwrap_or_else(|| "deepseek-v4-flash".into()),
-        )
+    let local = if args.dump_frame.is_some() {
+        (None, None, None)
+    } else {
+        settings::read_defaults()
     };
+    let (provider, model) = (
+        args.provider
+            .clone()
+            .or(local.0)
+            .unwrap_or_else(|| "deepseek-official".into()),
+        args.model
+            .clone()
+            .or(local.1)
+            .unwrap_or_else(|| "deepseek-v4-flash".into()),
+    );
+    // --theme flag > dsh-whale-tui.theme in settings.yaml > dark.
+    let theme_name = args
+        .theme
+        .as_deref()
+        .or(local.2.as_deref())
+        .unwrap_or("dark")
+        .to_string();
     if let Some(size) = args.dump_frame {
         return dump_demo_frame(
             size,
-            theme::theme_for(&args.theme),
+            theme::theme_for(&theme_name),
             session_id,
             provider,
             model,
@@ -541,8 +585,8 @@ fn main() -> Result<()> {
         let tx = bus_tx.clone();
         let cfg = RuntimeCfg {
             cwd: cwd.clone(),
-            provider: provider.clone(),
-            model: model.clone(),
+            cli_provider: args.provider.clone(),
+            cli_model: args.model.clone(),
         };
         std::thread::Builder::new()
             .name("controller".into())
@@ -578,7 +622,7 @@ fn main() -> Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let theme = theme::theme_for(&args.theme);
+    let theme = theme::theme_for(&theme_name);
     let (term_kind, in_tmux) = term::detect();
     let mut app = App::new(
         theme,

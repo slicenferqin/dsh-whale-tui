@@ -122,6 +122,7 @@ TUI 的默认 provider/model 从 ~/.dsh/settings.yaml 的 dsh-whale-tui: 块读�
 | /theme | 主题实时预览（方向键切换预览 · Enter 保持 · Esc 还原） |
 | /copy | 复制最近回复 |
 | /model | 模型选择器 |
+| /provider | 服务商面板（列表 + key 状态）；/provider add 表单面板新增服务商：协议选项与宿主 schema 同源、key 打码、错误留面板重试；自定义路由（填 baseURL）必须显式列 models，写入 llm-pi-ai 块 + credentials 后宿主热加载，/model 立即可选 |
 | /compact | 压缩当前会话历史 |
 
 ## 目录
