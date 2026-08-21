@@ -162,7 +162,7 @@ fn controller_loop(
             });
         }
         Err(e) => {
-            let _ = bus.send(AppEvent::RuntimeStderr(format!("initialize failed: {e}")));
+            let _ = bus.send(AppEvent::RuntimeError(format!("initialize failed: {e}")));
         }
     }
     for cmd in rx {
@@ -174,7 +174,7 @@ fn controller_loop(
                 });
                 if let Err(e) = rt.request("session/prompt", Some(params), Duration::from_secs(30))
                 {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("prompt failed: {e}")));
+                    let _ = bus.send(AppEvent::RuntimeError(format!("prompt failed: {e}")));
                 }
             }
             Cmd::SendNow { session_id, text } => {
@@ -185,7 +185,7 @@ fn controller_loop(
                 if let Err(e) =
                     rt.request("session/send-now", Some(params), Duration::from_secs(30))
                 {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("send-now failed: {e}")));
+                    let _ = bus.send(AppEvent::RuntimeError(format!("send-now failed: {e}")));
                 }
             }
             Cmd::UpdateQueue {
@@ -203,7 +203,7 @@ fn controller_loop(
                     Some(params),
                     Duration::from_secs(10),
                 ) {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("queue update failed: {e}")));
+                    let _ = bus.send(AppEvent::RuntimeError(format!("queue update failed: {e}")));
                 }
             }
             Cmd::ExecuteCommand { session_id, line } => {
@@ -216,9 +216,7 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!(
-                            "command execution failed: {e}"
-                        )));
+                        let _ = bus.send(AppEvent::RuntimeError(format!("command execution failed: {e}")));
                     }
                 }
             }
@@ -226,7 +224,7 @@ fn controller_loop(
                 let params = json!({ "sessionId": session_id });
                 if let Err(e) = rt.request("session/cancel", Some(params), Duration::from_secs(10))
                 {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("cancel failed: {e}")));
+                    let _ = bus.send(AppEvent::RuntimeError(format!("cancel failed: {e}")));
                 }
             }
             Cmd::Load { session_id } => {
@@ -239,7 +237,7 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("load failed: {e}")));
+                        let _ = bus.send(AppEvent::RuntimeError(format!("load failed: {e}")));
                     }
                 }
             }
@@ -253,7 +251,7 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("catalog failed: {e}")));
+                        let _ = bus.send(AppEvent::RuntimeError(format!("catalog failed: {e}")));
                     }
                 }
             }
@@ -266,9 +264,7 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!(
-                            "list-providers failed: {e}"
-                        )));
+                        let _ = bus.send(AppEvent::RuntimeError(format!("list-providers failed: {e}")));
                     }
                 }
             }
@@ -360,7 +356,7 @@ fn controller_loop(
                     }
                     Err(e) => {
                         let _ =
-                            bus.send(AppEvent::RuntimeStderr(format!("select-model failed: {e}")));
+                            bus.send(AppEvent::RuntimeError(format!("select-model failed: {e}")));
                     }
                 }
             }
@@ -379,7 +375,7 @@ fn controller_loop(
                     }
                     Err(e) => {
                         let _ =
-                            bus.send(AppEvent::RuntimeStderr(format!("mode switch failed: {e}")));
+                            bus.send(AppEvent::RuntimeError(format!("mode switch failed: {e}")));
                     }
                 }
             }
@@ -393,7 +389,7 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("compact failed: {e}")));
+                        let _ = bus.send(AppEvent::RuntimeError(format!("compact failed: {e}")));
                     }
                 }
             }
@@ -410,7 +406,7 @@ fn controller_loop(
                         });
                     }
                     Err(e) => {
-                        let _ = bus.send(AppEvent::RuntimeStderr(format!("rewind failed: {e}")));
+                        let _ = bus.send(AppEvent::RuntimeError(format!("rewind failed: {e}")));
                     }
                 }
             }
@@ -425,7 +421,7 @@ fn controller_loop(
                     }
                     Err(e) => {
                         let _ =
-                            bus.send(AppEvent::RuntimeStderr(format!("session-info failed: {e}")));
+                            bus.send(AppEvent::RuntimeError(format!("session-info failed: {e}")));
                     }
                 }
             }
@@ -437,7 +433,7 @@ fn controller_loop(
                     });
                 }
                 Err(e) => {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("jobs failed: {e}")));
+                    let _ = bus.send(AppEvent::RuntimeError(format!("jobs failed: {e}")));
                 }
             },
             Cmd::ListLive => match rt.request("tui/live-sessions", None, Duration::from_secs(10)) {
@@ -451,7 +447,7 @@ fn controller_loop(
             },
             Cmd::Respond { id, result } => {
                 if let Err(e) = rt.respond(&id, result) {
-                    let _ = bus.send(AppEvent::RuntimeStderr(format!("respond failed: {e}")));
+                    let _ = bus.send(AppEvent::RuntimeError(format!("respond failed: {e}")));
                 }
             }
             Cmd::Shutdown { ack } => {
@@ -610,7 +606,18 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // kitty 键盘协议（progressive enhancement）：不支持的终端静默忽略
+    // CSI>u，行为与今天一致；支持的终端里 Ctrl+Enter / Ctrl+M / Ctrl+I /
+    // Shift+Enter 才真的可达——这些和弦在 app.rs 里早有分支和提示栏文案，
+    // 但不开协议它们在多数终端被别名为普通 Enter，是死键。
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
     // Mouse reporting is applied from app state on the first loop pass, so the
     // default lives in one place (App::new) rather than being duplicated here.
     let prev_hook = std::panic::take_hook();
@@ -719,7 +726,14 @@ fn set_mouse_reporting(enabled: bool) {
 fn restore_terminal() {
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(MOUSE_OFF.as_bytes());
-    let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+    // Pop 要在 LeaveAlternateScreen 之前：kitty 协议标志按栈管理，
+    // 留给 shell 的键盘模式必须和我们进入前一致。
+    let _ = execute!(
+        stdout,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
     let _ = stdout.flush();
 }

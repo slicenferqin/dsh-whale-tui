@@ -566,11 +566,19 @@ function apply(ctx) {
       name: tool.name,
       description: tool.description,
     }))
+    // dsh-compaction-basic 的触发阈值：BasicCompactionEngine.config 是公开
+    // 字段（抽象 CompactionEngine 类型上没有），进程内插件可以直接读
+    // （docs/04 §6.3.1）。TUI 用它代替硬编码 0.80 画压力条色带。
+    const compactionEngine = ctx.get('compaction')
+    const compactionThresholdRatio = typeof compactionEngine?.config?.thresholdRatio === 'number'
+      ? compactionEngine.config.thresholdRatio
+      : null
     const capabilities = {
       models: true,
       permissions: perm !== undefined,
       planMode: ctx.get('planMode') !== undefined,
-      compaction: ctx.get('compaction') !== undefined,
+      compaction: compactionEngine !== undefined,
+      compactionThresholdRatio,
       jobs: ctx.get('jobs') !== undefined,
       userQuestions: userQuestions !== undefined,
       sessionSearch: ctx.get('sessionQuery') !== undefined,

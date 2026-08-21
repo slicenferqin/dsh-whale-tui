@@ -195,6 +195,9 @@ pub struct HarnessCapabilities {
     /// context pressure and todo sync all go quiet, so `/context` reports it.
     pub projections: bool,
     pub goals: bool,
+    /// dsh-compaction-basic 的 thresholdRatio（宿主配置，可按 model 覆盖；
+    /// 桥端读 BasicCompactionEngine.config）。None = 用内置默认 0.80。
+    pub compaction_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +422,40 @@ pub enum Dialog {
     ProviderList(ProviderListView),
     ProviderKey(ProviderKeyDialog),
     ProviderRemove(String),
+}
+
+impl Dialog {
+    /// 当前接收文本输入的字段——粘贴路由与"正在打字"判定的唯一真相。
+    /// 新增带文本输入的对话框在这里登记一次，粘贴与焦点守卫自动生效；
+    /// 分散的手工路由已经漏过两次（粘贴丢事件、vim 键抢字面输入）。
+    fn text_field_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Dialog::History(d) => Some(&mut d.query),
+            Dialog::Ask(d) => {
+                if d.taking_text {
+                    Some(&mut d.custom_text)
+                } else if d.taking_feedback {
+                    Some(&mut d.feedback)
+                } else {
+                    None
+                }
+            }
+            Dialog::Model(d) => Some(&mut d.filter),
+            Dialog::Queue(d) => {
+                if d.editing {
+                    Some(&mut d.draft)
+                } else {
+                    None
+                }
+            }
+            Dialog::FilePicker(d) => Some(&mut d.query),
+            Dialog::Palette(d) => Some(&mut d.filter),
+            Dialog::Shortcuts(d) => Some(&mut d.filter),
+            Dialog::ProviderKey(d) => Some(&mut d.draft),
+            Dialog::Provider(w) => w.text_field_mut(),
+            _ => None,
+        }
+    }
 }
 
 /// /provider add 的分支向导（Dialog::Provider）。交互原型见
@@ -703,6 +740,35 @@ impl ProviderWizard {
         }
     }
 
+    /// 向导当前的文本字段（Models 步按焦点分派到手填/窗口编辑）。
+    fn text_field_mut(&mut self) -> Option<&mut String> {
+        if self.step == ProviderStep::Models {
+            match self.models_focus {
+                ModelsFocus::Manual => Some(&mut self.manual),
+                ModelsFocus::Window => Some(&mut self.window_draft),
+                _ => None,
+            }
+        } else if self.editing_text() {
+            Some(&mut self.draft)
+        } else {
+            None
+        }
+    }
+
+    fn text_field(&self) -> Option<&String> {
+        if self.step == ProviderStep::Models {
+            match self.models_focus {
+                ModelsFocus::Manual => Some(&self.manual),
+                ModelsFocus::Window => Some(&self.window_draft),
+                _ => None,
+            }
+        } else if self.editing_text() {
+            Some(&self.draft)
+        } else {
+            None
+        }
+    }
+
     /// 校验草稿并提交进当前字段；Err 是展示在面板里的校验信息。
     pub(crate) fn commit_draft(&mut self) -> Result<(), String> {
         let text = self.draft.trim().to_string();
@@ -848,6 +914,12 @@ fn open_url(url: &str) {
 
 pub struct App {
     pub theme: Theme,
+    /// 主题代际：每次换主题 +1，作为 scrollback 行缓存指纹的一部分，
+    /// 换主题后旧行自动失效，无需显式清空。
+    pub(crate) theme_generation: u64,
+    /// scrollback 行缓存：内容指纹 → 该 cell 的最终换行行。流式输出只改
+    /// 最后一个 cell，其余 cell 每帧直接命中，markdown 高亮不再逐帧重算。
+    pub(crate) cell_render_cache: crate::ui::CellRenderCache,
     pub transcript: Transcript,
     /// DSH session projections (docs/04 section 3) — the canonical read model.
     pub projections: crate::projection::Projections,
@@ -891,6 +963,18 @@ pub struct App {
     /// 绘制时记录的 composer 盒几何，鼠标点击定位光标用（ui.rs draw 每帧刷新）。
     pub composer_bottom: u16,
     pub composer_inner_width: u16,
+    /// scrollback 拖选：rows 向量里的绝对行区间 (anchor, head)，行粒度 v1。
+    pub(crate) scroll_sel: Option<(usize, usize)>,
+    /// 下锚时的 (cells 数, 渲染宽度)：内容或折行变化后旧绝对行号失效，
+    /// 渲染与复制都以这个基线校验，失配就不画不拷。
+    pub(crate) scroll_sel_basis: Option<(usize, u16)>,
+    /// 最近一帧的 scrollback 渲染结果与几何（ui.rs 每帧刷新），
+    /// 供拖选命中映射与复制取文，不必在事件路径上重建。
+    pub(crate) viewport_rows: std::rc::Rc<Vec<ratatui::text::Line<'static>>>,
+    pub(crate) viewport_start: usize,
+    pub(crate) scrollback_top: u16,
+    pub(crate) scrollback_height: u16,
+    pub(crate) scrollback_width: u16,
     /// 本帧弹窗的可点击行（ui::draw_dialog 每帧重填；无弹窗时清空）。
     pub dialog_hits: Vec<DialogHit>,
     pub needs_redraw: bool,
@@ -927,7 +1011,7 @@ pub struct App {
     /// builtinProviders）；空 = 未拉取，/provider add 会触发一次拉取。
     catalog_providers: Vec<CatalogProvider>,
     live_ids: HashSet<String>,
-    capabilities: HarnessCapabilities,
+    pub(crate) capabilities: HarnessCapabilities,
     harness_commands: Vec<HarnessCommand>,
     catalog_loaded: bool,
     cancel_grace: Option<Instant>,
@@ -949,6 +1033,8 @@ impl App {
     ) -> Self {
         Self {
             theme,
+            theme_generation: 0,
+            cell_render_cache: crate::ui::CellRenderCache::default(),
             transcript: Transcript::new(),
             projections: crate::projection::Projections::default(),
             input: String::new(),
@@ -978,6 +1064,13 @@ impl App {
             follow_selection: true,
             composer_top: 0,
             composer_bottom: 0,
+            scroll_sel: None,
+            scroll_sel_basis: None,
+            viewport_rows: std::rc::Rc::new(Vec::new()),
+            viewport_start: 0,
+            scrollback_top: 0,
+            scrollback_height: 0,
+            scrollback_width: 0,
             composer_inner_width: 1,
             dialog_hits: Vec::new(),
             needs_redraw: true,
@@ -2858,6 +2951,9 @@ impl App {
                         tools: capability_flag(capabilities, "tools"),
                         projections: capability_flag(capabilities, "projections"),
                         goals: capability_flag(capabilities, "goals"),
+                        compaction_threshold: capabilities
+                            .and_then(|c| c.get("compactionThresholdRatio"))
+                            .and_then(Value::as_f64),
                     };
                     self.harness_commands = params
                         .get("commands")
@@ -3252,14 +3348,25 @@ impl App {
             AppEvent::RuntimeStderr(line) => {
                 self.set_notice(line);
             }
+            AppEvent::RuntimeError(message) => {
+                self.report_error(message);
+            }
             AppEvent::RuntimeExited(code) => {
                 if !self.quit {
-                    self.set_notice(format!("runtime exited: {:?}", code));
+                    self.report_error(format!("runtime exited: {:?}", code));
                     self.state = RunState::Idle;
                 }
             }
         }
         self.needs_redraw = true;
+    }
+
+    /// 用户必须看到的错误：落进会话（持久 cell）+ notice（即时提醒）。
+    /// 只在 notice 里活几秒的错误是"发送没反应"困惑的主要来源。
+    fn report_error(&mut self, message: String) {
+        self.transcript
+            .push(CellKind::Notice, "error".to_string(), message.clone());
+        self.set_notice(message);
     }
 
     fn open_dialog(&mut self, id: String, method: &str, params: &Value) {
@@ -3448,11 +3555,26 @@ impl App {
                 if !in_box {
                     // Only move focus. This used to also slam `scroll` to 0, so a
                     // click near the composer yanked the viewport to the bottom —
-                    // which read as the UI jumping while trying to select text.
-                    let changed = self.focus != Focus::Scrollback;
+                    let mut changed = self.focus != Focus::Scrollback;
                     self.focus = Focus::Scrollback;
                     self.follow_selection = true;
                     self.input_sel = None;
+                    // scrollback 文本区内的落下 = 拖选下锚（行粒度），
+                    // 选区随最近一帧的视口几何映射到绝对行号。
+                    if mouse.row >= self.scrollback_top
+                        && mouse.row < self.scrollback_top + self.scrollback_height
+                        && !self.viewport_rows.is_empty()
+                    {
+                        let abs = self.abs_row_at(mouse.row);
+                        changed |= self.scroll_sel != Some((abs, abs));
+                        self.scroll_sel = Some((abs, abs));
+                        self.scroll_sel_basis =
+                            Some((self.transcript.cells.len(), self.scrollback_width));
+                    } else {
+                        changed |= self.scroll_sel.is_some();
+                        self.scroll_sel = None;
+                        self.scroll_sel_basis = None;
+                    }
                     return changed;
                 }
                 let mut changed = self.focus != Focus::Prompt;
@@ -3476,8 +3598,16 @@ impl App {
                 changed
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                // 只有锚点在 composer 里落下的拖动才是文本选择（?1000h 有
-                // Drag 事件，无需 any-event 跟踪）。
+                // scrollback 下锚的拖动 = 行选；composer 下锚的拖动 = 文本选
+                // （?1000h 有 Drag 事件，无需 any-event 跟踪）。
+                if let Some((anchor, head)) = self.scroll_sel {
+                    let next = self.abs_row_at(mouse.row);
+                    if next == head {
+                        return false;
+                    }
+                    self.scroll_sel = Some((anchor, next));
+                    return true;
+                }
                 let Some((anchor, _)) = self.input_sel else {
                     return false;
                 };
@@ -3490,7 +3620,47 @@ impl App {
                 true
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                // 拖选结束：OSC52 写系统剪贴板。终端不支持时选区仍在，
+                // scrollback 行选优先：拖选结束 OSC52 写系统剪贴板。
+                // 基线（cells 数 + 宽度）失配说明选区对应的内容已变，放弃复制。
+                if let (Some((a, b)), Some((cells, w))) = (self.scroll_sel, self.scroll_sel_basis) {
+                    if a == b {
+                        return false;
+                    }
+                    if cells != self.transcript.cells.len() || w != self.scrollback_width {
+                        self.scroll_sel = None;
+                        self.scroll_sel_basis = None;
+                        return false;
+                    }
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let text = self
+                        .viewport_rows
+                        .get(lo..=hi)
+                        .map(|rows| {
+                            rows.iter()
+                                .map(|line| {
+                                    line.spans
+                                        .iter()
+                                        .map(|span| span.content.as_ref())
+                                        .collect::<String>()
+                                        .trim_end()
+                                        .to_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        return false;
+                    }
+                    crate::term::osc52_copy(&text, self.in_tmux);
+                    self.set_notice(format!(
+                        "copied {} chars · 终端不放行 OSC52 时 /mouse 关捕获后原生选择",
+                        text.chars().count()
+                    ));
+                    return true;
+                }
+                // composer 拖选结束：OSC52 写系统剪贴板。终端不支持时选区仍在，
                 // 可直接输入替换或 Backspace 删除。
                 let Some((lo, hi)) = self.input_selection_range() else {
                     return false;
@@ -3505,6 +3675,14 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// 屏幕行 → scrollback rows 向量的绝对行号。越出视口上下沿时钳到
+    /// 视口首/末行，drag 拖出屏幕时选区行为可预期。
+    fn abs_row_at(&self, screen_row: u16) -> usize {
+        let rel = screen_row.saturating_sub(self.scrollback_top) as usize;
+        let rel = rel.min((self.scrollback_height as usize).saturating_sub(1));
+        (self.viewport_start + rel).min(self.viewport_rows.len().saturating_sub(1))
     }
 
     /// 鼠标坐标 → input 字节偏移。越出文本区上沿取可视窗首行起点，越出下沿
@@ -3563,6 +3741,7 @@ impl App {
                 } else {
                     crate::theme::theme_for("light")
                 };
+                self.theme_generation += 1;
             }
             Dialog::Palette(p) => {
                 p.selected = index.min(p.visible.len().saturating_sub(1));
@@ -4390,49 +4569,24 @@ impl App {
             self.insert_str(&text);
             return;
         }
+        // 对话框文本字段统一走声明式路由（Dialog::text_field_mut）：
+        // 单行字段过滤换行——与逐键输入同一约束（Enter 永远不会进这些字段）。
+        // History 有联动（重算可见集），单独分支。
         match &mut self.dialog {
             Dialog::History(d) => {
+                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
                 d.query.push_str(&text);
                 let query = d.query.clone();
                 d.visible = history_matches(&self.history, &query);
                 d.selected = 0;
             }
-            Dialog::Ask(d) => {
-                if d.taking_text {
-                    d.custom_text.push_str(&text);
-                } else if d.taking_feedback {
-                    d.feedback.push_str(&text);
+            dialog => {
+                if let Some(field) = dialog.text_field_mut() {
+                    let text: String =
+                        text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                    field.push_str(&text);
                 }
             }
-            Dialog::Model(d) => d.filter.push_str(&text),
-            Dialog::Queue(d) if d.editing => d.draft.push_str(&text),
-            Dialog::FilePicker(d) => d.query.push_str(&text),
-            Dialog::Palette(d) => d.filter.push_str(&text),
-            Dialog::Shortcuts(d) => d.filter.push_str(&text),
-            // provider 向导/key 编辑都是单行字段：粘贴内容过滤换行，规则与
-            // 逐键输入一致（Enter 永远不会进入这些字段）。
-            Dialog::Provider(wizard) => {
-                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
-                if wizard.step == ProviderStep::Models && wizard.models_focus == ModelsFocus::Manual
-                {
-                    wizard.manual.push_str(&text);
-                } else if wizard.step == ProviderStep::Models
-                    && wizard.models_focus == ModelsFocus::Window
-                {
-                    let digits: String = text
-                        .chars()
-                        .filter(|c| c.is_ascii_digit() || matches!(c, 'k' | 'K' | 'm' | 'M'))
-                        .collect();
-                    wizard.window_draft.push_str(&digits);
-                } else if wizard.editing_text() {
-                    wizard.draft.push_str(&text);
-                }
-            }
-            Dialog::ProviderKey(dialog) => {
-                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
-                dialog.draft.push_str(&text);
-            }
-            _ => {}
         }
     }
 
@@ -4908,6 +5062,7 @@ impl App {
                     } else {
                         crate::theme::theme_for("light")
                     };
+                    self.theme_generation += 1;
                 }
                 KeyCode::Enter => {
                     self.dialog = Dialog::None;
@@ -4917,6 +5072,7 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.theme = t.original;
+                    self.theme_generation += 1;
                     self.dialog = Dialog::None;
                 }
                 _ => {}
@@ -5177,14 +5333,10 @@ impl App {
                         }
                     }
                     // ---- 选项光标的上下移动（Type/Known/Api 词表/Models 列表）----
-                    // vim 的 k/j 不能抢文本焦点（手填模型 id / 窗口编辑里的字面 k/j）。
+                    // vim 的 k/j 不能抢文本焦点——判定走声明式 text_field，
+                    // 覆盖 Id/BaseUrl/ApiKey 草稿与 Models 手填/窗口编辑。
                     KeyCode::Up | KeyCode::Char('k')
-                        if key.code == KeyCode::Up
-                            || !(wizard.step == ProviderStep::Models
-                                && matches!(
-                                    wizard.models_focus,
-                                    ModelsFocus::Manual | ModelsFocus::Window
-                                )) =>
+                        if key.code == KeyCode::Up || wizard.text_field().is_none() =>
                     {
                         match wizard.step {
                             ProviderStep::Type => {
@@ -5204,12 +5356,7 @@ impl App {
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j')
-                        if key.code == KeyCode::Down
-                            || !(wizard.step == ProviderStep::Models
-                                && matches!(
-                                    wizard.models_focus,
-                                    ModelsFocus::Manual | ModelsFocus::Window
-                                )) =>
+                        if key.code == KeyCode::Down || wizard.text_field().is_none() =>
                     {
                         match wizard.step {
                             ProviderStep::Type => wizard.type_sel = (wizard.type_sel + 1).min(1),
@@ -5767,6 +5914,86 @@ mod tests {
             "clicking where focus already is changes nothing"
         );
     }
+
+    #[test]
+    fn scrollback_drag_selects_rows_and_copies_text() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = test_app();
+        app.transcript.push(CellKind::User, "you", "hello world");
+        app.transcript.push(CellKind::Assistant, "dsh", "answer line");
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(!app.viewport_rows.is_empty(), "绘制后应有渲染行");
+
+        let at = |kind, row| MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // scrollback 区域（composer 上方）内按下并拖动一行。
+        let anchor_row = app.scrollback_top + 1;
+        assert!(app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), anchor_row)));
+        assert!(app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), anchor_row + 1)));
+        let (a, b) = app.scroll_sel.expect("拖选应下锚");
+        assert_ne!(a, b, "拖动一行后选区应非空");
+        assert!(app.handle_mouse(at(MouseEventKind::Up(MouseButton::Left), anchor_row + 1)));
+        let notice = app.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("copied"), "复制后应有 notice，实际：{notice}");
+
+        // 内容变化后基线失配：同一选区不再复制（旧行号可能已是别的文本）。
+        app.transcript.push(CellKind::User, "you", "new turn");
+        assert!(!app.handle_mouse(at(MouseEventKind::Up(MouseButton::Left), anchor_row)));
+    }
+    #[test]
+    fn paste_routes_into_dialog_text_fields() {
+        let mut app = test_app();
+        app.history = vec!["cargo build".into(), "cargo test".into(), "git status".into()];
+        app.dialog = Dialog::History(HistoryView {
+            query: String::new(),
+            selected: 0,
+            visible: vec![0, 1, 2],
+        });
+        // 单行字段过滤换行，且 History 联动重算可见集。
+        app.handle_paste("car\ngo".into());
+        let Dialog::History(view) = &app.dialog else {
+            panic!("history 弹窗应仍开着");
+        };
+        assert_eq!(view.query, "cargo");
+        assert_eq!(view.visible.len(), 2, "cargo 应命中两条，实际 {:?}", view.visible);
+
+        // Model 过滤框同一路由（声明式 text_field，不再逐弹窗手写）。
+        app.dialog = Dialog::Model(ModelPicker {
+            rows: Vec::new(),
+            filter: String::new(),
+            selected: 0,
+        });
+        app.handle_paste("deep\nseek".into());
+        let Dialog::Model(picker) = &app.dialog else {
+            panic!("model 弹窗应仍开着");
+        };
+        assert_eq!(picker.filter, "deepseek");
+    }
+
+    #[test]
+    fn runtime_error_event_lands_in_transcript_and_notice() {
+        // RPC 失败必须落进会话（持久 cell），不能只活在 notice 的几秒里。
+        let mut app = test_app();
+        app.handle(AppEvent::RuntimeError("prompt failed: boom".into()));
+        assert!(
+            app.transcript
+                .cells
+                .iter()
+                .any(|c| c.kind == CellKind::Notice && c.text.contains("boom")),
+            "错误应落进会话"
+        );
+        assert_eq!(app.notice.as_deref(), Some("prompt failed: boom"));
+    }
+
+
 
     #[test]
     fn dialog_clicks_move_selection_and_confirm_like_the_keyboard() {

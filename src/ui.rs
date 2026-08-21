@@ -233,6 +233,19 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     Rect::new(x, y, w.min(area.width), h.min(area.height))
 }
 
+/// 列表弹窗的跟随式滚动窗口：返回包含 selected 的 [start, end) 切片，
+/// 长度 ≤ capacity，贴边时窗口顶到序列边界。/model 列表超出一屏时选中项
+/// 直接不可见——所有可选列表弹窗都必须过这层窗口，不能渲染全量硬裁。
+fn list_window(len: usize, selected: usize, capacity: usize) -> (usize, usize) {
+    let capacity = capacity.max(1);
+    if len <= capacity {
+        return (0, len);
+    }
+    let half = capacity / 2;
+    let start = selected.saturating_sub(half).min(len - capacity);
+    (start, (start + capacity).min(len))
+}
+
 /// Grok 风格的圆角弹窗外框：品牌色 border、纯色底，视觉上从 scrollback 浮起。
 fn popup_block<'a>(title: impl Into<Line<'a>>, color: ratatui::style::Color) -> Block<'a> {
     Block::bordered()
@@ -1238,7 +1251,10 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
-            for (i, item) in view.items.iter().enumerate() {
+            let capacity = (h as usize).saturating_sub(4).max(1);
+            let (win_start, win_end) = list_window(view.items.len(), view.selected, capacity);
+            for i in win_start..win_end {
+                let item = &view.items[i];
                 let selected = i == view.selected;
                 let mark = if selected { "› " } else { "  " };
                 let key_note = if item.key == "none" {
@@ -1266,8 +1282,19 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                     Span::styled(key_note, Style::default().fg(app.theme.gray)),
                 ]));
             }
-            let block = popup_block(" ◈ providers ", app.theme.accent_tool)
+            let title = if win_start > 0 {
+                format!(" ◈ providers  ▲ {} more ", win_start)
+            } else {
+                " ◈ providers ".to_string()
+            };
+            let mut block = popup_block(title, app.theme.accent_tool)
                 .style(Style::default().bg(app.theme.bg_light));
+            if win_end < view.items.len() {
+                block = block.title_bottom(
+                    Line::from(format!(" ▼ {} more ", view.items.len() - win_end))
+                        .style(Style::default().fg(app.theme.gray)),
+                );
+            }
             f.render_widget(
                 Paragraph::new(lines)
                     .block(block)
@@ -1288,7 +1315,8 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
             )));
             let mut previous_section = None;
             let mut pending: Vec<(usize, usize)> = Vec::new();
-            for (row_idx, item_idx) in p.visible.iter().take(max_rows).enumerate() {
+            let (win_start, win_end) = list_window(p.visible.len(), p.selected, max_rows);
+            for (row_idx, item_idx) in p.visible[win_start..win_end].iter().enumerate() {
                 let row = &p.rows[*item_idx];
                 if previous_section != Some(row.section) {
                     lines.push(Line::from(Span::styled(
@@ -1299,7 +1327,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                     )));
                     previous_section = Some(row.section);
                 }
-                let selected = row_idx == p.selected;
+                let selected = win_start + row_idx == p.selected;
                 let mark = if selected { "◆" } else { " " };
                 let shortcut = row.shortcut.as_deref().unwrap_or(&row.label);
                 let label_budget =
@@ -1317,7 +1345,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                 } else {
                     Style::default().fg(app.theme.text_secondary)
                 };
-                pending.push((lines.len(), row_idx));
+                pending.push((lines.len(), win_start + row_idx));
                 lines.push(Line::from(Span::styled(
                     format!("  {mark} {label}{}{shortcut}", " ".repeat(gap)),
                     style,
@@ -1337,8 +1365,19 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                 push_select_hit(&mut hits, rect, line_idx, index);
             }
             f.render_widget(Clear, rect);
-            let block = popup_block(" Commands ", app.theme.border)
+            let title = if win_start > 0 {
+                format!(" Commands  ▲ {} more ", win_start)
+            } else {
+                " Commands ".to_string()
+            };
+            let mut block = popup_block(title, app.theme.border)
                 .style(Style::default().bg(app.theme.bg_light));
+            if win_end < p.visible.len() {
+                block = block.title_bottom(
+                    Line::from(format!(" ▼ {} more ", p.visible.len() - win_end))
+                        .style(Style::default().fg(app.theme.gray)),
+                );
+            }
             f.render_widget(
                 Paragraph::new(lines)
                     .block(block)
@@ -1517,7 +1556,12 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
-            for item_idx in &vis {
+            // 行容量 = 框高 - 上下边框 - 过滤行 - 空行。窗口跟随选中项，
+            // 超出的部分用边框标题提示（不占行容量）。
+            let capacity = (h as usize).saturating_sub(4).max(1);
+            let sel_pos = vis.iter().position(|i| *i == m.selected).unwrap_or(0);
+            let (win_start, win_end) = list_window(vis.len(), sel_pos, capacity);
+            for item_idx in &vis[win_start..win_end] {
                 let row = &m.rows[*item_idx];
                 let selected = *item_idx == m.selected;
                 let mark = if selected { "› " } else { "  " };
@@ -1554,8 +1598,19 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                     Style::default().fg(app.theme.gray_dim),
                 )));
             }
-            let block = popup_block(" ◈ model ", app.theme.accent_assistant)
+            let title = if win_start > 0 {
+                format!(" ◈ model  ▲ {} more ", win_start)
+            } else {
+                " ◈ model ".to_string()
+            };
+            let mut block = popup_block(title, app.theme.accent_assistant)
                 .style(Style::default().bg(app.theme.bg_light));
+            if win_end < vis.len() {
+                block = block.title_bottom(
+                    Line::from(format!(" ▼ {} more ", vis.len() - win_end))
+                        .style(Style::default().fg(app.theme.gray)),
+                );
+            }
             f.render_widget(
                 Paragraph::new(lines)
                     .block(block)
@@ -1619,13 +1674,21 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
         }
         Dialog::Resume(p) => {
             let w = area.width.min(80).saturating_sub(4).max(40);
+            let h = (p.items.len() as u16 + 4)
+                .min(area.height.saturating_sub(4))
+                .max(6);
+            let rect = centered_rect(w, h, area);
+            f.render_widget(Clear, rect);
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 " /resume — Enter 恢复 · Esc 关闭",
                 Style::default().fg(app.theme.gray),
             ))];
             lines.push(Line::from(""));
             let mut pending: Vec<(usize, usize)> = Vec::new();
-            for (i, item) in p.items.iter().enumerate() {
+            let capacity = (h as usize).saturating_sub(4).max(1);
+            let (win_start, win_end) = list_window(p.items.len(), p.selected, capacity);
+            for i in win_start..win_end {
+                let item = &p.items[i];
                 let selected = i == p.selected;
                 let mark = if selected { "› " } else { "  " };
                 let style = if selected {
@@ -1652,16 +1715,22 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) -> Vec<DialogHit> {
                     style,
                 )));
             }
-            let h = (lines.len() as u16 + 2)
-                .min(area.height.saturating_sub(4))
-                .max(6);
-            let rect = centered_rect(w, h, area);
             for (line_idx, index) in pending {
                 push_select_hit(&mut hits, rect, line_idx, index);
             }
-            f.render_widget(Clear, rect);
-            let block = popup_block(" ↺ resume ", app.theme.accent_success)
+            let title = if win_start > 0 {
+                format!(" ↺ resume  ▲ {} more ", win_start)
+            } else {
+                " ↺ resume ".to_string()
+            };
+            let mut block = popup_block(title, app.theme.accent_success)
                 .style(Style::default().bg(app.theme.bg_light));
+            if win_end < p.items.len() {
+                block = block.title_bottom(
+                    Line::from(format!(" ▼ {} more ", p.items.len() - win_end))
+                        .style(Style::default().fg(app.theme.gray)),
+                );
+            }
             f.render_widget(
                 Paragraph::new(lines)
                     .block(block)
@@ -1962,16 +2031,16 @@ fn workspace_label(workspace: &str) -> String {
     workspace.to_string()
 }
 
-/// DSH's default auto-compaction trigger: `dsh-compaction-basic` compacts once
-/// measured context reaches `floor(contextWindow * DEFAULT_THRESHOLD_RATIO)`,
-/// where that ratio defaults to 0.8 (it retains ~16% afterwards).
+/// 自动压缩阈值：默认 `dsh-compaction-basic` 的 DEFAULT_THRESHOLD_RATIO = 0.8
+/// （压缩后保留约 16%）。桥端会把宿主实际配置（BasicCompactionEngine.config
+/// .thresholdRatio，可含 per-model 覆盖）经 capabilities 下发，优先使用；
+/// 没下发（非 DSH harness / 旧桥）退回默认。
 ///
-/// This is the *default*; the ratio is configurable and can be overridden per
-/// provider/model via `modelPolicies`, and the policy compares its own
-/// `measure().totalTokens` rather than the `projectedTokens` we display. So the
-/// band is an accurate guide, not a promise. Reading the resolved threshold from
-/// the harness would make it exact — worth doing if it ever matters.
-const COMPACT_THRESHOLD: f64 = 0.80;
+/// 注意策略比较的是它自己 `measure().totalTokens`，不是我们展示的
+/// `projectedTokens`，所以色带是准确的指引而非硬线。
+fn compact_threshold(app: &App) -> f64 {
+    app.capabilities.compaction_threshold.unwrap_or(0.80)
+}
 
 /// Top-right context chip and its pressure colour.
 ///
@@ -1999,12 +2068,13 @@ fn context_chip(app: &App) -> (String, ratatui::style::Color) {
         let window = window?;
         (window > 0).then(|| (used as f64 / window as f64).clamp(0.0, 1.0))
     });
+    let threshold = compact_threshold(app);
     let color = match fraction {
         // At or past the threshold auto-compaction will fire; approaching it is
         // the warning. Neither is an error — compaction is routine — but the
         // user deserves to see it coming.
-        Some(f) if f >= COMPACT_THRESHOLD => app.theme.accent_error,
-        Some(f) if f >= COMPACT_THRESHOLD - 0.15 => app.theme.warning,
+        Some(f) if f >= threshold => app.theme.accent_error,
+        Some(f) if f >= threshold - 0.15 => app.theme.warning,
         _ => app.theme.gray_bright,
     };
     let text = match (window, fraction) {
@@ -2189,17 +2259,73 @@ struct CellRowRange {
     end: usize,
 }
 
+/// scrollback 行缓存：内容指纹 → 该 cell 渲染+换行后的最终行。
+/// 流式输出每帧只改最后一个 cell，其余 cell 的 markdown 高亮/换行直接命中；
+/// 指纹包含宽度、选中态与主题代际，这些变化会让旧条目自然失效。
+#[derive(Default)]
+pub struct CellRenderCache {
+    map: std::collections::HashMap<u64, std::rc::Rc<Vec<Line<'static>>>>,
+}
+
+impl CellRenderCache {
+    /// 缓存上限：超出即整体清空（下一帧重建当前视图所需条目），
+    /// 防止流式产生的历史版本条目无界堆积。
+    const CAP: usize = 512;
+
+    fn get(&self, key: u64) -> Option<std::rc::Rc<Vec<Line<'static>>>> {
+        self.map.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: u64, lines: std::rc::Rc<Vec<Line<'static>>>) {
+        if self.map.len() >= Self::CAP {
+            self.map.clear();
+        }
+        self.map.insert(key, lines);
+    }
+}
+
+/// cell 渲染指纹：所有影响该 cell 最终行内容的输入。
+fn cell_render_key(
+    cell: &crate::transcript::Cell,
+    width: u16,
+    active: bool,
+    theme_generation: u64,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(&cell.kind).hash(&mut hasher);
+    cell.title.hash(&mut hasher);
+    cell.text.hash(&mut hasher);
+    cell.raw_text.hash(&mut hasher);
+    cell.raw.hash(&mut hasher);
+    cell.tool.hash(&mut hasher);
+    cell.folded.hash(&mut hasher);
+    cell.failed.hash(&mut hasher);
+    width.hash(&mut hasher);
+    active.hash(&mut hasher);
+    theme_generation.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn transcript_rows(
     app: &App,
+    cache: &mut CellRenderCache,
     t: &Transcript,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<CellRowRange>) {
     let mut rows = Vec::new();
     let mut ranges = Vec::with_capacity(t.cells.len());
     for (index, cell) in t.cells.iter().enumerate() {
-        let one = Transcript::from_cell(cell.clone(), t.selected == Some(index));
+        let active = app.focus == Focus::Scrollback && t.selected == Some(index);
+        let key = cell_render_key(cell, width, active, app.theme_generation);
         let start = rows.len();
-        rows.extend(wrap_lines(&transcript_lines(app, &one), width));
+        let rendered = cache.get(key).unwrap_or_else(|| {
+            let one = Transcript::from_cell(cell.clone(), t.selected == Some(index));
+            let lines = std::rc::Rc::new(wrap_lines(&transcript_lines(app, &one), width));
+            cache.insert(key, lines.clone());
+            lines
+        });
+        rows.extend(rendered.iter().cloned());
         let end = rows.len();
         ranges.push(CellRowRange { start, end });
         if index + 1 < t.cells.len() {
@@ -2476,6 +2602,31 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// 拖选中的一整行：所有 span 覆写选区底色，行尾用同色空格补齐到整宽，
+/// 视觉上是一条连续色带而不是断断续续的文本底色。
+fn highlight_selected_row(
+    line: Line<'static>,
+    width: u16,
+    bg: ratatui::style::Color,
+) -> Line<'static> {
+    let style = Style::default().bg(bg);
+    let text_width: usize = line
+        .spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| span.patch_style(style))
+        .collect();
+    let pad = (width as usize).saturating_sub(text_width);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), style));
+    }
+    Line::from(spans)
+}
+
 fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
     let split = Layout::default()
         .direction(Direction::Horizontal)
@@ -2489,7 +2640,14 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let (rows, ranges) = transcript_rows(app, &app.transcript, text_area.width.saturating_sub(1));
+
+    // 缓存与 app.transcript 分属不同借用：take 出来用完放回，
+    // 避免 &mut App 与 &app.transcript 的借用冲突。
+    let mut cache = std::mem::take(&mut app.cell_render_cache);
+    let width = text_area.width.saturating_sub(1);
+    let (rows, ranges) = transcript_rows(app, &mut cache, &app.transcript, width);
+    let rows = std::rc::Rc::new(rows);
+    app.cell_render_cache = cache;
     let height = text_area.height as usize;
     if app.follow_selection && app.focus == Focus::Scrollback {
         app.scroll = scroll_for_selection(
@@ -2502,7 +2660,32 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.scroll = app.scroll.min(rows.len().saturating_sub(height));
     }
+    let view_start = (rows.len().saturating_sub(app.scroll)).saturating_sub(height);
     let view = tail_window(&rows, height, app.scroll);
+    // 拖选高亮：选区是 rows 向量的绝对行区间，基线（cells 数 + 宽度）
+    // 一致才有效——内容或折行变了，旧行号对应的可能已是别的文本。
+    let sel = match (app.scroll_sel, app.scroll_sel_basis) {
+        (Some((a, b)), Some((cells, w))) if cells == app.transcript.cells.len() && w == width => {
+            Some((a.min(b), a.max(b)))
+        }
+        _ => None,
+    };
+    let view: Vec<Line> = view
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| match sel {
+            Some((lo, hi)) if (lo..=hi).contains(&(view_start + i)) => {
+                highlight_selected_row(line, text_area.width, app.theme.bg_highlight)
+            }
+            _ => line,
+        })
+        .collect();
+    // 几何存给鼠标事件路径：命中映射与复制取文都直接用最近一帧。
+    app.viewport_rows = rows.clone();
+    app.viewport_start = view_start;
+    app.scrollback_top = text_area.y;
+    app.scrollback_height = text_area.height;
+    app.scrollback_width = width;
     f.render_widget(
         Paragraph::new(view).style(Style::default().bg(app.theme.bg_base)),
         text_area,
@@ -2756,6 +2939,20 @@ mod tests {
     use super::*;
     use crate::theme::DARK;
 
+    #[test]
+    fn list_window_keeps_selection_visible() {
+        // 不超容量：全量
+        assert_eq!(list_window(5, 2, 10), (0, 5));
+        // 贴头/贴尾
+        assert_eq!(list_window(30, 0, 10), (0, 10));
+        assert_eq!(list_window(30, 29, 10), (20, 30));
+        // 中间：尽量居中且包含选中项
+        let (start, end) = list_window(30, 15, 10);
+        assert!(start <= 15 && 15 < end && end - start == 10);
+        // 容量 0 兜底为 1
+        assert_eq!(list_window(30, 4, 0), (4, 5));
+    }
+
     fn test_app() -> App {
         let (tx, _rx) = mpsc::channel();
         App::new(
@@ -2774,6 +2971,48 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn model_picker_windows_overflowing_list_around_selection() {
+        // 24 行屏幕、30 个模型、选中第 27 个：选中行必须可见，
+        // 且底部要有 "▼ N more" 提示。回归：/model 列表超屏时选中项直接不可见。
+        let backend = TestBackend::new(70, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        let rows: Vec<crate::app::ModelEntry> = (0..30)
+            .map(|i| crate::app::ModelEntry {
+                provider: "yw".into(),
+                id: format!("model-{i:02}"),
+                name: format!("model-{i:02}"),
+                description: None,
+                context_window: Some(262_144),
+                reasoning: None,
+            })
+            .collect();
+        app.dialog = Dialog::Model(crate::app::ModelPicker {
+            rows,
+            filter: String::new(),
+            selected: 27,
+        });
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..24)
+            .map(|y| {
+                (0..70)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("model-27"), "选中项必须渲染出来\n{screen}");
+        assert!(screen.contains("more"), "超页必须有滚动提示\n{screen}");
+        assert!(
+            !screen.contains("model-00"),
+            "窗口外的头部行不应渲染\n{screen}"
+        );
     }
 
     #[test]

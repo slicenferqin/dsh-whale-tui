@@ -11,6 +11,9 @@ pub enum AppEvent {
     Rpc { method: String, params: Value },
     /// One line of runtime stderr (kept for diagnostics).
     RuntimeStderr(String),
+    /// 用户发起动作的失败（prompt/cancel/load 等 RPC 错误）——要落进会话，
+    /// 不能像 stderr 诊断行那样只在 notice 里活几秒。
+    RuntimeError(String),
     /// Server-initiated request from the bridge (approval / ask_user dialogs).
     ServerRequest {
         id: String,

@@ -25,6 +25,11 @@ pub enum CellKind {
 pub struct Cell {
     #[allow(dead_code)] // stable identity for event dedup (planned)
     pub id: u64,
+    /// 产生这个 cell 的 surface 事件 seq（user/message、assistant/message、
+    /// tool/result——dsh-session 的 SURFACE_EVENT_TYPES 三件套）。None =
+    /// 非 surface cell（tool/call 卡、本地错误条、demo），压缩替换按它
+    /// 判定哪些节点被影子化（docs/04 §6.3.2）。
+    pub seq: Option<u64>,
     pub kind: CellKind,
     pub title: String,
     pub text: String,
@@ -225,6 +230,18 @@ pub struct Transcript {
     pending_user: VecDeque<(usize, String)>,
 }
 
+/// 事件信封上的 surfaceOp replace 声明（dsh-session：被替换区间 inclusive）。
+/// "append" 标记或无 surfaceOp 返回 None。
+fn surface_replace_range(event: &Value) -> Option<(u64, u64)> {
+    let op = event.get("surfaceOp")?;
+    if op.get("op").and_then(Value::as_str) != Some("replace") {
+        return None;
+    }
+    let start = op.get("start").and_then(Value::as_u64)?;
+    let end = op.get("end").and_then(Value::as_u64)?;
+    Some((start, end))
+}
+
 impl Transcript {
     pub fn new() -> Self {
         Self::default()
@@ -244,6 +261,7 @@ impl Transcript {
         self.next_id += 1;
         self.cells.push(Cell {
             id,
+            seq: None,
             kind,
             title: title.into(),
             raw_text: String::new(),
@@ -256,6 +274,68 @@ impl Transcript {
             link: None,
         });
         self.cells.len() - 1
+    }
+
+    /// 压缩替换（docs/04 §6.3.2）：surfaceOp replace 声明的 seq 区间内，
+    /// 所有 surface cell 都被摘要影子化。index 跨度内无 seq 的 cell
+    /// （tool/call 卡、本地错误条）一并清掉，避免孤儿卡悬在摘要上方；
+    /// 腾出的位置放一条 compact 标记，轮次/选中/乐观队列整体重映射。
+    fn apply_surface_replace(&mut self, start: u64, end: u64) {
+        let mut span: Option<(usize, usize)> = None;
+        for (i, cell) in self.cells.iter().enumerate() {
+            if matches!(cell.seq, Some(seq) if (start..=end).contains(&seq)) {
+                span = Some(match span {
+                    None => (i, i),
+                    Some((first, _)) => (first, i),
+                });
+            }
+        }
+        let Some((a, b)) = span else { return };
+        let removed = b + 1 - a;
+        self.cells.drain(a..=b);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.cells.insert(
+            a.min(self.cells.len()),
+            Cell {
+                id,
+                seq: None,
+                kind: CellKind::Notice,
+                title: "compact".to_string(),
+                text: format!("上下文压缩：{removed} 个会话节点被摘要替换"),
+                raw_text: String::new(),
+                raw: false,
+                call_id: None,
+                tool: None,
+                folded: false,
+                failed: false,
+                link: None,
+            },
+        );
+        // 跨度内的下标 = 被压缩掉（rewind 选择器里消失）；跨度后的顺移。
+        let remap = |idx: usize| {
+            if idx < a {
+                Some(idx)
+            } else if idx > b {
+                Some(idx - removed + 1)
+            } else {
+                None
+            }
+        };
+        self.turns = self
+            .turns
+            .iter()
+            .filter_map(|m| remap(m.cell).map(|cell| TurnMarker { seq: m.seq, cell }))
+            .collect();
+        self.selected = self
+            .selected
+            .and_then(remap)
+            .or(Some(a.min(self.cells.len() - 1)));
+        self.pending_user = self
+            .pending_user
+            .iter()
+            .filter_map(|(i, text)| remap(*i).map(|i| (i, text.clone())))
+            .collect();
     }
 
     /// 发送即上屏的用户消息：不等运行时回执，先把消息放进会话，回执到达时
@@ -463,7 +543,13 @@ impl Transcript {
         }
     }
 
+
     pub fn apply(&mut self, event: &Value) {
+        // surfaceOp replace（压缩摘要）先处理：丢弃被影子化的区间，
+        // 再走正常事件逻辑——摘要消息本身照常入列。
+        if let Some((start, end)) = surface_replace_range(event) {
+            self.apply_surface_replace(start, end);
+        }
         let Some(ty) = event.get("type").and_then(Value::as_str) else {
             return;
         };
@@ -501,6 +587,7 @@ impl Transcript {
                     };
                     if let Some((i, _)) = claimed {
                         if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+                            self.cells[i].seq = Some(seq);
                             self.turns.push(TurnMarker { seq, cell: i });
                         }
                         self.selected = Some(i);
@@ -508,6 +595,7 @@ impl Transcript {
                     }
                     let i = self.push(CellKind::User, String::new(), text);
                     if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+                        self.cells[i].seq = Some(seq);
                         self.turns.push(TurnMarker { seq, cell: i });
                     }
                     self.selected = Some(i);
@@ -599,6 +687,18 @@ impl Transcript {
                         }
                     }
                 }
+                // 提交消息的 seq 盖到本条消息流式建出的尾部 cell 上：
+                // chunk 期间拿不到最终 seq，压缩替换要靠它识别这些节点。
+                if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
+                    for cell in self.cells.iter_mut().rev() {
+                        if !matches!(cell.kind, CellKind::Assistant | CellKind::Thinking)
+                            || cell.seq.is_some()
+                        {
+                            break;
+                        }
+                        cell.seq = Some(seq);
+                    }
+                }
             }
             "tool/call" => {
                 let name = data
@@ -680,6 +780,7 @@ impl Transcript {
                     .or_else(|| data.and_then(|d| d.get("result")).map(summarize))
                     .unwrap_or_default();
                 let i = self.push(CellKind::ToolResult, String::new(), text);
+                self.cells[i].seq = event.get("seq").and_then(Value::as_u64);
                 self.cells[i].raw_text = self.cells[i].text.clone();
                 self.cells[i].call_id = data
                     .and_then(|d| d.get("message"))
@@ -872,6 +973,53 @@ mod tests {
         assert_eq!(t.cells[1].text, "thinking...");
         assert_eq!(t.turns.len(), 1);
         assert_eq!(t.turns[0].seq, 7);
+    }
+
+    #[test]
+    fn surface_replace_shadows_compacted_range() {
+        // docs/04 §6.3.2：压缩摘要事件带 surfaceOp replace(start,end)，
+        // 区间内的 surface cell 必须离场，rewind 轮次表同步重映射。
+        let mut t = Transcript::new();
+        let user = |seq: u64, text: &str| {
+            json!({"type":"user/message","seq":seq,"data":{"source":{"kind":"user"},"content":[{"type":"text","text":text}]}})
+        };
+        let assistant = |seq: u64, text: &str, surface_op: Value| {
+            json!({"type":"assistant/message","seq":seq,"surfaceOp":surface_op,"data":{"message":{"content":[{"type":"text","text":text}]}}})
+        };
+        t.apply(&user(1, "first"));
+        t.apply(&assistant(2, "answer one", json!("append")));
+        t.apply(&user(3, "second"));
+        t.apply(&assistant(4, "answer two", json!("append")));
+        assert_eq!(t.cells.len(), 4);
+        assert_eq!(t.turns.len(), 2);
+
+        // 压缩：seq 1..=2 被摘要替换（first + answer one 离场）。
+        t.apply(&assistant(
+            5,
+            "summary of the first exchange",
+            json!({"op":"replace","start":1,"end":2}),
+        ));
+
+        let kinds: Vec<CellKind> = t.cells.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            [CellKind::Notice, CellKind::User, CellKind::Assistant, CellKind::Assistant],
+            "压缩标记顶替被影子化的区间，摘要在尾部入列，实际：{kinds:?}"
+        );
+        assert!(t.cells[0].text.contains("上下文压缩"));
+        assert_eq!(t.cells[1].text, "second");
+        // rewind 轮次表：被压缩的 seq 1 消失，seq 3 重映射到新下标 1。
+        let turns: Vec<(u64, usize)> = t.turns.iter().map(|m| (m.seq, m.cell)).collect();
+        assert_eq!(turns, vec![(3, 1)], "轮次表应重映射，实际 {turns:?}");
+        // 选中项必须仍然指向合法 cell。
+        assert!(t.selected.is_some_and(|i| i < t.cells.len()));
+        // 再次替换一个不存在的区间：无操作，不 panic。
+        t.apply(&assistant(
+            6,
+            "another summary",
+            json!({"op":"replace","start":100,"end":200}),
+        ));
+        assert_eq!(t.cells.len(), 5);
     }
 
     #[test]
