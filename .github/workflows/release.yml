@@ -14,23 +14,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14, platform: darwin, arch: arm64, target: darwin-arm64 }
-          - { os: macos-13, platform: darwin, arch: x64, target: darwin-x64 }
-          - { os: ubuntu-24.04, platform: linux, arch: x64, target: linux-x64 }
-    runs-on: ${{ matrix.os }}
+          # macos-13 (Intel) runner 排队动辄半小时起，darwin-x64 改在
+          # macos-14 上交叉编译；代价是该平台不跑测试（无法执行 x86
+          # 二进制），由另外两个平台的测试套件覆盖。
+          - { os: macos-14, platform: darwin, arch: arm64, target: darwin-arm64, rust_target: aarch64-apple-darwin, native: true }
+          - { os: macos-14, platform: darwin, arch: x64, target: darwin-x64, rust_target: x86_64-apple-darwin, native: false }
+          - { os: ubuntu-24.04, platform: linux, arch: x64, target: linux-x64, rust_target: x86_64-unknown-linux-gnu, native: true }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
       - run: rustup update stable && rustup default stable
-      # 每个目标平台都跑完整测试套件，这就是该平台的验证。
+      - run: rustup target add ${{ matrix.rust_target }}
+      # 能执行的目标平台跑完整测试套件，这就是该平台的验证。
       - run: cargo test --locked
-      - run: cargo build --release --locked
+        if: matrix.native
+      - run: cargo build --release --locked --target ${{ matrix.rust_target }}
       - name: Stage native binary
         run: >
           node scripts/package-native.mjs stage
-          --source target/release/dsh-whale-tui
+          --source target/${{ matrix.rust_target }}/release/dsh-whale-tui
           --platform ${{ matrix.platform }}
           --arch ${{ matrix.arch }}
           --vendor-root vendor
