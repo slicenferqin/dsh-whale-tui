@@ -4229,6 +4229,21 @@ impl App {
             Dialog::FilePicker(d) => d.query.push_str(&text),
             Dialog::Palette(d) => d.filter.push_str(&text),
             Dialog::Shortcuts(d) => d.filter.push_str(&text),
+            // provider 向导/key 编辑都是单行字段：粘贴内容过滤换行，规则与
+            // 逐键输入一致（Enter 永远不会进入这些字段）。
+            Dialog::Provider(wizard) => {
+                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                if wizard.step == ProviderStep::Models && wizard.models_focus == ModelsFocus::Manual
+                {
+                    wizard.manual.push_str(&text);
+                } else if wizard.editing_text() {
+                    wizard.draft.push_str(&text);
+                }
+            }
+            Dialog::ProviderKey(dialog) => {
+                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                dialog.draft.push_str(&text);
+            }
             _ => {}
         }
     }
@@ -7301,5 +7316,44 @@ mod tests {
             params: json!({ "ok": true, "id": "asxs" }),
         });
         assert!(app.notice.as_deref().unwrap().contains("asxs removed"));
+    }
+
+    #[test]
+    fn provider_dialogs_accept_pasted_text() {
+        let mut app = test_app();
+        // 向导文本步（baseURL / API key 等同路径）：粘贴进 draft，换行被过滤。
+        app.run_command("/provider add");
+        let Dialog::Provider(wizard) = &mut app.dialog else {
+            panic!("expected provider wizard");
+        };
+        wizard.step = ProviderStep::ApiKey;
+        app.handle_paste("sk-pasted-key-123\r\n".to_string());
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert_eq!(wizard.draft, "sk-pasted-key-123");
+        // Models 步手填焦点：粘贴进 manual。
+        let Dialog::Provider(wizard) = &mut app.dialog else {
+            panic!("wizard stays open");
+        };
+        wizard.step = ProviderStep::Models;
+        wizard.models_focus = ModelsFocus::Manual;
+        app.handle_paste("deepseek-v4-flash\n".to_string());
+        let Dialog::Provider(wizard) = &app.dialog else {
+            panic!("wizard stays open");
+        };
+        assert_eq!(wizard.manual, "deepseek-v4-flash");
+        // key 编辑子面板：粘贴进 draft。
+        app.dialog = Dialog::ProviderKey(ProviderKeyDialog {
+            id: "deepseek".into(),
+            draft: String::new(),
+            saving: false,
+            error: None,
+        });
+        app.handle_paste("sk-replaced\r\n".to_string());
+        let Dialog::ProviderKey(dialog) = &app.dialog else {
+            panic!("key dialog stays open");
+        };
+        assert_eq!(dialog.draft, "sk-replaced");
     }
 }
