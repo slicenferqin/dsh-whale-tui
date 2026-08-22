@@ -73,16 +73,12 @@ fn osc52_copy(text: &str) -> bool {
     if encoded.len() > 100_000 {
         return false;
     }
-    let esc = "\x1b";
-    let seq = format!("{}]52;c;{}{}", esc, encoded, "\x07");
-    let framed = if in_tmux() {
-        let inner = seq.replace(esc, &format!("{esc}{esc}"));
-        format!("{}Ptmux;{}{}", esc, inner, "\x5c")
-    } else {
-        seq
-    };
+    // tmux 里也发裸序列：tmux 消费后在 set-clipboard external/on（默认
+    // external）时存入 buffer 并转发外层终端；DCS 包裹在 tmux ≥3.3 默认
+    // allow-passthrough off 下会被静默丢弃。
+    let seq = format!("{}]52;c;{}{}", "\x1b", encoded, "\x07");
     let mut stdout = std::io::stdout();
-    stdout.write_all(framed.as_bytes()).is_ok() && stdout.flush().is_ok()
+    stdout.write_all(seq.as_bytes()).is_ok() && stdout.flush().is_ok()
 }
 
 /// Copy text through native -> tmux -> OSC 52, always writing a backup.

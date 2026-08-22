@@ -630,7 +630,7 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let theme = theme::theme_for(&theme_name);
-    let (term_kind, in_tmux) = term::detect();
+    let term_kind = term::detect();
     let mut app = App::new(
         theme,
         session_id,
@@ -641,7 +641,6 @@ fn main() -> Result<()> {
         cwd,
     );
     app.term_kind = term_kind;
-    app.in_tmux = in_tmux;
     if args.demo {
         demo::seed(&mut app);
     }
@@ -708,14 +707,17 @@ fn main() -> Result<()> {
 /// crossterm's `EnableMouseCapture` also turns on `?1003h` (any-event tracking),
 /// which reports **every pointer movement** — not just drags. Each of those woke
 /// a full redraw, so simply moving the mouse across the TUI made the screen
-/// judder. We only need button press/release (`?1000h`, which also carries wheel
-/// events) plus SGR coordinates (`?1006h`) for terminals wider than 223 columns.
+/// judder. We need press/release/wheel (`?1000h`) plus button-motion tracking
+/// (`?1002h`) — motion is reported only while a button is held, i.e. drags —
+/// plus SGR coordinates (`?1006h`) for terminals wider than 223 columns.
+/// Without `?1002h` the terminal never sends Drag events: a click lands the
+/// selection anchor but dragging never extends it.
 ///
 /// Any tracking mode suppresses the terminal's own text selection. Most
 /// terminals let you hold Shift to get it back; `/mouse` turns reporting off
 /// entirely for the ones that do not.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 fn set_mouse_reporting(enabled: bool) {
     let mut stdout = std::io::stdout();

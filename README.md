@@ -4,6 +4,21 @@ DeepSeek Harness（DSH）的原生终端用户界面。基于 Rust / ratatui 实
 
 [![CI](https://github.com/slicenferqin/dsh-whale-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/slicenferqin/dsh-whale-tui/actions)
 
+## 为什么是原生 TUI：三条路线的对比
+
+DSH 官方内核之外，前端目前有三种形态：
+
+| | 官方 Web UI | 社区桥接 [dsh-grok-tui](https://github.com/chen-001/dsh-grok-tui) | 本项目（原生 TUI） |
+|---|---|---|---|
+| 形态 | 浏览器 dashboard | grok-build 官方 TUI 二进制 + cordis 桥插件 | Rust 原生 TUI，fd3/fd4 直连插件进程 |
+| DSH 语义覆盖 | 完整：32 个 `dsh-client-ui-*` surface，官方同步演进 | 仅 grok kernel 世界观内的子集 | 投影驱动：GoalBar、contextPressure、goal/todos 投影、压缩影子化均为结构化渲染 |
+| 中断 / 审批 / ask_user | 完整 | 映射到 grok UI 的等价物 | 双向扩展协议原生透传（cancel / PermissionRequest / AskUserQuestion） |
+| 用量指标 | 完整 | 桥拿不到 DSH 的指标形状，靠 herdr 侧栏 / tmux 附加面板外挂 | 状态栏原生渲染，含 projectedTokens，压缩即刻反映 |
+| 进程模型 | 浏览器 + web 宿主 | 三层：grok 二进制 + 桥 + dsh web 宿主；需 `setup` 改写 profile；独立后端与 web 宿主共享会话存储、不能同时跑 | 插件进程复刻 SDK server；与 Web UI 共享 `~/.dsh/sessions`，可同时打开同一会话 |
+| 短板 | 非终端形态，远程 / 纯键盘工作流不友好 | 语义错配是结构性的——DSH 独有 surface 在 grok UI 中没有对应渲染；版本漂移需追 grok 上游 | surface 覆盖尚不及 web（skill 卡、cordis 卡、调用树、图片附件 ❌，见 [docs/04](docs/04-dsh-capability-map.md)）；仅 macOS/Linux |
+
+三条路线不互斥：Web UI 看全局与产物，桥接方案体验 grok 原版手感，原生 TUI 是终端日常驾驶的默认选择。社区另有 [openma](https://github.com/CalenMorell/openma)（Rust 只读终端 viewer，验证了 wire 只读子集）；本项目交互语义的双向化证明见 [docs/02](docs/02-openma-teardown.md)。
+
 ## 概述
 
 dsh-whale-tui 将 DSH 的完整 agent 能力带入终端：真实会话、流式事件、工具审批、模型与服务商管理、会话恢复与回溯，全部经由单一 JSON-RPC 通道与宿主通信。TUI 进程持有 TTY，宿主进程持有 runtime，两者职责清晰分离。
@@ -14,13 +29,14 @@ dsh-whale-tui 将 DSH 的完整 agent 能力带入终端：真实会话、流式
 
 - **会话生命周期**：initialize / prompt / cancel / shutdown，流式解析 assistant chunk、usage、turn/end 事件
 - **审批与提问**：工具审批弹窗、ask_user 问答卡（单选 / 多选 / 自由文本），双向请求-响应通道
+- **Goal / todo 投影**：GoalBar 常驻显示 goal 目标、阶段徽标与轮次进度；goal、todos 的 upsert/remove 实时反映
+- **压缩语义**：`surfaceOp` replace 影子化——被压缩折叠的 surface 撤出转录并留压缩标记（对齐 docs/04 §6.3.2）；上下文压力阈值读宿主压缩配置，压缩后 projectedTokens 即刻回落
 - **Esc 状态机**：turn 中取消；空闲时双击清空草稿 / 双击 rewind 回溯（800ms 窗口）
 - **模型与服务商**：`/model` 模型切换；`/provider` 服务商面板（列表、key 状态、新增、编辑 key、删除）；新增向导内置 pi-ai 目录（37 个服务商预设）与自定义 OpenAI/Anthropic 兼容端点，key 写入 credentials 后宿主热加载
 - **会话恢复**：`/resume` 直读 `~/.dsh/sessions` 的 JSONL（zstd 多帧），恢复后回放完整历史并接续活会话
 - **权限模式**：Normal / Plan / Always-approve 循环切换（Shift+Tab），计划审查（a/s/c/y/q）
 - **任务视图**：Ctrl+T 任务清单快照，Ctrl+G 后台任务与活跃子代理
-- **鼠标交互**：弹窗选项可直接点击选择（与键盘同一代码路径），滚轮在弹窗内翻动选项；`/mouse` 开关鼠标上报，默认关闭以保证终端原生选区复制
-- **剪贴板**：native → tmux → OSC52 三级路由，备份落盘 `~/.dsh/last-copy.txt`
+- **鼠标交互**：默认开启——滚轮滚动、scrollback 字粒度拖选（松开即 OSC52 复制）、点击弹窗选项等价于回车；`/mouse` 关闭后回到终端原生选择
 - **终端适配**：启动探测 TERM_PROGRAM / TMUX（VS Code 家族自动改用 Ctrl+D 退出提示），色彩按终端能力量化（truecolor / 256 / 16），主题实时预览并持久化
 
 ## 架构
@@ -53,7 +69,7 @@ dsh-whale-tui 将 DSH 的完整 agent 能力带入终端：真实会话、流式
 本地开发：
 
     cargo build                                # 编译
-    cargo test                                 # 单元测试（142 项）
+    cargo test                                 # 单元测试（155 项）
     cargo run -- --demo                        # 脚本化 demo（无需 runtime/API key）
     cargo run -- --demo --theme light
     cargo run -- --dump-frame 100x30           # 无 TTY 的确定性布局检查
@@ -76,6 +92,7 @@ TUI 的默认 provider / model / theme 从 `~/.dsh/settings.yaml` 的 `dsh-whale
 | Enter | 单行模式：空闲发送、turn 中排队；多行模式：换行 |
 | Alt+Enter | 发送多行输入；turn 中先取消当前 turn 再发送 |
 | Shift+Enter | 不切模式直接插入换行 |
+| Ctrl+I / Ctrl+Enter | 直接发送（turn 中先取消当前 turn 再发送；Ctrl+Enter 需终端支持 kitty 键盘协议） |
 | Ctrl+M | prompt 聚焦时切换多行模式；scrollback 聚焦时打开模型选择器 |
 | Esc | turn 中取消；空闲时双击清空 / 双击 rewind（800ms 窗口） |
 | Ctrl+C | 先清草稿，再按取消 |
@@ -106,7 +123,7 @@ TUI 的默认 provider / model / theme 从 `~/.dsh/settings.yaml` 的 `dsh-whale
 | y / Y | 复制选中块内容 / 元数据 |
 | 鼠标点击 | 弹窗内直接选择选项（等价于方向键 + Enter） |
 | 鼠标滚轮 | 弹窗内翻动选项；会话区滚动视口 |
-| `/mouse` | 开关鼠标上报；开启后选区复制需按住 Shift |
+| 鼠标拖选（scrollback） | 字粒度选区，松开即 OSC52 复制（终端不放行 OSC52 时 `/mouse` 关捕获后原生选择） |
 
 ## Slash 命令
 
@@ -122,7 +139,7 @@ TUI 的默认 provider / model / theme 从 `~/.dsh/settings.yaml` 的 `dsh-whale
 | /theme | 主题实时预览（方向键切换 · Enter 保持 · Esc 还原），选择持久化 |
 | /copy | 复制最近回复 |
 | /compact | 压缩当前会话历史 |
-| /mouse | 开关鼠标上报 |
+| /mouse | 开关鼠标捕获（默认开：滚轮 + 拖选复制 + 点击弹窗；关闭后终端原生选择/复制） |
 
 ## 项目结构
 

@@ -8,6 +8,10 @@ grok-build 风格的 DeepSeek Harness 终端 TUI —— 自研完整实现，作
 
 **当前状态：P1 全量完成**。真实会话事件、Esc 状态机、审批与 ask_user 双向通道、模型与权限切换、会话恢复/回溯、压缩、计划审查、任务与子代理视图均已接入。demo 模式（--demo）无需 runtime/API key。
 
+## 与 Web UI、桥接方案的关系
+
+官方 Web UI surface 最全（32 个 `dsh-client-ui-*`，浏览器形态）；社区 [dsh-grok-tui](https://github.com/chen-001/dsh-grok-tui) 把 grok 官方 TUI 二进制桥接进 dsh web——真 grok 手感，但 DSH 独有 surface 与用量指标进不了 grok UI，需 herdr 侧栏 / tmux 面板外挂。本项目是原生 Rust TUI：投影驱动渲染 DSH 语义（GoalBar、contextPressure、压缩影子化、审批/ask_user 双向透传），终端原生（SSH / tmux / 纯键盘）。完整对比见仓库 README「三条路线的对比」。
+
 ## 设计依据
 
 - docs/01-grok-tui-spec.md —— grok-build pager 交互细节复刻 spec（键盘绑定、Esc 语义、审批弹窗、工具卡、主题槽位等）+ DSH 落点对照 + P0/P1/P2 优先级

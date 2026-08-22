@@ -963,8 +963,9 @@ pub struct App {
     /// 绘制时记录的 composer 盒几何，鼠标点击定位光标用（ui.rs draw 每帧刷新）。
     pub composer_bottom: u16,
     pub composer_inner_width: u16,
-    /// scrollback 拖选：rows 向量里的绝对行区间 (anchor, head)，行粒度 v1。
-    pub(crate) scroll_sel: Option<(usize, usize)>,
+    /// scrollback 拖选：rows 向量里的 (绝对行, 显示列) 端点对，字粒度。
+    /// 列相对 scrollback 文本区左沿；端点无序（拖向上/左时 head < anchor）。
+    pub(crate) scroll_sel: Option<((usize, u16), (usize, u16))>,
     /// 下锚时的 (cells 数, 渲染宽度)：内容或折行变化后旧绝对行号失效，
     /// 渲染与复制都以这个基线校验，失配就不画不拷。
     pub(crate) scroll_sel_basis: Option<(usize, u16)>,
@@ -973,6 +974,7 @@ pub struct App {
     pub(crate) viewport_rows: std::rc::Rc<Vec<ratatui::text::Line<'static>>>,
     pub(crate) viewport_start: usize,
     pub(crate) scrollback_top: u16,
+    pub(crate) scrollback_left: u16,
     pub(crate) scrollback_height: u16,
     pub(crate) scrollback_width: u16,
     /// 本帧弹窗的可点击行（ui::draw_dialog 每帧重填；无弹窗时清空）。
@@ -980,9 +982,9 @@ pub struct App {
     pub needs_redraw: bool,
     /// Is mouse reporting on? Defaults to ON.
     ///
-    /// Mouse reporting (`?1000h` + `?1006h`) is on by default so the wheel
-    /// scrolls the transcript (docs/01 section 2.7). With reporting off the
-    /// terminal turns the wheel into arrow keys, which the composer reads as
+    /// Mouse reporting (`?1000h` + `?1002h` + `?1006h`) is on by default so the
+    /// wheel scrolls the transcript and drag-select works (docs/01 section 2.7).
+    /// With reporting off the terminal turns the wheel into arrow keys, which
     /// prompt-history recall — history text landing in the draft. `/mouse`
     /// opts out for terminals where Shift+drag selection does not work.
     pub mouse_capture: bool,
@@ -994,7 +996,6 @@ pub struct App {
     pub dialog: Dialog,
     pub workspace: String,
     pub term_kind: TermKind,
-    pub in_tmux: bool,
     at_fragment_start: Option<usize>,
     permission_presets: Vec<String>,
     preset_index: usize,
@@ -1069,6 +1070,7 @@ impl App {
             viewport_rows: std::rc::Rc::new(Vec::new()),
             viewport_start: 0,
             scrollback_top: 0,
+            scrollback_left: 0,
             scrollback_height: 0,
             scrollback_width: 0,
             composer_inner_width: 1,
@@ -1082,7 +1084,6 @@ impl App {
             dialog: Dialog::None,
             workspace,
             term_kind: TermKind::Plain,
-            in_tmux: false,
             at_fragment_start: None,
             permission_presets: Vec::new(),
             preset_index: 0,
@@ -2117,13 +2118,13 @@ impl App {
                 section: Actions,
             },
             ShortcutRow {
-                label: "Select / copy text with the mouse",
-                keys: "works by default (mouse reporting is off)",
+                label: "Select / copy text in the scrollback",
+                keys: "drag (copies on release); Shift+drag = native selection",
                 section: Actions,
             },
             ShortcutRow {
                 label: "Mouse wheel scrolling",
-                keys: "/mouse to enable (then Shift to select)",
+                keys: "on by default; /mouse toggles reporting off",
                 section: Actions,
             },
             ShortcutRow {
@@ -3565,9 +3566,12 @@ impl App {
                         && mouse.row < self.scrollback_top + self.scrollback_height
                         && !self.viewport_rows.is_empty()
                     {
-                        let abs = self.abs_row_at(mouse.row);
-                        changed |= self.scroll_sel != Some((abs, abs));
-                        self.scroll_sel = Some((abs, abs));
+                        let point = (
+                            self.abs_row_at(mouse.row),
+                            mouse.column.saturating_sub(self.scrollback_left),
+                        );
+                        changed |= self.scroll_sel != Some((point, point));
+                        self.scroll_sel = Some((point, point));
                         self.scroll_sel_basis =
                             Some((self.transcript.cells.len(), self.scrollback_width));
                     } else {
@@ -3599,9 +3603,12 @@ impl App {
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                 // scrollback 下锚的拖动 = 行选；composer 下锚的拖动 = 文本选
-                // （?1000h 有 Drag 事件，无需 any-event 跟踪）。
+                // （?1002h 上报 Drag 事件，无需 any-event 跟踪）。
                 if let Some((anchor, head)) = self.scroll_sel {
-                    let next = self.abs_row_at(mouse.row);
+                    let next = (
+                        self.abs_row_at(mouse.row),
+                        mouse.column.saturating_sub(self.scrollback_left),
+                    );
                     if next == head {
                         return false;
                     }
@@ -3631,29 +3638,27 @@ impl App {
                         self.scroll_sel_basis = None;
                         return false;
                     }
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    let text = self
-                        .viewport_rows
-                        .get(lo..=hi)
-                        .map(|rows| {
-                            rows.iter()
-                                .map(|line| {
-                                    line.spans
-                                        .iter()
-                                        .map(|span| span.content.as_ref())
-                                        .collect::<String>()
-                                        .trim_end()
-                                        .to_string()
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default();
-                    let text = text.trim().to_string();
+                    // 端点排序后逐行切片：首行从 anchor 列到行尾，末行到
+                    // head 列，中间行整行；同一行就是纯列区间（字粒度）。
+                    let ((r1, c1), (r2, c2)) = if a <= b { (a, b) } else { (b, a) };
+                    let rows = &self.viewport_rows;
+                    let hi_row = r2.min(rows.len().saturating_sub(1));
+                    let mut parts = Vec::new();
+                    for r in r1..=hi_row {
+                        let line = &rows[r];
+                        let start = if r == r1 { c1 as usize } else { 0 };
+                        let end = if r == r2 { c2 as usize } else { usize::MAX };
+                        parts.push(
+                            crate::ui::slice_line_cols(line, start, end)
+                                .trim_end()
+                                .to_string(),
+                        );
+                    }
+                    let text = parts.join("\n").trim().to_string();
                     if text.is_empty() {
                         return false;
                     }
-                    crate::term::osc52_copy(&text, self.in_tmux);
+                    crate::term::osc52_copy(&text);
                     self.set_notice(format!(
                         "copied {} chars · 终端不放行 OSC52 时 /mouse 关捕获后原生选择",
                         text.chars().count()
@@ -3666,7 +3671,7 @@ impl App {
                     return false;
                 };
                 let text = self.input[lo..hi].to_string();
-                crate::term::osc52_copy(&text, self.in_tmux);
+                crate::term::osc52_copy(&text);
                 self.set_notice(format!(
                     "copied {} chars · 终端不放行 OSC52 时 /mouse 关捕获后原生选择",
                     text.chars().count()
@@ -4571,13 +4576,27 @@ impl App {
         }
         // 对话框文本字段统一走声明式路由（Dialog::text_field_mut）：
         // 单行字段过滤换行——与逐键输入同一约束（Enter 永远不会进这些字段）。
-        // History 有联动（重算可见集），单独分支。
+        // History / Palette / FilePicker 有联动（重算可见集），单独分支。
         match &mut self.dialog {
             Dialog::History(d) => {
                 let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
                 d.query.push_str(&text);
                 let query = d.query.clone();
                 d.visible = history_matches(&self.history, &query);
+                d.selected = 0;
+            }
+            Dialog::Palette(d) => {
+                // IME 上屏在部分终端走 bracketed paste；visible 是缓存，
+                // 不重算列表就停在旧过滤结果（逐键输入在 dialog_key 里重算）。
+                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                d.filter.push_str(&text);
+                d.visible = palette_filter(&d.rows, &d.filter);
+                d.selected = 0;
+            }
+            Dialog::FilePicker(d) => {
+                let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                d.query.push_str(&text);
+                d.visible = fuzzy_filter(&d.files, &d.query);
                 d.selected = 0;
             }
             dialog => {
@@ -5949,6 +5968,84 @@ mod tests {
         assert!(!app.handle_mouse(at(MouseEventKind::Up(MouseButton::Left), anchor_row)));
     }
     #[test]
+    fn scrollback_drag_within_a_row_selects_characters() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = test_app();
+        app.transcript.push(CellKind::Assistant, "dsh", "hello world");
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // 定位渲染行里 "hello" 的屏幕坐标，不猜布局。
+        let line_text = |line: &ratatui::text::Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let (row_idx, start_col) = app
+            .viewport_rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, line)| line_text(line).find("hello").map(|c| (i, c)))
+            .expect("转录里应有 hello world 行");
+        let screen_row = app.scrollback_top + (row_idx - app.viewport_start) as u16;
+        let col = app.scrollback_left + start_col as u16;
+
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 同一行内拖动 5 列：正好选中 "hello"（行粒度实现里 a==b 是无操作）。
+        assert!(app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), col, screen_row)));
+        assert!(app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), col + 5, screen_row)));
+        let (a, b) = app.scroll_sel.expect("拖选应下锚");
+        assert_eq!(a.0, b.0, "同一行");
+        assert_ne!(a.1, b.1, "列不同——字粒度选区");
+        assert!(app.handle_mouse(at(MouseEventKind::Up(MouseButton::Left), col + 5, screen_row)));
+        let notice = app.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("copied 5 chars"), "应只拷出 hello，实际：{notice}");
+    }
+
+    #[test]
+    fn composer_drag_selection_is_painted() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 完整事件路径：真实几何下 Down/Drag → 重绘 → 选区字符必须上色。
+        // （渲染层单测直接设 input_sel 能画；这条防的是事件路径与绘制脱节。）
+        let mut app = test_app();
+        app.set_input("hello world");
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let text_row = app.composer_top + 1;
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: text_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), 3)));
+        assert!(app.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), 8)));
+        assert!(app.input_selection_range().is_some(), "拖选后应有选区");
+
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let bgs: Vec<_> = (3..8)
+            .map(|x| buffer.cell((x, text_row)).unwrap().bg)
+            .collect();
+        assert!(
+            bgs.iter().all(|bg| *bg == crate::theme::DARK.bg_highlight),
+            "选区列应上 bg_highlight，实际 {bgs:?}"
+        );
+    }
+    #[test]
     fn paste_routes_into_dialog_text_fields() {
         let mut app = test_app();
         app.history = vec!["cargo build".into(), "cargo test".into(), "git status".into()];
@@ -5976,6 +6073,41 @@ mod tests {
             panic!("model 弹窗应仍开着");
         };
         assert_eq!(picker.filter, "deepseek");
+    }
+
+    #[test]
+    fn paste_into_palette_recomputes_visible_rows() {
+        // IME 上屏在部分终端走 bracketed paste：visible 是缓存，粘贴后
+        // 必须立刻重算，否则列表停在旧过滤结果直到下一个逐键事件。
+        let mut app = test_app();
+        let rows = vec![
+            PaletteRow {
+                label: "/model".into(),
+                action: "model".into(),
+                shortcut: None,
+                section: "Commands",
+            },
+            PaletteRow {
+                label: "/resume".into(),
+                action: "resume".into(),
+                shortcut: None,
+                section: "Commands",
+            },
+        ];
+        let visible = palette_filter(&rows, "");
+        app.dialog = Dialog::Palette(Palette {
+            rows,
+            filter: String::new(),
+            selected: 0,
+            visible,
+        });
+        app.handle_paste("res\nume".into());
+        let Dialog::Palette(palette) = &app.dialog else {
+            panic!("palette 弹窗应仍开着");
+        };
+        assert_eq!(palette.filter, "resume");
+        assert_eq!(palette.visible, vec![1], "粘贴后应立即重算可见集");
+        assert_eq!(palette.selected, 0);
     }
 
     #[test]
@@ -7054,6 +7186,109 @@ mod tests {
         assert_eq!(text, "first\ns");
     }
 
+    #[test]
+    fn ctrl_enter_sends_now_and_clears_draft() {
+        // kitty 协议下 Ctrl+Enter = CSI 13;5u → (Enter, CONTROL)：turn 中
+        // 打断发送。hint 栏广告了这个键，不能是无测试的死键。
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::DARK,
+            "s1".into(),
+            "p".into(),
+            "m".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.state = RunState::Running;
+        app.set_input("urgent question");
+
+        app.handle_key(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )));
+
+        let Cmd::SendNow { text, .. } = rx.recv().unwrap() else {
+            panic!("Ctrl+Enter 应发 SendNow 命令");
+        };
+        assert_eq!(text, "urgent question");
+        assert!(app.input.is_empty(), "发送后草稿应清空");
+
+        // 空闲（非 running）时不发命令、不动草稿——demo 静默是同一语义。
+        app.state = RunState::Idle;
+        app.set_input("draft stays");
+        app.handle_key(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )));
+        assert!(rx.try_recv().is_err(), "空闲时 Ctrl+Enter 不应发命令");
+        assert_eq!(app.input, "draft stays");
+    }
+
+
+    #[test]
+    fn model_picker_click_uses_rendered_hit_rects() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // 端到端命中：渲染期登记的命中区 → 鼠标点击 → 选中并确认，
+        // 与"方向键 + Enter"同一语义（发出 SelectModel、关闭弹窗）。
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let mut app = App::new(
+            crate::theme::DARK,
+            "s1".into(),
+            "p".into(),
+            "m".into(),
+            false,
+            tx,
+            "/tmp".into(),
+        );
+        app.dialog = Dialog::Model(ModelPicker {
+            rows: (0..3)
+                .map(|i| ModelEntry {
+                    provider: "yw".into(),
+                    id: format!("model-{i}"),
+                    name: format!("model-{i}"),
+                    description: None,
+                    context_window: Some(262_144),
+                    reasoning: None,
+                })
+                .collect(),
+            filter: String::new(),
+            selected: 0,
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // 第二行的命中区必须存在；点击它的中心。
+        let (row, col) = app
+            .dialog_hits
+            .iter()
+            .find_map(|hit| match hit {
+                DialogHit::Select {
+                    index: 1,
+                    row,
+                    col_start,
+                    col_end,
+                } => Some((*row, (col_start + col_end) / 2)),
+                _ => None,
+            })
+            .expect("model 行应在渲染期登记命中区");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click), "命中点击应被消费");
+
+        let Cmd::SelectModel { model, .. } = rx.recv().unwrap() else {
+            panic!("点击第二行应发 SelectModel");
+        };
+        assert_eq!(model, "model-1");
+        assert!(matches!(app.dialog, Dialog::None), "确认后弹窗应关闭");
+    }
     #[test]
     fn prompt_history_walks_both_directions_and_restores_draft() {
         let mut app = test_app();

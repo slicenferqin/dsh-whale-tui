@@ -28,11 +28,11 @@ impl TermKind {
     }
 }
 
-pub fn detect() -> (TermKind, bool) {
+pub fn detect() -> TermKind {
     let prog = std::env::var("TERM_PROGRAM")
         .unwrap_or_default()
         .to_lowercase();
-    let kind = match prog.as_str() {
+    match prog.as_str() {
         "vscode" => TermKind::Vscode,
         "cursor" => TermKind::Cursor,
         "windsurf" => TermKind::Windsurf,
@@ -44,9 +44,7 @@ pub fn detect() -> (TermKind, bool) {
         "alacritty" => TermKind::Alacritty,
         "iterm.app" | "iterm2" => TermKind::Iterm2,
         _ => TermKind::Plain,
-    };
-    let in_tmux = std::env::var("TMUX").is_ok();
-    (kind, in_tmux)
+    }
 }
 
 /// 标准 base64（OSC52 载荷要求）。无依赖实现，输入是任意 UTF-8 字节流。
@@ -74,17 +72,19 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// OSC52 写系统剪贴板：`\x1b]52;c;<base64>\x07`。tmux 里需要 DCS 包装且
-/// 服务端 `set-clipboard on` 才放行，否则序列被 tmux 吃掉（无害但无效）。
-pub fn osc52_copy(text: &str, in_tmux: bool) {
-    use std::io::Write;
+/// OSC52 写系统剪贴板：`\x1b]52;c;<base64>\x07`。tmux 里也发裸序列——
+/// tmux 会消费它并在 `set-clipboard external/on`（默认 external）时存入
+/// 自己的 buffer 并转发给外层终端。DCS 包裹（`\x1bPtmux;…`）是旧方案，
+/// tmux ≥3.3 默认 `allow-passthrough off`，会被静默丢弃。
+pub(crate) fn osc52_sequence(text: &str) -> String {
     let payload = base64_encode(text.as_bytes());
+    format!("\x1b]52;c;{payload}\x07")
+}
+
+pub fn osc52_copy(text: &str) {
+    use std::io::Write;
     let mut out = std::io::stdout();
-    if in_tmux {
-        let _ = write!(out, "\x1bPtmux;\x1b\x1b]52;c;{payload}\x07\x1b\\");
-    } else {
-        let _ = write!(out, "\x1b]52;c;{payload}\x07");
-    }
+    let _ = write!(out, "{}", osc52_sequence(text));
     let _ = out.flush();
 }
 
@@ -111,5 +111,11 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode("你好".as_bytes()), "5L2g5aW9");
+    }
+
+    #[test]
+    fn osc52_sequence_is_raw_osc52() {
+        // tmux 外：终端直接放行；tmux 内：tmux 消费后按 set-clipboard 转发。
+        assert_eq!(osc52_sequence("foo"), "\x1b]52;c;Zm9v\x07");
     }
 }

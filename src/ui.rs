@@ -2627,6 +2627,71 @@ fn highlight_selected_row(
     Line::from(spans)
 }
 
+/// 行内显示列 → 字符下标：数 end_cell <= col 的字符个数。宽字符跨列时
+/// 要求整字落在列界内——与复制切片同一口径，保证高亮所见即所拷。
+fn char_idx_at_col(line: &Line<'static>, col: usize) -> usize {
+    let mut used = 0;
+    let mut idx = 0;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > col {
+                return idx;
+            }
+            used += w;
+            idx += 1;
+        }
+    }
+    idx
+}
+
+/// 拖选取文：一行内显示列 [start_col, end_col) 覆盖的字符（end_col 传
+/// usize::MAX 到行尾）。口径见 char_idx_at_col。
+pub(crate) fn slice_line_cols(line: &Line<'static>, start_col: usize, end_col: usize) -> String {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let s = char_idx_at_col(line, start_col).min(chars.len());
+    let e = char_idx_at_col(line, end_col).min(chars.len()).max(s);
+    chars[s..e].iter().collect()
+}
+
+/// 拖选中的部分行：列区间内的字符覆写选区底色，区间外保持原样。
+/// 与 highlight_selected_row 的整行色带互补（首/末行用列区间，中间行整行）。
+fn highlight_cols(
+    line: Line<'static>,
+    start_col: usize,
+    end_col: usize,
+    bg: ratatui::style::Color,
+) -> Line<'static> {
+    let sel = Style::default().bg(bg);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_style = Style::default();
+    let mut used = 0usize;
+    for span in line.spans {
+        for ch in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            used += w;
+            let style = if used > start_col && used <= end_col {
+                span.style.patch(sel)
+            } else {
+                span.style
+            };
+            if !buf.is_empty() && style != buf_style {
+                spans.push(Span::styled(std::mem::take(&mut buf), buf_style));
+            }
+            if buf.is_empty() {
+                buf_style = style;
+            }
+            buf.push(ch);
+        }
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, buf_style));
+    }
+    Line::from(spans)
+}
+
 fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
     let split = Layout::default()
         .direction(Direction::Horizontal)
@@ -2662,11 +2727,12 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let view_start = (rows.len().saturating_sub(app.scroll)).saturating_sub(height);
     let view = tail_window(&rows, height, app.scroll);
-    // 拖选高亮：选区是 rows 向量的绝对行区间，基线（cells 数 + 宽度）
-    // 一致才有效——内容或折行变了，旧行号对应的可能已是别的文本。
+    // 拖选高亮：选区是 rows 向量里的 (绝对行, 显示列) 端点对，基线
+    // （cells 数 + 宽度）一致才有效——内容或折行变了，旧坐标对应的
+    // 可能已是别的文本。首/末行按列区间上色，中间行整行色带。
     let sel = match (app.scroll_sel, app.scroll_sel_basis) {
         (Some((a, b)), Some((cells, w))) if cells == app.transcript.cells.len() && w == width => {
-            Some((a.min(b), a.max(b)))
+            Some(if a <= b { (a, b) } else { (b, a) })
         }
         _ => None,
     };
@@ -2674,8 +2740,17 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
         .into_iter()
         .enumerate()
         .map(|(i, line)| match sel {
-            Some((lo, hi)) if (lo..=hi).contains(&(view_start + i)) => {
-                highlight_selected_row(line, text_area.width, app.theme.bg_highlight)
+            Some(((r1, c1), (r2, c2))) if (r1..=r2).contains(&(view_start + i)) => {
+                let r = view_start + i;
+                if r1 == r2 {
+                    highlight_cols(line, c1 as usize, c2 as usize, app.theme.bg_highlight)
+                } else if r == r1 {
+                    highlight_cols(line, c1 as usize, usize::MAX, app.theme.bg_highlight)
+                } else if r == r2 {
+                    highlight_cols(line, 0, c2 as usize, app.theme.bg_highlight)
+                } else {
+                    highlight_selected_row(line, text_area.width, app.theme.bg_highlight)
+                }
             }
             _ => line,
         })
@@ -2684,6 +2759,7 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, area: Rect) {
     app.viewport_rows = rows.clone();
     app.viewport_start = view_start;
     app.scrollback_top = text_area.y;
+    app.scrollback_left = text_area.x;
     app.scrollback_height = text_area.height;
     app.scrollback_width = width;
     f.render_widget(
@@ -2731,9 +2807,13 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
     let text_style = Style::default()
         .fg(app.theme.text_primary)
         .bg(app.theme.bg_light);
-    let sel_style = Style::default()
-        .fg(app.theme.text_primary)
-        .bg(app.theme.bg_highlight);
+        // 选中态用 REVERSED 而不是只靠 bg_highlight：浅色主题量化到 256 色
+        // 后 bg_highlight 是浅灰、bg_light 是白，肉眼不可分；反色在任何
+        // 量化级别下都是深底浅字。
+        let sel_style = Style::default()
+            .fg(app.theme.text_primary)
+            .bg(app.theme.bg_highlight)
+            .add_modifier(Modifier::REVERSED);
     let sel = app.input_selection_range();
     for (index, raw) in visible_rows.iter().enumerate() {
         let first_visual_row = visible_start + index == 0;
@@ -2971,6 +3051,31 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn composer_selection_paints_highlight_background() {
+        // 输入框拖选必须有选中态：选区字符底色 = bg_highlight。
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        app.set_input("打算看了大会上了解");
+        app.input_sel = Some((0, 9)); // "打算看"（3 个中文字 = 9 字节）
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // composer 文本行：顶边框下一行；前缀 "› " 后 col 3 起是正文。
+        let y = 17;
+        assert_eq!(buffer.cell((3, y)).unwrap().symbol(), "打");
+        let sel_cell = |x: u16| buffer.cell((x, y)).unwrap();
+        for (x, ch) in [(3, "打"), (5, "算"), (7, "看")] {
+            assert_eq!(sel_cell(x).bg, DARK.bg_highlight, "{ch} 底色");
+            assert!(
+                sel_cell(x).modifier.contains(Modifier::REVERSED),
+                "{ch} 必须带 REVERSED——256 色量化下浅灰 on 白不可见"
+            );
+        }
+        assert_eq!(sel_cell(9).bg, DARK.bg_light, "了不在选区");
+        assert!(!sel_cell(9).modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -3310,6 +3415,20 @@ mod tests {
         assert!(text.contains("5.0K"), "{text}");
         assert!(!text.contains('%'), "{text}");
         assert_eq!(color, DARK.gray_bright);
+    }
+
+    #[test]
+    fn slice_line_cols_respects_display_columns_and_wide_chars() {
+        // "hello 世界 test"：世占列 6-7，界占列 8-9。
+        let line = || Line::from("hello 世界 test");
+        assert_eq!(slice_line_cols(&line(), 0, 5), "hello");
+        assert_eq!(slice_line_cols(&line(), 6, 10), "世界");
+        // 跨列取整：列 7 落在"世"中间，起点含"世"；列 9 落在"界"中间，终点不含它。
+        assert_eq!(slice_line_cols(&line(), 7, 9), "世");
+        assert_eq!(slice_line_cols(&line(), 0, usize::MAX), "hello 世界 test");
+        // 区间外/空区间。
+        assert_eq!(slice_line_cols(&line(), 3, 3), "");
+        assert_eq!(slice_line_cols(&line(), 60, 80), "");
     }
 
     #[test]
